@@ -1,0 +1,1 @@
+ALTER TABLE "leave_requests" ADD COLUMN "duration_type" varchar(20) DEFAULT 'custom' NOT NULL;
