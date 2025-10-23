@@ -1,12 +1,11 @@
 import { Controller, Get, Param, ParseIntPipe, Query } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { ApiTags } from '@nestjs/swagger';
 
 import { Permissions } from '../../common/decorators/permissions.decorator';
 import { CostingService } from './costing.service';
 
 @ApiTags('costing')
 @Controller('costing')
-@ApiBearerAuth()
 export class CostingController {
   constructor(private readonly costingService: CostingService) {}
 

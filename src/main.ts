@@ -81,7 +81,13 @@ async function bootstrap() {
     })
     .build();
 
-  const swaggerDocument = SwaggerModule.createDocument(app, swaggerConfig);
+  const swaggerDocument = SwaggerModule.createDocument(app, swaggerConfig, {
+    operationIdFactory: (controllerKey: string, methodKey: string) => methodKey,
+  });
+  
+  // Apply global security to all endpoints by default
+  swaggerDocument.security = [{ bearer: [] }];
+  
   SwaggerModule.setup('docs', app, swaggerDocument);
 
   const port = process.env.PORT ? Number(process.env.PORT) : 9900;

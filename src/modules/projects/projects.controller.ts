@@ -9,7 +9,7 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiQuery, ApiTags } from '@nestjs/swagger';
+import { ApiQuery, ApiTags } from '@nestjs/swagger';
 
 import { Permissions } from '../../common/decorators/permissions.decorator';
 import { AssignMemberDto } from './dto/assign-member.dto';
@@ -19,7 +19,6 @@ import { ProjectsService } from './projects.service';
 
 @ApiTags('projects')
 @Controller('projects')
-@ApiBearerAuth()
 export class ProjectsController {
   constructor(private readonly projectsService: ProjectsService) {}
 

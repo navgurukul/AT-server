@@ -1,5 +1,5 @@
 import { Body, Controller, Get, Headers, Post, UnauthorizedException } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { ApiTags } from '@nestjs/swagger';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
@@ -26,7 +26,6 @@ export class AuthController {
   }
 
   @Post('logout')
-  @ApiBearerAuth()
   logout(
     @CurrentUser() user: AuthenticatedUser | undefined,
     @Headers('authorization') authorization?: string,
@@ -48,7 +47,6 @@ export class AuthController {
   }
 
   @Get('me')
-  @ApiBearerAuth()
   me(@CurrentUser() user: AuthenticatedUser | undefined) {
     return user ? this.authService.getProfile(user) : null;
   }

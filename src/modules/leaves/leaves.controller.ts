@@ -7,7 +7,7 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiQuery, ApiTags } from '@nestjs/swagger';
+import { ApiQuery, ApiTags } from '@nestjs/swagger';
 
 import { Permissions } from '../../common/decorators/permissions.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -19,7 +19,6 @@ import { LeavesService } from './leaves.service';
 
 @ApiTags('leaves')
 @Controller('leaves')
-@ApiBearerAuth()
 export class LeavesController {
   constructor(private readonly leavesService: LeavesService) {}
 

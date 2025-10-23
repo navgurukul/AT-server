@@ -7,7 +7,7 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiQuery, ApiTags } from '@nestjs/swagger';
+import { ApiQuery, ApiTags } from '@nestjs/swagger';
 
 import { Permissions } from '../../common/decorators/permissions.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -19,7 +19,6 @@ import { TimesheetsService } from './timesheets.service';
 
 @ApiTags('timesheets')
 @Controller('timesheets')
-@ApiBearerAuth()
 export class TimesheetsController {
   constructor(private readonly timesheetsService: TimesheetsService) {}
 
