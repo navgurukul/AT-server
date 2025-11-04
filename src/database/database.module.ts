@@ -22,11 +22,10 @@ import { createDrizzleClient } from './drizzle.provider';
 
         return new Pool({
           connectionString,
-          ssl: isProduction
-            ? {
+          ssl:  {
                 rejectUnauthorized: false,
-              }
-            : undefined,
+              },
+          options: '-c search_path=public,main',
         });
       },
     },

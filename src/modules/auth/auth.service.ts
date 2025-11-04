@@ -37,7 +37,7 @@ export class AuthService {
 
   async login(payload: LoginDto) {
     const googleProfile = await this.verifyGoogleToken(payload.idToken);
-
+    console.log('Google Profile:', googleProfile);
     if (!googleProfile.email || !googleProfile.sub) {
       throw new UnauthorizedException('Incomplete Google profile data');
     }
@@ -50,7 +50,7 @@ export class AuthService {
     }
 
     const db = this.databaseService.connection;
-
+   console.log("Database Connection:", db);
     const [user] = await db
       .select()
       .from(usersTable)
