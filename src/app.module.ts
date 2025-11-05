@@ -9,6 +9,7 @@ import { PermissionsGuard } from './common/guards/permissions.guard';
 import { RequestLoggingInterceptor } from './common/interceptors/request-logging.interceptor';
 import { DatabaseModule } from './database/database.module';
 import { AdminModule } from './modules/admin/admin.module';
+import { DepartmentsModule } from './modules/departments/departments.module';
 import { ApprovalsModule } from './modules/approvals/approvals.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { AuthModule } from './modules/auth/auth.module';
@@ -52,6 +53,7 @@ import { UsersModule } from './modules/users/users.module';
     AdminModule,
     AuditModule,
     JobsModule,
+    DepartmentsModule,
   ],
   controllers: [AppController],
   providers: [

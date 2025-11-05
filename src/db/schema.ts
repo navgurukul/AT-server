@@ -180,6 +180,12 @@ export const projects = pgTable('projects', {
   orgId: integer('org_id')
     .notNull()
     .references(() => orgs.id),
+  departmentId: integer('department_id')
+    .notNull()
+    .references(() => departments.id),
+  projectManagerId: integer('project_manager_id')
+    .notNull()
+    .references(() => users.id),
   name: varchar('name', { length: 200 }).notNull(),
   code: varchar('code', { length: 40 }).notNull().unique(),
   status: projectStatusEnum().notNull().default('active'),

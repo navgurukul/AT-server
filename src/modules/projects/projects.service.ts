@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Injectable,
   NotFoundException,
   ConflictException,
@@ -18,6 +19,7 @@ import {
 import { DatabaseService } from '../../database/database.service';
 import {
   costRatesTable,
+  departmentsTable,
   projectMembersTable,
   projectsTable,
   timesheetEntriesTable,
@@ -32,9 +34,38 @@ interface ListProjectsParams {
   orgId?: number;
   status?: string;
   search?: string;
+  departmentId?: number;
+  departmentName?: string;
+  projectManagerId?: number;
   page?: number;
   limit?: number;
 }
+
+const ALLOWED_PROJECT_STATUSES = [
+  'active',
+  'draft',
+  'on_hold',
+  'completed',
+  'archived',
+] as const;
+
+const PROJECT_SELECTION = {
+  id: projectsTable.id,
+  orgId: projectsTable.orgId,
+  departmentId: projectsTable.departmentId,
+  projectManagerId: projectsTable.projectManagerId,
+  name: projectsTable.name,
+  code: projectsTable.code,
+  status: projectsTable.status,
+  startDate: projectsTable.startDate,
+  endDate: projectsTable.endDate,
+  budgetCurrency: projectsTable.budgetCurrency,
+  budgetAmount: projectsTable.budgetAmount,
+  budgetAmountMinor: projectsTable.budgetAmountMinor,
+  createdAt: projectsTable.createdAt,
+  updatedAt: projectsTable.updatedAt,
+  description: projectsTable.description,
+};
 
 @Injectable()
 export class ProjectsService {
@@ -55,13 +86,63 @@ export class ProjectsService {
       );
     }
 
+    const requestedStatus =
+      payload.status && ALLOWED_PROJECT_STATUSES.includes(payload.status as any)
+        ? (payload.status as (typeof ALLOWED_PROJECT_STATUSES)[number])
+        : 'active';
+
+    const [department] = await db
+      .select({
+        id: departmentsTable.id,
+        orgId: departmentsTable.orgId,
+      })
+      .from(departmentsTable)
+      .where(eq(departmentsTable.id, payload.departmentId))
+      .limit(1);
+
+    if (!department) {
+      throw new NotFoundException(
+        `Department with id ${payload.departmentId} not found`,
+      );
+    }
+
+    if (Number(department.orgId) !== payload.orgId) {
+      throw new BadRequestException(
+        'Department does not belong to the provided organisation',
+      );
+    }
+
+    const [manager] = await db
+      .select({
+        id: usersTable.id,
+        orgId: usersTable.orgId,
+        status: usersTable.status,
+      })
+      .from(usersTable)
+      .where(eq(usersTable.id, payload.projectManagerId))
+      .limit(1);
+
+    if (!manager) {
+      throw new NotFoundException(
+        `Project manager with id ${payload.projectManagerId} not found`,
+      );
+    }
+
+    if (Number(manager.orgId) !== payload.orgId) {
+      throw new BadRequestException(
+        'Project manager must belong to the same organisation',
+      );
+    }
+
     const [project] = await db
       .insert(projectsTable)
       .values({
         orgId: payload.orgId,
+        departmentId: payload.departmentId,
+        projectManagerId: payload.projectManagerId,
         name: payload.name,
         code: payload.code,
-        status: (payload.status ?? 'draft') as 'draft' | 'completed' | 'active' | 'on_hold' | 'archived',
+        status: requestedStatus,
         startDate: payload.startDate ? new Date(payload.startDate) : null,
         endDate: payload.endDate ? new Date(payload.endDate) : null,
         budgetCurrency: payload.budgetCurrency ?? null,
@@ -70,9 +151,10 @@ export class ProjectsService {
             ? payload.budgetAmountMinor.toString()
             : null,
       })
-      .returning();
+      .returning(PROJECT_SELECTION);
 
-    return project;
+    const [hydrated] = await this.hydrateProjects(project ? [project] : []);
+    return hydrated ?? project;
   }
 
   async listProjects(params: ListProjectsParams = {}) {
@@ -85,37 +167,66 @@ export class ProjectsService {
     if (params.orgId) {
       filters.push(eq(projectsTable.orgId, params.orgId));
     }
-    if (params.status) {
-      const allowedStatuses = ['active', 'draft', 'on_hold', 'completed', 'archived'] as const;
-      if (allowedStatuses.includes(params.status as any)) {
-        filters.push(eq(projectsTable.status, params.status as typeof allowedStatuses[number]));
-      }
-    }
-    if (params.search) {
-      const term = `%${params.search.toLowerCase()}%`;
+    if (
+      params.status &&
+      ALLOWED_PROJECT_STATUSES.includes(params.status as any)
+    ) {
       filters.push(
-        or(
-          ilike(projectsTable.name, term),
-          ilike(projectsTable.code, term),
+        eq(
+          projectsTable.status,
+          params.status as (typeof ALLOWED_PROJECT_STATUSES)[number],
         ),
       );
+    }
+    if (params.departmentId) {
+      filters.push(eq(projectsTable.departmentId, params.departmentId));
+    }
+    if (params.projectManagerId) {
+      filters.push(
+        eq(projectsTable.projectManagerId, params.projectManagerId),
+      );
+    }
+
+    if (params.departmentName) {
+      const term = `%${params.departmentName.trim().toLowerCase()}%`;
+      const matchingDepartments = await db
+        .select({ id: departmentsTable.id })
+        .from(departmentsTable)
+        .where(ilike(departmentsTable.name, term));
+
+      if (matchingDepartments.length === 0) {
+        return {
+          data: [],
+          page,
+          limit,
+          total: 0,
+        };
+      }
+
+      const matchedDepartmentIds = matchingDepartments.map((department) =>
+        Number(department.id),
+      );
+      filters.push(
+        inArray(projectsTable.departmentId, matchedDepartmentIds),
+      );
+    }
+
+    if (params.search) {
+      const cleaned = params.search.trim();
+      if (cleaned.length > 0) {
+        const term = `%${cleaned.toLowerCase()}%`;
+        filters.push(
+          or(
+            ilike(projectsTable.name, term),
+            ilike(projectsTable.code, term),
+          ),
+        );
+      }
     }
 
     const whereClause = filters.length > 0 ? and(...filters) : undefined;
 
-    const baseQuery = db.select({
-      id: projectsTable.id,
-      name: projectsTable.name,
-      code: projectsTable.code,
-      status: projectsTable.status,
-      orgId: projectsTable.orgId,
-      startDate: projectsTable.startDate,
-      endDate: projectsTable.endDate,
-      budgetCurrency: projectsTable.budgetCurrency,
-      budgetAmountMinor: projectsTable.budgetAmountMinor,
-      createdAt: projectsTable.createdAt,
-      updatedAt: projectsTable.updatedAt,
-    }).from(projectsTable);
+    const baseQuery = db.select(PROJECT_SELECTION).from(projectsTable);
 
     const filteredQuery = whereClause ? baseQuery.where(whereClause) : baseQuery;
 
@@ -134,41 +245,7 @@ export class ProjectsService {
           .from(projectsTable);
     const [{ value: total }] = await countQuery;
 
-    const projectIds = projects.map((project) => project.id);
-    const members =
-      projectIds.length === 0
-        ? []
-        : await db
-            .select({
-              projectId: projectMembersTable.projectId,
-              userId: projectMembersTable.userId,
-              role: projectMembersTable.role,
-              allocationPct: projectMembersTable.allocationPct,
-              startDate: projectMembersTable.startDate,
-              endDate: projectMembersTable.endDate,
-              userName: usersTable.name,
-              userEmail: usersTable.email,
-            })
-            .from(projectMembersTable)
-            .innerJoin(
-              usersTable,
-              eq(projectMembersTable.userId, usersTable.id),
-            )
-            .where(inArray(projectMembersTable.projectId, projectIds));
-
-    const membersByProject = members.reduce<Record<number, typeof members>>(
-      (acc, curr) => {
-        acc[curr.projectId] = acc[curr.projectId] ?? [];
-        acc[curr.projectId].push(curr);
-        return acc;
-      },
-      {},
-    );
-
-    const enrichedProjects = projects.map((project) => ({
-      ...project,
-      members: membersByProject[project.id] ?? [],
-    }));
+    const enrichedProjects = await this.hydrateProjects(projects);
 
     return {
       data: enrichedProjects,
@@ -182,13 +259,13 @@ export class ProjectsService {
     const db = this.database.connection;
 
     const [existing] = await db
-      .select({ id: projectsTable.id, code: projectsTable.code })
+      .select(PROJECT_SELECTION)
       .from(projectsTable)
       .where(eq(projectsTable.id, id))
       .limit(1);
 
     if (!existing) {
-      throw new NotFoundException(`Project with id ${id} not found`);
+      throw new NotFoundException('Project with id ' + id + ' not found');
     }
 
     if (payload.code && payload.code !== existing.code) {
@@ -198,22 +275,62 @@ export class ProjectsService {
         .where(eq(projectsTable.code, payload.code))
         .limit(1);
       if (codeUsed) {
-        throw new ConflictException(
-          `Project code '${payload.code}' is already in use`,
-        );
+        throw new ConflictException('Project code ' + payload.code + ' is already in use');
       }
     }
 
     const updateValues: Partial<typeof projectsTable.$inferInsert> = {};
+
+    if (payload.departmentId !== undefined) {
+      const [department] = await db
+        .select({
+          id: departmentsTable.id,
+          orgId: departmentsTable.orgId,
+        })
+        .from(departmentsTable)
+        .where(eq(departmentsTable.id, payload.departmentId))
+        .limit(1);
+
+      if (!department) {
+        throw new NotFoundException('Department with id ' + payload.departmentId + ' not found');
+      }
+
+      if (Number(department.orgId) !== Number(existing.orgId)) {
+        throw new BadRequestException('Department does not belong to the same organisation');
+      }
+
+      updateValues.departmentId = payload.departmentId;
+    }
+
+    if (payload.projectManagerId !== undefined) {
+      const [manager] = await db
+        .select({
+          id: usersTable.id,
+          orgId: usersTable.orgId,
+          status: usersTable.status,
+        })
+        .from(usersTable)
+        .where(eq(usersTable.id, payload.projectManagerId))
+        .limit(1);
+
+      if (!manager) {
+        throw new NotFoundException('Project manager with id ' + payload.projectManagerId + ' not found');
+      }
+
+      if (Number(manager.orgId) !== Number(existing.orgId)) {
+        throw new BadRequestException('Project manager must belong to the same organisation');
+      }
+
+      updateValues.projectManagerId = payload.projectManagerId;
+    }
+
     if (payload.name !== undefined) updateValues.name = payload.name;
     if (payload.code !== undefined) updateValues.code = payload.code;
     if (payload.status !== undefined) {
-      const allowedStatuses = ['active', 'draft', 'on_hold', 'completed', 'archived'] as const;
-      if (allowedStatuses.includes(payload.status as any)) {
-        updateValues.status = payload.status as typeof allowedStatuses[number];
-      } else {
-        updateValues.status = undefined;
+      if (!ALLOWED_PROJECT_STATUSES.includes(payload.status as any)) {
+        throw new BadRequestException('Invalid project status');
       }
+      updateValues.status = payload.status as (typeof ALLOWED_PROJECT_STATUSES)[number];
     }
     if (payload.startDate !== undefined) {
       updateValues.startDate = payload.startDate
@@ -230,22 +347,26 @@ export class ProjectsService {
       updateValues.budgetAmountMinor = payload.budgetAmountMinor.toString();
     }
 
-    if (Object.keys(updateValues).length === 0) {
-      return existing;
+    let resultingProject = existing;
+
+    if (Object.keys(updateValues).length > 0) {
+      const [updated] = await db
+        .update(projectsTable)
+        .set({
+          ...updateValues,
+          updatedAt: new Date(),
+        })
+        .where(eq(projectsTable.id, id))
+        .returning(PROJECT_SELECTION);
+
+      if (updated) {
+        resultingProject = updated;
+      }
     }
 
-    const [updated] = await db
-      .update(projectsTable)
-      .set({
-        ...updateValues,
-        updatedAt: new Date(),
-      })
-      .where(eq(projectsTable.id, id))
-      .returning();
-
-    return updated;
+    const [hydrated] = await this.hydrateProjects([resultingProject]);
+    return hydrated ?? resultingProject;
   }
-
   async assignMember(projectId: number, payload: AssignMemberDto) {
     const db = this.database.connection;
 
@@ -580,6 +701,144 @@ export class ProjectsService {
     };
   }
 
+  private async hydrateProjects(
+    projects: Array<
+      typeof projectsTable.$inferSelect & {
+        departmentId: number | null;
+        projectManagerId: number | null;
+      }
+    >,
+  ) {
+    if (projects.length === 0) {
+      return [];
+    }
+
+    const db = this.database.connection;
+    const projectIds = projects.map((project) => project.id);
+
+    const departmentIds = Array.from(
+      new Set(
+        projects
+          .map((project) => project.departmentId)
+          .filter((id): id is number => id !== null && id !== undefined),
+      ),
+    );
+
+    const projectManagerIds = Array.from(
+      new Set(
+        projects
+          .map((project) => project.projectManagerId)
+          .filter((id): id is number => id !== null && id !== undefined),
+      ),
+    );
+
+    const departments =
+      departmentIds.length === 0
+        ? []
+        : await db
+            .select({
+              id: departmentsTable.id,
+              name: departmentsTable.name,
+              code: departmentsTable.code,
+              description: departmentsTable.description,
+            })
+            .from(departmentsTable)
+            .where(inArray(departmentsTable.id, departmentIds));
+
+    const departmentsById = departments.reduce<
+      Record<
+        number,
+        {
+          id: number;
+          name: string;
+          code: string | null;
+          description: string | null;
+        }
+      >
+    >((acc, department) => {
+      acc[Number(department.id)] = {
+        id: Number(department.id),
+        name: department.name,
+        code: department.code ?? null,
+        description: department.description ?? null,
+      };
+      return acc;
+    }, {});
+
+    const managers =
+      projectManagerIds.length === 0
+        ? []
+        : await db
+            .select({
+              id: usersTable.id,
+              name: usersTable.name,
+              email: usersTable.email,
+            })
+            .from(usersTable)
+            .where(inArray(usersTable.id, projectManagerIds));
+
+    const managersById = managers.reduce<
+      Record<
+        number,
+        {
+          id: number;
+          name: string | null;
+          email: string | null;
+        }
+      >
+    >((acc, manager) => {
+      acc[Number(manager.id)] = {
+        id: Number(manager.id),
+        name: manager.name ?? null,
+        email: manager.email ?? null,
+      };
+      return acc;
+    }, {});
+
+    const members =
+      projectIds.length === 0
+        ? []
+        : await db
+            .select({
+              projectId: projectMembersTable.projectId,
+              userId: projectMembersTable.userId,
+              role: projectMembersTable.role,
+              allocationPct: projectMembersTable.allocationPct,
+              startDate: projectMembersTable.startDate,
+              endDate: projectMembersTable.endDate,
+              userName: usersTable.name,
+              userEmail: usersTable.email,
+            })
+            .from(projectMembersTable)
+            .innerJoin(
+              usersTable,
+              eq(projectMembersTable.userId, usersTable.id),
+            )
+            .where(inArray(projectMembersTable.projectId, projectIds));
+
+    const membersByProject = members.reduce<Record<number, typeof members>>(
+      (acc, curr) => {
+        acc[curr.projectId] = acc[curr.projectId] ?? [];
+        acc[curr.projectId].push(curr);
+        return acc;
+      },
+      {},
+    );
+
+    return projects.map((project) => ({
+      ...project,
+      department:
+        project.departmentId !== null
+          ? departmentsById[project.departmentId] ?? null
+          : null,
+      projectManager:
+        project.projectManagerId !== null
+          ? managersById[project.projectManagerId] ?? null
+          : null,
+      members: membersByProject[project.id] ?? [],
+    }));
+  }
+
   private resolveDateRange(from?: string, to?: string) {
     const fromDate = from ? new Date(from) : undefined;
     const toDate = to ? new Date(to) : undefined;
@@ -603,3 +862,10 @@ export class ProjectsService {
     }
   }
 }
+
+
+
+
+
+
+

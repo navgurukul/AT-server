@@ -1,6 +1,6 @@
 {
-  "id": "72f65c48-5b8d-4459-8874-a651f40431bf",
-  "prevId": "03d14d1e-d859-4be6-af53-3616d42317a5",
+  "id": "a26c2e5e-f803-4b99-ba39-60f95e8d594e",
+  "prevId": "72f65c48-5b8d-4459-8874-a651f40431bf",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -2103,6 +2103,18 @@
           "primaryKey": false,
           "notNull": true
         },
+        "department_id": {
+          "name": "department_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "project_manager_id": {
+          "name": "project_manager_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
         "name": {
           "name": "name",
           "type": "varchar(200)",
@@ -2182,6 +2194,32 @@
           "tableTo": "orgs",
           "columnsFrom": [
             "org_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "projects_department_id_departments_id_fk": {
+          "name": "projects_department_id_departments_id_fk",
+          "tableFrom": "projects",
+          "tableTo": "departments",
+          "columnsFrom": [
+            "department_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "projects_project_manager_id_users_id_fk": {
+          "name": "projects_project_manager_id_users_id_fk",
+          "tableFrom": "projects",
+          "tableTo": "users",
+          "columnsFrom": [
+            "project_manager_id"
           ],
           "columnsTo": [
             "id"

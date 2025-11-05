@@ -33,12 +33,18 @@ export class ProjectsController {
   @ApiQuery({ name: 'orgId', required: false, type: Number })
   @ApiQuery({ name: 'status', required: false, type: String })
   @ApiQuery({ name: 'search', required: false, type: String })
+  @ApiQuery({ name: 'departmentId', required: false, type: Number })
+  @ApiQuery({ name: 'departmentName', required: false, type: String })
+  @ApiQuery({ name: 'projectManagerId', required: false, type: Number })
   @ApiQuery({ name: 'page', required: false, type: Number })
   @ApiQuery({ name: 'limit', required: false, type: Number })
   listProjects(
     @Query('orgId') orgId?: string,
     @Query('status') status?: string,
     @Query('search') search?: string,
+    @Query('departmentId') departmentId?: string,
+    @Query('departmentName') departmentName?: string,
+    @Query('projectManagerId') projectManagerId?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
@@ -46,6 +52,9 @@ export class ProjectsController {
       orgId: orgId ? Number.parseInt(orgId, 10) : undefined,
       status: status ?? undefined,
       search: search ?? undefined,
+      departmentId: departmentId ? Number.parseInt(departmentId, 10) : undefined,
+      departmentName: departmentName ?? undefined,
+      projectManagerId: projectManagerId ? Number.parseInt(projectManagerId, 10) : undefined,
       page: page ? Number.parseInt(page, 10) : undefined,
       limit: limit ? Number.parseInt(limit, 10) : undefined,
     });

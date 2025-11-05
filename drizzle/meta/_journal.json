@@ -57,6 +57,13 @@
       "when": 1762350784087,
       "tag": "0008_overjoyed_liz_osborn",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1762355711936,
+      "tag": "0008_rich_vapor",
+      "breakpoints": true
     }
   ]
 }

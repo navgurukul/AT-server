@@ -29,6 +29,14 @@ export class CreateProjectDto {
   @IsString()
   status?: string;
 
+  @ApiProperty()
+  @IsInt()
+  departmentId!: number;
+
+  @ApiProperty()
+  @IsInt()
+  projectManagerId!: number;
+
   @ApiPropertyOptional()
   @IsOptional()
   @IsDateString()
