@@ -35,7 +35,7 @@ function sanitize(value: string | undefined | null): string | undefined {
         }
 
         const url = new URL(rawConnectionString);
-        url.searchParams.set('options', '-c search_path=navtrack,public,main');
+        url.searchParams.set('options', '-c search_path=public');
 
         const sslMode = (
           sanitize(configService.get<string>('DB_SSL_MODE')) ?? 'require'

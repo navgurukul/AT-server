@@ -23,8 +23,8 @@ function buildConnectionConfig() {
 
   if (explicitUrl) {
     const url = new URL(explicitUrl);
-    url.searchParams.set('options', '-c search_path=navtrack,public,main');
-    url.searchParams.delete('sslmode');
+    url.searchParams.set('options', '-c search_path=public');
+    url.searchParams.set('sslmode', 'require');
     return {
       connectionString: url.toString(),
       ssl: requiresSsl ? { rejectUnauthorized: false } : false,
@@ -53,7 +53,7 @@ async function main() {
   const client = new Client(buildConnectionConfig());
 
   await client.connect();
-  await client.query('SET search_path TO navtrack, public, main');
+  await client.query('SET search_path TO public');
 
   await client.query('CREATE SCHEMA IF NOT EXISTS drizzle');
   await client.query(`
