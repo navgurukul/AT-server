@@ -162,6 +162,7 @@ export class LeavesService {
 
       let requestedDurationType: "half_day" | "full_day" | "custom";
       let requestedHours: number;
+      let requestedHalfDaySegment: "first_half" | "second_half" | null = null;
 
       switch (payload.durationType) {
         case "half_day":
@@ -170,8 +171,14 @@ export class LeavesService {
               "Half-day requests must span a single working day"
             );
           }
+          if (!payload.halfDaySegment) {
+            throw new BadRequestException(
+              "Half-day requests must specify whether it is the first or second half"
+            );
+          }
           requestedDurationType = "half_day";
           requestedHours = HALF_DAY_HOURS;
+          requestedHalfDaySegment = payload.halfDaySegment;
           break;
         case "full_day":
           requestedDurationType = "full_day";
@@ -194,6 +201,15 @@ export class LeavesService {
             requestedDurationType = "full_day";
             requestedHours = totalHours;
           }
+      }
+
+      if (
+        payload.halfDaySegment &&
+        requestedDurationType !== "half_day"
+      ) {
+        throw new BadRequestException(
+          "Half-day segment can only be provided for half-day requests"
+        );
       }
 
       if (requestedHours <= 0) {
@@ -266,6 +282,7 @@ export class LeavesService {
           startDate,
           endDate,
           durationType: requestedDurationType,
+          halfDaySegment: requestedHalfDaySegment,
           hours: requestedHours.toString(),
           reason: payload.reason ?? null,
           state: leaveType.requiresApproval ? "pending" : "approved",
@@ -334,7 +351,6 @@ export class LeavesService {
         .update(leaveRequestsTable)
         .set({
           state: newState,
-          decidedAt: now,
           decidedByUserId: approverId,
           updatedAt: now,
         })
@@ -432,7 +448,6 @@ export class LeavesService {
         .update(leaveRequestsTable)
         .set({
           state: newState,
-          decidedAt: now,
           decidedByUserId: approverId,
           updatedAt: now,
         })
@@ -516,10 +531,10 @@ export class LeavesService {
         endDate: leaveRequestsTable.endDate,
         hours: leaveRequestsTable.hours,
         durationType: leaveRequestsTable.durationType,
+        halfDaySegment: leaveRequestsTable.halfDaySegment,
         reason: leaveRequestsTable.reason,
         state: leaveRequestsTable.state,
         requestedAt: leaveRequestsTable.requestedAt,
-        decidedAt: leaveRequestsTable.decidedAt,
         leaveTypeName: leaveTypesTable.name,
         leaveTypeCode: leaveTypesTable.code,
         userName: usersTable.name,

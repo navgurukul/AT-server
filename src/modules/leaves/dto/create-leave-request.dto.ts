@@ -42,4 +42,12 @@ export class CreateLeaveRequestDto {
   @IsOptional()
   @IsIn(['half_day', 'full_day', 'custom'])
   durationType?: 'half_day' | 'full_day' | 'custom';
+
+  @ApiPropertyOptional({
+    enum: ['first_half', 'second_half'],
+    description: 'Required when requesting a half-day leave.',
+  })
+  @IsOptional()
+  @IsIn(['first_half', 'second_half'])
+  halfDaySegment?: 'first_half' | 'second_half';
 }

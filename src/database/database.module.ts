@@ -25,7 +25,7 @@ import { createDrizzleClient } from './drizzle.provider';
           ssl:  {
                 rejectUnauthorized: false,
               },
-          options: '-c search_path=public,main',
+          options: '-c search_path=navtrack,public,main',
         });
       },
     },

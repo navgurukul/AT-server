@@ -350,12 +350,12 @@ export const leaveRequests = pgTable('leave_requests', {
   durationType: varchar('duration_type', { length: 20 })
     .notNull()
     .default('custom'),
+  halfDaySegment: varchar('half_day_segment', { length: 20 }),
   hours: numeric('hours', { precision: 6, scale: 2 }).notNull(),
   reason: text('reason'),
   state: leaveStateEnum().notNull().default('pending'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   requestedAt: timestamp('requested_at', { withTimezone: true }).defaultNow(),
-  decidedAt: timestamp('decided_at', { withTimezone: true }),
   decidedByUserId: integer('decided_by_user_id').references(() => users.id),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
 });

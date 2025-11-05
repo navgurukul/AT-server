@@ -28,6 +28,7 @@ async function main() {
   const client = new Client(buildConnectionConfig());
 
   await client.connect();
+  await client.query('SET search_path TO navtrack, public, main');
 
   await client.query('CREATE SCHEMA IF NOT EXISTS drizzle');
   await client.query(`

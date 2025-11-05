@@ -370,6 +370,7 @@ export class ReportsService {
         hours: leaveRequestsTable.hours,
         state: leaveRequestsTable.state,
         durationType: leaveRequestsTable.durationType,
+        halfDaySegment: leaveRequestsTable.halfDaySegment,
         reason: leaveRequestsTable.reason,
         leaveTypeId: leaveRequestsTable.leaveTypeId,
         leaveTypeCode: leaveTypesTable.code,
@@ -403,6 +404,7 @@ export class ReportsService {
           requestId: number;
           state: string;
           durationType: string;
+          halfDaySegment: string | null;
           hours: number;
           leaveType: { id: number; code: string | null; name: string | null };
         }>;
@@ -464,6 +466,7 @@ export class ReportsService {
           requestId: request.id,
           state: request.state,
           durationType: request.durationType,
+          halfDaySegment: request.halfDaySegment ?? null,
           hours: Number(hoursForDay.toFixed(2)),
           leaveType: {
             id: request.leaveTypeId,
@@ -495,6 +498,7 @@ export class ReportsService {
           requestId: number;
           state: string;
           durationType: string;
+          halfDaySegment: string | null;
           hours: number;
           leaveType: { id: number; code: string | null; name: string | null };
         }>;
