@@ -1,10 +1,24 @@
 import { Global, Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Pool } from 'pg';
+import { Pool, PoolConfig } from 'pg';
 
 import { DRIZZLE } from './database.constants';
 import { DatabaseService } from './database.service';
 import { createDrizzleClient } from './drizzle.provider';
+
+function sanitize(value: string | undefined | null): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  let trimmed = value.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
+  return trimmed.length > 0 ? trimmed : undefined;
+}
 
 @Global()
 @Module({
@@ -13,20 +27,33 @@ import { createDrizzleClient } from './drizzle.provider';
       provide: Pool,
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => {
-        const connectionString = configService.get<string>('DATABASE_URL');
-        if (!connectionString) {
+        const rawConnectionString = sanitize(
+          configService.get<string>('DATABASE_URL'),
+        );
+        if (!rawConnectionString) {
           throw new Error('DATABASE_URL environment variable is required');
         }
 
-        const isProduction = configService.get<string>('NODE_ENV') === 'production';
+        const url = new URL(rawConnectionString);
+        url.searchParams.set('options', '-c search_path=navtrack,public,main');
 
-        return new Pool({
-          connectionString,
-          ssl:  {
-                rejectUnauthorized: false,
-              },
-          options: '-c search_path=navtrack,public,main',
-        });
+        const sslMode = (
+          sanitize(configService.get<string>('DB_SSL_MODE')) ?? 'require'
+        ).toLowerCase();
+
+        const poolConfig: PoolConfig = {
+          connectionString: url.toString(),
+        };
+
+        url.searchParams.delete('sslmode');
+        poolConfig.connectionString = url.toString();
+        poolConfig.ssl = ['require', 'verify-full', 'prefer', 'allow', 'true'].includes(
+          sslMode,
+        )
+          ? { rejectUnauthorized: false }
+          : false;
+
+        return new Pool(poolConfig);
       },
     },
     {

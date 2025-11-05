@@ -2,22 +2,47 @@ import 'dotenv/config';
 import { Client } from 'pg';
 import { readMigrationFiles } from 'drizzle-orm/migrator';
 
+function sanitize(value) {
+  if (!value) {
+    return undefined;
+  }
+  let trimmed = value.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function buildConnectionConfig() {
-  if (process.env.DB_HOST && process.env.DB_USER && process.env.DB_NAME) {
+  const explicitUrl = sanitize(process.env.DATABASE_URL);
+  const sslMode = (sanitize(process.env.DB_SSL_MODE) ?? 'require').toLowerCase();
+  const requiresSsl = ['require', 'verify-full', 'prefer', 'allow', 'true'].includes(sslMode);
+
+  if (explicitUrl) {
+    const url = new URL(explicitUrl);
+    url.searchParams.set('options', '-c search_path=navtrack,public,main');
+    url.searchParams.delete('sslmode');
     return {
-      host: process.env.DB_HOST,
-      port: Number(process.env.DB_PORT ?? 5432),
-      user: process.env.DB_USER,
-      password: process.env.DB_PASS ?? undefined,
-      database: process.env.DB_NAME,
-      ssl: { rejectUnauthorized: false },
+      connectionString: url.toString(),
+      ssl: requiresSsl ? { rejectUnauthorized: false } : false,
     };
   }
 
-  if (process.env.DATABASE_URL) {
+  const host = sanitize(process.env.DB_HOST);
+  const user = sanitize(process.env.DB_USER);
+  const database = sanitize(process.env.DB_NAME);
+
+  if (host && user && database) {
     return {
-      connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
+      host,
+      port: Number(sanitize(process.env.DB_PORT) ?? 5432),
+      user,
+      password: sanitize(process.env.DB_PASS),
+      database,
+      ssl: requiresSsl ? { rejectUnauthorized: false } : false,
     };
   }
 
