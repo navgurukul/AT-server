@@ -2,7 +2,7 @@ import {
   BadRequestException,
   Injectable,
   NotFoundException,
-} from '@nestjs/common';
+} from "@nestjs/common";
 import {
   and,
   count,
@@ -14,9 +14,9 @@ import {
   or,
   lt,
   sql,
-} from 'drizzle-orm';
+} from "drizzle-orm";
 
-import { DatabaseService } from '../../database/database.service';
+import { DatabaseService } from "../../database/database.service";
 import {
   approvalsTable,
   leaveBalancesTable,
@@ -24,14 +24,14 @@ import {
   leaveRequestsTable,
   leaveTypesTable,
   usersTable,
-} from '../../db/schema';
-import { CalendarService } from '../calendar/calendar.service';
-import { CreateLeaveRequestDto } from './dto/create-leave-request.dto';
-import { BulkReviewLeaveRequestsDto } from './dto/bulk-review-leave-requests.dto';
-import { ReviewLeaveRequestDto } from './dto/review-leave-request.dto';
+} from "../../db/schema";
+import { CalendarService } from "../calendar/calendar.service";
+import { CreateLeaveRequestDto } from "./dto/create-leave-request.dto";
+import { BulkReviewLeaveRequestsDto } from "./dto/bulk-review-leave-requests.dto";
+import { ReviewLeaveRequestDto } from "./dto/review-leave-request.dto";
 
 interface ListLeaveRequestsParams {
-  state?: 'pending' | 'approved' | 'rejected' | 'cancelled';
+  state?: "pending" | "approved" | "rejected" | "cancelled";
   managerId?: number;
 }
 
@@ -42,7 +42,7 @@ const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 export class LeavesService {
   constructor(
     private readonly database: DatabaseService,
-    private readonly calendarService: CalendarService,
+    private readonly calendarService: CalendarService
   ) {}
 
   async listBalances(userId: number) {
@@ -65,7 +65,7 @@ export class LeavesService {
       .from(leaveBalancesTable)
       .innerJoin(
         leaveTypesTable,
-        eq(leaveBalancesTable.leaveTypeId, leaveTypesTable.id),
+        eq(leaveBalancesTable.leaveTypeId, leaveTypesTable.id)
       )
       .where(eq(leaveBalancesTable.userId, userId));
 
@@ -75,17 +75,36 @@ export class LeavesService {
     };
   }
 
+  async listLeaveTypes(orgId: number) {
+    const db = this.database.connection;
+
+    const types = await db
+      .select({
+        id: leaveTypesTable.id,
+        code: leaveTypesTable.code,
+        name: leaveTypesTable.name,
+        paid: leaveTypesTable.paid,
+        requiresApproval: leaveTypesTable.requiresApproval,
+        description: leaveTypesTable.description,
+        maxPerRequestHours: leaveTypesTable.maxPerRequestHours,
+      })
+      .from(leaveTypesTable)
+      .where(eq(leaveTypesTable.orgId, orgId));
+
+    return types;
+  }
+
   async createLeaveRequest(
     userId: number,
     orgId: number,
-    payload: CreateLeaveRequestDto,
+    payload: CreateLeaveRequestDto
   ) {
     const db = this.database.connection;
     const startDate = new Date(payload.startDate);
     const endDate = new Date(payload.endDate);
 
     if (endDate < startDate) {
-      throw new BadRequestException('End date cannot be before start date');
+      throw new BadRequestException("End date cannot be before start date");
     }
 
     return await db.transaction(async (tx) => {
@@ -95,13 +114,15 @@ export class LeavesService {
         .where(
           and(
             eq(leaveTypesTable.id, payload.leaveTypeId),
-            eq(leaveTypesTable.orgId, orgId),
-          ),
+            eq(leaveTypesTable.orgId, orgId)
+          )
         )
         .limit(1);
 
       if (!leaveType) {
-        throw new NotFoundException('Leave type not found for this organisation');
+        throw new NotFoundException(
+          "Leave type not found for this organisation"
+        );
       }
 
       const [policy] = await tx
@@ -110,14 +131,14 @@ export class LeavesService {
         .where(
           and(
             eq(leavePoliciesTable.leaveTypeId, payload.leaveTypeId),
-            eq(leavePoliciesTable.orgId, orgId),
-          ),
+            eq(leavePoliciesTable.orgId, orgId)
+          )
         )
         .limit(1);
 
       if (!policy) {
         throw new BadRequestException(
-          'No leave policy configured for the selected leave type',
+          "No leave policy configured for the selected leave type"
         );
       }
 
@@ -126,62 +147,62 @@ export class LeavesService {
       const { workingDays, totalHours } = await this.calculateWorkingHours(
         orgId,
         startDate,
-        endDate,
+        endDate
       );
 
       if (totalHours <= 0) {
         throw new BadRequestException(
-          'Selected date range contains no working days',
+          "Selected date range contains no working days"
         );
       }
 
       if (payload.hours !== undefined && payload.hours <= 0) {
-        throw new BadRequestException('Leave hours must be greater than zero');
+        throw new BadRequestException("Leave hours must be greater than zero");
       }
 
-      let requestedDurationType: 'half_day' | 'full_day' | 'custom';
+      let requestedDurationType: "half_day" | "full_day" | "custom";
       let requestedHours: number;
 
       switch (payload.durationType) {
-        case 'half_day':
+        case "half_day":
           if (workingDays !== 1) {
             throw new BadRequestException(
-              'Half-day requests must span a single working day',
+              "Half-day requests must span a single working day"
             );
           }
-          requestedDurationType = 'half_day';
+          requestedDurationType = "half_day";
           requestedHours = HALF_DAY_HOURS;
           break;
-        case 'full_day':
-          requestedDurationType = 'full_day';
+        case "full_day":
+          requestedDurationType = "full_day";
           requestedHours = totalHours;
           break;
-        case 'custom':
+        case "custom":
           if (payload.hours === undefined) {
             throw new BadRequestException(
-              'Custom duration requires leave hours to be specified',
+              "Custom duration requires leave hours to be specified"
             );
           }
-          requestedDurationType = 'custom';
+          requestedDurationType = "custom";
           requestedHours = payload.hours;
           break;
         default:
           if (payload.hours !== undefined) {
-            requestedDurationType = 'custom';
+            requestedDurationType = "custom";
             requestedHours = payload.hours;
           } else {
-            requestedDurationType = 'full_day';
+            requestedDurationType = "full_day";
             requestedHours = totalHours;
           }
       }
 
       if (requestedHours <= 0) {
-        throw new BadRequestException('Leave hours must be greater than zero');
+        throw new BadRequestException("Leave hours must be greater than zero");
       }
 
       if (requestedHours > totalHours) {
         throw new BadRequestException(
-          `Requested hours exceed available working hours (${totalHours})`,
+          `Requested hours exceed available working hours (${totalHours})`
         );
       }
 
@@ -193,27 +214,27 @@ export class LeavesService {
         .where(
           and(
             eq(leaveRequestsTable.userId, userId),
-            inArray(leaveRequestsTable.state, ['pending', 'approved']),
+            inArray(leaveRequestsTable.state, ["pending", "approved"]),
             or(
               and(
                 gte(leaveRequestsTable.startDate, startDate),
-                lte(leaveRequestsTable.startDate, endDate),
+                lte(leaveRequestsTable.startDate, endDate)
               ),
               and(
                 gte(leaveRequestsTable.endDate, startDate),
-                lte(leaveRequestsTable.endDate, endDate),
+                lte(leaveRequestsTable.endDate, endDate)
               ),
               and(
                 lte(leaveRequestsTable.startDate, startDate),
-                gte(leaveRequestsTable.endDate, endDate),
-              ),
-            ),
-          ),
+                gte(leaveRequestsTable.endDate, endDate)
+              )
+            )
+          )
         );
 
       if (Number(overlappingRequests[0]?.value ?? 0) > 0) {
         throw new BadRequestException(
-          'Overlapping leave request exists for the selected period',
+          "Overlapping leave request exists for the selected period"
         );
       }
 
@@ -224,14 +245,14 @@ export class LeavesService {
           .where(
             and(
               eq(leaveBalancesTable.userId, userId),
-              eq(leaveBalancesTable.leaveTypeId, payload.leaveTypeId),
-            ),
+              eq(leaveBalancesTable.leaveTypeId, payload.leaveTypeId)
+            )
           )
           .limit(1);
 
         if (!balance || Number(balance.balanceHours) < requestedDays) {
           throw new BadRequestException(
-            'Insufficient leave balance for this leave type',
+            "Insufficient leave balance for this leave type"
           );
         }
       }
@@ -247,7 +268,7 @@ export class LeavesService {
           durationType: requestedDurationType,
           hours: requestedHours.toString(),
           reason: payload.reason ?? null,
-          state: leaveType.requiresApproval ? 'pending' : 'approved',
+          state: leaveType.requiresApproval ? "pending" : "approved",
           requestedAt: new Date(),
         })
         .returning();
@@ -268,10 +289,10 @@ export class LeavesService {
             .insert(approvalsTable)
             .values({
               orgId,
-              subjectType: 'leave_request',
+              subjectType: "leave_request",
               subjectId: request.id,
               approverId: user.managerId,
-              decision: 'pending',
+              decision: "pending",
             })
             .onConflictDoNothing();
         }
@@ -283,9 +304,9 @@ export class LeavesService {
 
   async reviewLeaveRequest(
     requestId: number,
-    action: 'approve' | 'reject',
+    action: "approve" | "reject",
     payload: ReviewLeaveRequestDto,
-    approverId: number,
+    approverId: number
   ) {
     const db = this.database.connection;
 
@@ -297,16 +318,16 @@ export class LeavesService {
         .limit(1);
 
       if (!request) {
-        throw new NotFoundException('Leave request not found');
+        throw new NotFoundException("Leave request not found");
       }
 
-      if (!['pending', 'approved'].includes(request.state)) {
+      if (!["pending", "approved"].includes(request.state)) {
         throw new BadRequestException(
-          `Leave request in state ${request.state} cannot be updated`,
+          `Leave request in state ${request.state} cannot be updated`
         );
       }
 
-      const newState = action === 'approve' ? 'approved' : 'rejected';
+      const newState = action === "approve" ? "approved" : "rejected";
       const now = new Date();
 
       const [updated] = await tx
@@ -323,21 +344,21 @@ export class LeavesService {
       await tx
         .update(approvalsTable)
         .set({
-          decision: newState === 'approved' ? 'approved' : 'rejected',
+          decision: newState === "approved" ? "approved" : "rejected",
           comment: payload.comment ?? null,
           decidedAt: now,
         })
         .where(
           and(
-            eq(approvalsTable.subjectType, 'leave_request'),
+            eq(approvalsTable.subjectType, "leave_request"),
             eq(approvalsTable.subjectId, requestId),
-            eq(approvalsTable.approverId, approverId),
-          ),
+            eq(approvalsTable.approverId, approverId)
+          )
         );
 
-      if (newState === 'approved') {
+      if (newState === "approved") {
         await this.applyLeaveBalance(tx, requestId, Number(request.hours));
-      } else if (request.state === 'approved' && newState === 'rejected') {
+      } else if (request.state === "approved" && newState === "rejected") {
         await this.restoreLeaveBalance(tx, requestId, Number(request.hours));
       }
 
@@ -347,15 +368,15 @@ export class LeavesService {
 
   async bulkReviewLeaveRequests(
     payload: BulkReviewLeaveRequestsDto,
-    action: 'approve' | 'reject',
-    approverId: number,
+    action: "approve" | "reject",
+    approverId: number
   ) {
     if (
       (!payload.requestIds || payload.requestIds.length === 0) &&
       (payload.month === undefined || payload.year === undefined)
     ) {
       throw new BadRequestException(
-        'Provide either requestIds or both month and year for bulk review.',
+        "Provide either requestIds or both month and year for bulk review."
       );
     }
 
@@ -377,8 +398,7 @@ export class LeavesService {
         filters.push(lt(leaveRequestsTable.startDate, startOfNextMonth));
       }
 
-      const whereClause =
-        filters.length === 1 ? filters[0] : and(...filters);
+      const whereClause = filters.length === 1 ? filters[0] : and(...filters);
 
       const candidates = await tx
         .select()
@@ -387,23 +407,23 @@ export class LeavesService {
 
       if (candidates.length === 0) {
         throw new NotFoundException(
-          'No leave requests matched the selection criteria.',
+          "No leave requests matched the selection criteria."
         );
       }
 
       const eligible = candidates.filter((request) =>
-        action === 'approve'
-          ? request.state === 'pending'
-          : request.state === 'pending' || request.state === 'approved',
+        action === "approve"
+          ? request.state === "pending"
+          : request.state === "pending" || request.state === "approved"
       );
 
       if (eligible.length === 0) {
         throw new BadRequestException(
-          `No leave requests are eligible to be ${action}d in their current state.`,
+          `No leave requests are eligible to be ${action}d in their current state.`
         );
       }
 
-      const newState = action === 'approve' ? 'approved' : 'rejected';
+      const newState = action === "approve" ? "approved" : "rejected";
       const eligibleIds = eligible.map((request) => request.id);
       const eligibleIdSet = new Set(eligibleIds);
       const now = new Date();
@@ -427,27 +447,27 @@ export class LeavesService {
         })
         .where(
           and(
-            eq(approvalsTable.subjectType, 'leave_request'),
+            eq(approvalsTable.subjectType, "leave_request"),
             eq(approvalsTable.approverId, approverId),
-            inArray(approvalsTable.subjectId, eligibleIds),
-          ),
+            inArray(approvalsTable.subjectId, eligibleIds)
+          )
         );
 
-      if (action === 'approve') {
+      if (action === "approve") {
         for (const request of eligible) {
           await this.applyLeaveBalance(
             tx,
             request.id,
-            Number(request.hours ?? 0),
+            Number(request.hours ?? 0)
           );
         }
       } else {
         for (const request of eligible) {
-          if (request.state === 'approved') {
+          if (request.state === "approved") {
             await this.restoreLeaveBalance(
               tx,
               request.id,
-              Number(request.hours ?? 0),
+              Number(request.hours ?? 0)
             );
           }
         }
@@ -485,9 +505,7 @@ export class LeavesService {
       filters.push(eq(usersTable.managerId, params.managerId));
     }
 
-    const whereClause = filters.length
-      ? and(...filters)
-      : undefined;
+    const whereClause = filters.length ? and(...filters) : undefined;
 
     const baseQuery = db
       .select({
@@ -510,7 +528,7 @@ export class LeavesService {
       .from(leaveRequestsTable)
       .innerJoin(
         leaveTypesTable,
-        eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id),
+        eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id)
       )
       .innerJoin(usersTable, eq(leaveRequestsTable.userId, usersTable.id));
 
@@ -519,7 +537,7 @@ export class LeavesService {
       : baseQuery;
 
     const requests = await filteredQuery.orderBy(
-      desc(leaveRequestsTable.requestedAt),
+      desc(leaveRequestsTable.requestedAt)
     );
 
     return requests;
@@ -528,22 +546,22 @@ export class LeavesService {
   private async assertNoHolidays(
     orgId: number,
     startDate: Date,
-    endDate: Date,
+    endDate: Date
   ) {
     const start = new Date(
       Date.UTC(
         startDate.getUTCFullYear(),
         startDate.getUTCMonth(),
-        startDate.getUTCDate(),
-      ),
+        startDate.getUTCDate()
+      )
     );
 
     const finish = new Date(
       Date.UTC(
         endDate.getUTCFullYear(),
         endDate.getUTCMonth(),
-        endDate.getUTCDate(),
-      ),
+        endDate.getUTCDate()
+      )
     );
 
     const cursor = new Date(start);
@@ -552,7 +570,7 @@ export class LeavesService {
         throw new BadRequestException(
           `Cannot request leave on holiday or non-working day ${cursor
             .toISOString()
-            .slice(0, 10)}`,
+            .slice(0, 10)}`
         );
       }
       cursor.setUTCDate(cursor.getUTCDate() + 1);
@@ -562,27 +580,27 @@ export class LeavesService {
   private async calculateWorkingHours(
     orgId: number,
     startDate: Date,
-    endDate: Date,
+    endDate: Date
   ) {
     const start = new Date(
       Date.UTC(
         startDate.getUTCFullYear(),
         startDate.getUTCMonth(),
-        startDate.getUTCDate(),
-      ),
+        startDate.getUTCDate()
+      )
     );
     const finish = new Date(
       Date.UTC(
         endDate.getUTCFullYear(),
         endDate.getUTCMonth(),
-        endDate.getUTCDate(),
-      ),
+        endDate.getUTCDate()
+      )
     );
 
     const holidayMap = await this.calendarService.getHolidayMap(
       orgId,
       start,
-      finish,
+      finish
     );
 
     let workingDays = 0;
@@ -594,9 +612,7 @@ export class LeavesService {
       const isSecondOrFourthSaturday =
         dayOfWeek === 6 && this.isSecondOrFourthSaturday(cursor);
       const defaultWorkingDay = !(isSunday || isSecondOrFourthSaturday);
-      const isWorkingDay = override
-        ? override.isWorkingDay
-        : defaultWorkingDay;
+      const isWorkingDay = override ? override.isWorkingDay : defaultWorkingDay;
 
       if (isWorkingDay) {
         workingDays += 1;
@@ -612,9 +628,9 @@ export class LeavesService {
   }
 
   private async applyLeaveBalance(
-    tx: DatabaseService['connection'],
+    tx: DatabaseService["connection"],
     requestId: number,
-    hours: number,
+    hours: number
   ) {
     const [request] = await tx
       .select({
@@ -626,7 +642,7 @@ export class LeavesService {
       .limit(1);
 
     if (!request) {
-      throw new NotFoundException('Leave request not found');
+      throw new NotFoundException("Leave request not found");
     }
 
     const [balance] = await tx
@@ -638,14 +654,14 @@ export class LeavesService {
       .where(
         and(
           eq(leaveBalancesTable.userId, request.userId),
-          eq(leaveBalancesTable.leaveTypeId, request.leaveTypeId),
-        ),
+          eq(leaveBalancesTable.leaveTypeId, request.leaveTypeId)
+        )
       )
       .limit(1);
 
     if (!balance) {
       throw new BadRequestException(
-        'Leave balance not found for user and leave type',
+        "Leave balance not found for user and leave type"
       );
     }
 
@@ -653,7 +669,7 @@ export class LeavesService {
     const remaining = Number(balance.balanceHours) - requestedDays;
     if (remaining < 0) {
       throw new BadRequestException(
-        'Insufficient leave balance to approve this request',
+        "Insufficient leave balance to approve this request"
       );
     }
 
@@ -667,9 +683,9 @@ export class LeavesService {
   }
 
   private async restoreLeaveBalance(
-    tx: DatabaseService['connection'],
+    tx: DatabaseService["connection"],
     requestId: number,
-    hours: number,
+    hours: number
   ) {
     const [request] = await tx
       .select({
@@ -693,8 +709,8 @@ export class LeavesService {
       .where(
         and(
           eq(leaveBalancesTable.userId, request.userId),
-          eq(leaveBalancesTable.leaveTypeId, request.leaveTypeId),
-        ),
+          eq(leaveBalancesTable.leaveTypeId, request.leaveTypeId)
+        )
       );
   }
 
@@ -704,17 +720,3 @@ export class LeavesService {
     return occurrence === 2 || occurrence === 4;
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
