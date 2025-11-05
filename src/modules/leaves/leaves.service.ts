@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from "@nestjs/common";
@@ -94,6 +95,74 @@ export class LeavesService {
     return types;
   }
 
+  async listLeaveRequests(params: ListLeaveRequestsParams = {}) {
+    const db = this.database.connection;
+
+    const filters = [];
+    if (params.state) {
+      filters.push(eq(leaveRequestsTable.state, params.state));
+    }
+    if (params.managerId) {
+      filters.push(eq(usersTable.managerId, params.managerId));
+    }
+
+    const baseQuery = db
+      .select({
+        id: leaveRequestsTable.id,
+        userId: leaveRequestsTable.userId,
+        leaveTypeId: leaveRequestsTable.leaveTypeId,
+        state: leaveRequestsTable.state,
+        startDate: leaveRequestsTable.startDate,
+        endDate: leaveRequestsTable.endDate,
+        durationType: leaveRequestsTable.durationType,
+        halfDaySegment: leaveRequestsTable.halfDaySegment,
+        hours: leaveRequestsTable.hours,
+        reason: leaveRequestsTable.reason,
+        requestedAt: leaveRequestsTable.requestedAt,
+        updatedAt: leaveRequestsTable.updatedAt,
+        decidedByUserId: leaveRequestsTable.decidedByUserId,
+        leaveTypeName: leaveTypesTable.name,
+        leaveTypeCode: leaveTypesTable.code,
+        requesterName: usersTable.name,
+        requesterEmail: usersTable.email,
+        managerId: usersTable.managerId,
+      })
+      .from(leaveRequestsTable)
+      .innerJoin(usersTable, eq(usersTable.id, leaveRequestsTable.userId))
+      .innerJoin(
+        leaveTypesTable,
+        eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id),
+      );
+
+    const query = filters.length > 0 ? baseQuery.where(and(...filters)) : baseQuery;
+
+    const rows = await query.orderBy(desc(leaveRequestsTable.requestedAt));
+
+    return rows.map((row) => ({
+      id: row.id,
+      user: {
+        id: Number(row.userId),
+        name: row.requesterName ?? null,
+        email: row.requesterEmail ?? null,
+      },
+      managerId: row.managerId !== null && row.managerId !== undefined ? Number(row.managerId) : null,
+      leaveType: {
+        id: Number(row.leaveTypeId),
+        name: row.leaveTypeName,
+        code: row.leaveTypeCode ?? null,
+      },
+      state: row.state,
+      startDate: row.startDate,
+      endDate: row.endDate,
+      durationType: row.durationType,
+      halfDaySegment: row.halfDaySegment ?? null,
+      hours: row.hours ? Number(row.hours) : 0,
+      reason: row.reason ?? null,
+      requestedAt: row.requestedAt,
+      updatedAt: row.updatedAt,
+      decidedByUserId: row.decidedByUserId ?? null,
+    }));
+  }
   async createLeaveRequest(
     userId: number,
     orgId: number,
@@ -329,22 +398,36 @@ export class LeavesService {
 
     return await db.transaction(async (tx) => {
       const [request] = await tx
-        .select()
+        .select({
+          id: leaveRequestsTable.id,
+          state: leaveRequestsTable.state,
+          userId: leaveRequestsTable.userId,
+          hours: leaveRequestsTable.hours,
+          managerId: usersTable.managerId,
+        })
         .from(leaveRequestsTable)
+        .innerJoin(
+          usersTable,
+          eq(usersTable.id, leaveRequestsTable.userId),
+        )
         .where(eq(leaveRequestsTable.id, requestId))
         .limit(1);
 
       if (!request) {
-        throw new NotFoundException("Leave request not found");
+        throw new NotFoundException('Leave request not found');
       }
 
-      if (!["pending", "approved"].includes(request.state)) {
+      if (request.managerId === null || request.managerId !== approverId) {
+        throw new ForbiddenException('You are not authorized to review this leave request');
+      }
+
+      if (!['pending', 'approved'].includes(request.state)) {
         throw new BadRequestException(
-          `Leave request in state ${request.state} cannot be updated`
+          `Leave request in state ${request.state} cannot be updated`,
         );
       }
 
-      const newState = action === "approve" ? "approved" : "rejected";
+      const newState = action === 'approve' ? 'approved' : 'rejected';
       const now = new Date();
 
       const [updated] = await tx
@@ -360,28 +443,35 @@ export class LeavesService {
       await tx
         .update(approvalsTable)
         .set({
-          decision: newState === "approved" ? "approved" : "rejected",
+          decision: newState === 'approved' ? 'approved' : 'rejected',
           comment: payload.comment ?? null,
           decidedAt: now,
         })
         .where(
           and(
-            eq(approvalsTable.subjectType, "leave_request"),
+            eq(approvalsTable.subjectType, 'leave_request'),
             eq(approvalsTable.subjectId, requestId),
-            eq(approvalsTable.approverId, approverId)
-          )
+            eq(approvalsTable.approverId, approverId),
+          ),
         );
 
-      if (newState === "approved") {
-        await this.applyLeaveBalance(tx, requestId, Number(request.hours));
-      } else if (request.state === "approved" && newState === "rejected") {
-        await this.restoreLeaveBalance(tx, requestId, Number(request.hours));
+      if (newState === 'approved') {
+        await this.applyLeaveBalance(
+          tx,
+          requestId,
+          Number(request.hours ?? 0),
+        );
+      } else if (request.state === 'approved' && newState === 'rejected') {
+        await this.restoreLeaveBalance(
+          tx,
+          requestId,
+          Number(request.hours ?? 0),
+        );
       }
 
       return updated;
     });
   }
-
   async bulkReviewLeaveRequests(
     payload: BulkReviewLeaveRequestsDto,
     action: "approve" | "reject",
@@ -417,8 +507,18 @@ export class LeavesService {
       const whereClause = filters.length === 1 ? filters[0] : and(...filters);
 
       const candidates = await tx
-        .select()
+        .select({
+          id: leaveRequestsTable.id,
+          userId: leaveRequestsTable.userId,
+          state: leaveRequestsTable.state,
+          hours: leaveRequestsTable.hours,
+          managerId: usersTable.managerId,
+        })
         .from(leaveRequestsTable)
+        .innerJoin(
+          usersTable,
+          eq(usersTable.id, leaveRequestsTable.userId),
+        )
         .where(whereClause);
 
       if (candidates.length === 0) {
@@ -427,7 +527,17 @@ export class LeavesService {
         );
       }
 
-      const eligible = candidates.filter((request) =>
+      const managedCandidates = candidates.filter(
+        (candidate) => candidate.managerId === approverId,
+      );
+
+      if (managedCandidates.length === 0) {
+        throw new ForbiddenException(
+          'You are not authorized to review these leave requests',
+        );
+      }
+
+      const eligible = managedCandidates.filter((request) =>
         action === "approve"
           ? request.state === "pending"
           : request.state === "pending" || request.state === "approved"
@@ -488,14 +598,14 @@ export class LeavesService {
         }
       }
 
-      const skipped = candidates
+      const skipped = managedCandidates
         .filter((request) => !eligibleIdSet.has(request.id))
         .map((request) => ({
           id: request.id,
           state: request.state,
         }));
 
-      evaluatedIds = evaluatedIds ?? candidates.map((request) => request.id);
+      evaluatedIds = evaluatedIds ?? managedCandidates.map((request) => request.id);
 
       return {
         action,
@@ -507,57 +617,6 @@ export class LeavesService {
       };
     });
   }
-
-  async listLeaveRequests(params: ListLeaveRequestsParams) {
-    const db = this.database.connection;
-
-    const filters = [];
-    if (params.state) {
-      filters.push(eq(leaveRequestsTable.state, params.state));
-    }
-
-    if (params.managerId) {
-      filters.push(eq(usersTable.managerId, params.managerId));
-    }
-
-    const whereClause = filters.length ? and(...filters) : undefined;
-
-    const baseQuery = db
-      .select({
-        id: leaveRequestsTable.id,
-        userId: leaveRequestsTable.userId,
-        leaveTypeId: leaveRequestsTable.leaveTypeId,
-        startDate: leaveRequestsTable.startDate,
-        endDate: leaveRequestsTable.endDate,
-        hours: leaveRequestsTable.hours,
-        durationType: leaveRequestsTable.durationType,
-        halfDaySegment: leaveRequestsTable.halfDaySegment,
-        reason: leaveRequestsTable.reason,
-        state: leaveRequestsTable.state,
-        requestedAt: leaveRequestsTable.requestedAt,
-        leaveTypeName: leaveTypesTable.name,
-        leaveTypeCode: leaveTypesTable.code,
-        userName: usersTable.name,
-        userEmail: usersTable.email,
-      })
-      .from(leaveRequestsTable)
-      .innerJoin(
-        leaveTypesTable,
-        eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id)
-      )
-      .innerJoin(usersTable, eq(leaveRequestsTable.userId, usersTable.id));
-
-    const filteredQuery = whereClause
-      ? baseQuery.where(whereClause)
-      : baseQuery;
-
-    const requests = await filteredQuery.orderBy(
-      desc(leaveRequestsTable.requestedAt)
-    );
-
-    return requests;
-  }
-
   private async assertNoHolidays(
     orgId: number,
     startDate: Date,
@@ -735,3 +794,11 @@ export class LeavesService {
     return occurrence === 2 || occurrence === 4;
   }
 }
+
+
+
+
+
+
+
+
