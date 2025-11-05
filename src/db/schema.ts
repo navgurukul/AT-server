@@ -85,6 +85,18 @@ export const orgs = pgTable('orgs', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
 });
 
+export const departments = pgTable('departments', {
+  id: serial('id').primaryKey(),
+  orgId: integer('org_id')
+    .notNull()
+    .references(() => orgs.id, { onDelete: 'cascade' }),
+  name: varchar('name', { length: 160 }).notNull(),
+  code: varchar('code', { length: 50 }),
+  description: text('description'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+});
+
 export const users = pgTable(
   'users',
   {
@@ -97,6 +109,9 @@ export const users = pgTable(
     passwordHash: varchar('password_hash', { length: 255 }).notNull(),
     status: userStatusEnum().notNull().default('active'),
     managerId: integer('manager_id'),
+    departmentId: integer('department_id').references(() => departments.id, {
+      onDelete: 'set null',
+    }),
     rolePrimary: roleKeyEnum().notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
@@ -602,6 +617,7 @@ export const mvLeaveTrendsMonthly = pgTable(
 
 export const schema = {
   orgs,
+  departments,
   users,
   roles,
   userRoles,
@@ -633,6 +649,7 @@ export const schema = {
 
 // Legacy aliases to maintain compatibility with existing imports
 export const orgsTable = orgs;
+export const departmentsTable = departments;
 export const usersTable = users;
 export const rolesTable = roles;
 export const userRolesTable = userRoles;

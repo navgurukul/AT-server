@@ -6,4 +6,11 @@ export interface AuthenticatedUser {
   roles: string[];
   permissions: string[];
   managerId?: number | null;
+  departmentId?: number | null;
+  department?: {
+    id: number;
+    name: string;
+    code: string | null;
+    description: string | null;
+  } | null;
 }

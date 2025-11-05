@@ -2,8 +2,6 @@ import {
   Body,
   Controller,
   Get,
-  Param,
-  ParseIntPipe,
   Post,
   Query,
 } from '@nestjs/common';
@@ -13,8 +11,6 @@ import { Permissions } from '../../common/decorators/permissions.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
-import { SubmitTimesheetDto } from './dto/submit-timesheet.dto';
-import { UpsertTimesheetEntriesDto } from './dto/upsert-timesheet-entries.dto';
 import { TimesheetsService } from './timesheets.service';
 
 @ApiTags('timesheets')
@@ -43,7 +39,7 @@ export class TimesheetsController {
   }
 
   @Post()
-  @Permissions('timesheet:create:self')
+  @Permissions('timesheet:edit:self')
   createOrUpsert(
     @Body() payload: CreateTimesheetDto,
     @CurrentUser() user: AuthenticatedUser | undefined,
@@ -53,23 +49,4 @@ export class TimesheetsController {
     }
     return this.timesheetsService.createOrUpsert(payload, user.id, user.orgId);
   }
-
-  @Post(':id/entries')
-  @Permissions('timesheet:update:self')
-  upsertEntries(
-    @Param('id', ParseIntPipe) timesheetId: number,
-    @Body() payload: UpsertTimesheetEntriesDto,
-  ) {
-    return this.timesheetsService.upsertEntries(timesheetId, payload);
-  }
-
-  @Post(':id/submit')
-  @Permissions('timesheet:create:self')
-  submit(
-    @Param('id', ParseIntPipe) timesheetId: number,
-    @Body() payload: SubmitTimesheetDto,
-  ) {
-    return this.timesheetsService.submitTimesheet(timesheetId, payload);
-  }
-
 }

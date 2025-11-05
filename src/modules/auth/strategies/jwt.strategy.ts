@@ -47,6 +47,8 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         orgId: usersTable.orgId,
         name: usersTable.name,
         status: usersTable.status,
+        managerId: usersTable.managerId,
+        departmentId: usersTable.departmentId,
       })
       .from(usersTable)
       .where(eq(usersTable.id, payload.sub));
@@ -62,7 +64,14 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       name: user.name,
       roles: payload.roles,
       permissions: payload.permissions,
-      managerId: payload.managerId ?? null,
+      managerId:
+        user.managerId !== null && user.managerId !== undefined
+          ? Number(user.managerId)
+          : payload.managerId ?? null,
+      departmentId:
+        user.departmentId !== null && user.departmentId !== undefined
+          ? Number(user.departmentId)
+          : payload.departmentId ?? null,
     };
   }
 }

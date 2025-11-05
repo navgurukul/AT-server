@@ -7,6 +7,11 @@ export class UpdateUserDto {
   @IsInt()
   managerId?: number;
 
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsInt()
+  departmentId?: number;
+
   @ApiPropertyOptional({ type: [String] })
   @IsOptional()
   @IsArray()

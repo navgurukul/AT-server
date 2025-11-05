@@ -8,6 +8,7 @@ import { AuthenticatedUser } from '../../common/types/authenticated-user.interfa
 import { DatabaseService } from '../../database/database.service';
 import {
   authBlacklistedTokensTable,
+  departmentsTable,
   permissionsTable,
   rolePermissionsTable,
   rolesTable,
@@ -65,6 +66,7 @@ export class AuthService {
     }
 
     const now = new Date();
+    const departmentId = user.departmentId ? Number(user.departmentId) : null;
 
     if (!user.googleUserId) {
       await db
@@ -85,6 +87,36 @@ export class AuthService {
         .where(eq(usersTable.id, user.id));
     }
 
+    let department:
+      | {
+          id: number;
+          name: string;
+          code: string | null;
+          description: string | null;
+        }
+      | null = null;
+    if (departmentId) {
+      const [departmentRow] = await db
+        .select({
+          id: departmentsTable.id,
+          name: departmentsTable.name,
+          code: departmentsTable.code,
+          description: departmentsTable.description,
+        })
+        .from(departmentsTable)
+        .where(eq(departmentsTable.id, departmentId))
+        .limit(1);
+
+      if (departmentRow) {
+        department = {
+          id: Number(departmentRow.id),
+          name: departmentRow.name,
+          code: departmentRow.code ?? null,
+          description: departmentRow.description ?? null,
+        };
+      }
+    }
+
     const roles = await this.getUserRoles(Number(user.id));
     const permissions = await this.getUserPermissions(Number(user.id));
 
@@ -95,6 +127,7 @@ export class AuthService {
       roles,
       permissions,
       managerId: user.managerId ? Number(user.managerId) : null,
+      departmentId,
     };
 
     const accessToken = await this.signAccessToken(jwtPayload);
@@ -112,6 +145,8 @@ export class AuthService {
         roles,
         permissions,
         managerId: user.managerId ? Number(user.managerId) : null,
+        departmentId,
+        department,
         avatarUrl: googleProfile.picture ?? user.avatarUrl ?? null,
       },
     };
@@ -132,25 +167,38 @@ export class AuthService {
     }
 
     const db = this.databaseService.connection;
-    const [userExists] = await db
-      .select({ id: usersTable.id })
+    const [userRecord] = await db
+      .select({
+        id: usersTable.id,
+        email: usersTable.email,
+        orgId: usersTable.orgId,
+        managerId: usersTable.managerId,
+        departmentId: usersTable.departmentId,
+      })
       .from(usersTable)
       .where(eq(usersTable.id, payload.sub));
 
-    if (!userExists) {
+    if (!userRecord) {
       throw new UnauthorizedException('User no longer exists');
     }
 
     const roles = await this.getUserRoles(payload.sub);
     const permissions = await this.getUserPermissions(payload.sub);
+    const managerId = userRecord.managerId
+      ? Number(userRecord.managerId)
+      : null;
+    const departmentId = userRecord.departmentId
+      ? Number(userRecord.departmentId)
+      : null;
 
     const enrichedPayload: JwtPayload = {
-      sub: payload.sub,
-      email: payload.email,
-      orgId: payload.orgId,
+      sub: Number(userRecord.id),
+      email: userRecord.email,
+      orgId: Number(userRecord.orgId),
       roles,
       permissions,
-      managerId: payload.managerId ?? null,
+      managerId,
+      departmentId,
     };
 
     const newAccessToken = await this.signAccessToken(enrichedPayload);
@@ -171,8 +219,38 @@ export class AuthService {
     return { success: true };
   }
 
-  getProfile(user: AuthenticatedUser) {
-    return user;
+  async getProfile(user: AuthenticatedUser) {
+    const db = this.databaseService.connection;
+
+    if (!user.departmentId) {
+      return {
+        ...user,
+        department: null,
+      };
+    }
+
+    const [department] = await db
+      .select({
+        id: departmentsTable.id,
+        name: departmentsTable.name,
+        code: departmentsTable.code,
+        description: departmentsTable.description,
+      })
+      .from(departmentsTable)
+      .where(eq(departmentsTable.id, user.departmentId))
+      .limit(1);
+
+    return {
+      ...user,
+      department: department
+        ? {
+            id: Number(department.id),
+            name: department.name,
+            code: department.code ?? null,
+            description: department.description ?? null,
+          }
+        : null,
+    };
   }
 
   private async getUserRoles(userId: number): Promise<string[]> {

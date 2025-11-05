@@ -1,8 +1,9 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { and, count, eq, ilike, inArray, or } from 'drizzle-orm';
 
 import { DatabaseService } from '../../database/database.service';
 import {
+  departmentsTable,
   permissionsTable,
   rolePermissionsTable,
   rolesTable,
@@ -76,6 +77,7 @@ export class UsersService {
         orgId: usersTable.orgId,
         status: usersTable.status,
         managerId: usersTable.managerId,
+        departmentId: usersTable.departmentId,
         rolePrimary: usersTable.rolePrimary,
         avatarUrl: usersTable.avatarUrl,
         createdAt: usersTable.createdAt,
@@ -121,9 +123,64 @@ export class UsersService {
       {},
     );
 
+    const departmentIds = Array.from(
+      new Set(
+        users
+          .map((user) => user.departmentId)
+          .filter(
+            (id): id is number => id !== null && id !== undefined,
+          ),
+      ),
+    );
+
+    const departments =
+      departmentIds.length === 0
+        ? []
+        : await db
+            .select({
+              id: departmentsTable.id,
+              name: departmentsTable.name,
+              code: departmentsTable.code,
+              description: departmentsTable.description,
+            })
+            .from(departmentsTable)
+            .where(inArray(departmentsTable.id, departmentIds));
+
+    const departmentsById = departments.reduce<
+      Record<
+        number,
+        {
+          id: number;
+          name: string;
+          code: string | null;
+          description: string | null;
+        }
+      >
+    >((acc, curr) => {
+      acc[curr.id] = {
+        id: Number(curr.id),
+        name: curr.name,
+        code: curr.code ?? null,
+        description: curr.description ?? null,
+      };
+      return acc;
+    }, {});
+
     const enrichedUsers = users.map((user) => ({
       ...user,
       roles: rolesByUser[user.id] ?? [],
+      managerId:
+        user.managerId !== null && user.managerId !== undefined
+          ? Number(user.managerId)
+          : null,
+      departmentId:
+        user.departmentId !== null && user.departmentId !== undefined
+          ? Number(user.departmentId)
+          : null,
+      department:
+        user.departmentId !== null && user.departmentId !== undefined
+          ? departmentsById[user.departmentId] ?? null
+          : null,
     }));
 
     const total = Number(totalResult[0]?.value ?? 0);
@@ -140,7 +197,10 @@ export class UsersService {
     const db = this.database.connection;
 
     const [existing] = await db
-      .select({ id: usersTable.id })
+      .select({
+        id: usersTable.id,
+        orgId: usersTable.orgId,
+      })
       .from(usersTable)
       .where(eq(usersTable.id, id))
       .limit(1);
@@ -149,9 +209,37 @@ export class UsersService {
       throw new NotFoundException(`User with id ${id} not found`);
     }
 
-    const updateStatements: Partial<Pick<UpdateUserDto, 'managerId'>> = {};
+    const updateStatements: Partial<{
+      managerId: number;
+      departmentId: number | null;
+    }> = {};
     if (payload.managerId !== undefined) {
       updateStatements.managerId = payload.managerId;
+    }
+
+    if (payload.departmentId !== undefined) {
+      const [department] = await db
+        .select({
+          id: departmentsTable.id,
+          orgId: departmentsTable.orgId,
+        })
+        .from(departmentsTable)
+        .where(eq(departmentsTable.id, payload.departmentId))
+        .limit(1);
+
+      if (!department) {
+        throw new NotFoundException(
+          `Department with id ${payload.departmentId} not found`,
+        );
+      }
+
+      if (department.orgId !== existing.orgId) {
+        throw new BadRequestException(
+          'Department belongs to a different organisation',
+        );
+      }
+
+      updateStatements.departmentId = department.id;
     }
 
     if (Object.keys(updateStatements).length > 0) {
@@ -201,6 +289,7 @@ export class UsersService {
         orgId: usersTable.orgId,
         status: usersTable.status,
         managerId: usersTable.managerId,
+        departmentId: usersTable.departmentId,
       })
       .from(usersTable)
       .where(eq(usersTable.id, id))
@@ -232,8 +321,47 @@ export class UsersService {
       {},
     );
 
+    let department:
+      | {
+          id: number;
+          name: string;
+          code: string | null;
+          description: string | null;
+        }
+      | null = null;
+    if (user.departmentId !== null && user.departmentId !== undefined) {
+      const [departmentRow] = await db
+        .select({
+          id: departmentsTable.id,
+          name: departmentsTable.name,
+          code: departmentsTable.code,
+          description: departmentsTable.description,
+        })
+        .from(departmentsTable)
+        .where(eq(departmentsTable.id, user.departmentId))
+        .limit(1);
+
+      if (departmentRow) {
+        department = {
+          id: Number(departmentRow.id),
+          name: departmentRow.name,
+          code: departmentRow.code ?? null,
+          description: departmentRow.description ?? null,
+        };
+      }
+    }
+
     return {
       ...user,
+      managerId:
+        user.managerId !== null && user.managerId !== undefined
+          ? Number(user.managerId)
+          : null,
+      departmentId:
+        user.departmentId !== null && user.departmentId !== undefined
+          ? Number(user.departmentId)
+          : null,
+      department,
       roles: Object.keys(groupedRoles),
       permissions: [
         ...new Set(userRoles.map((assignment) => assignment.permissions)),

@@ -1,9 +1,4 @@
-import {
-  BadRequestException,
-  Injectable,
-  NotFoundException,
-  ForbiddenException,
-} from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import {
   and,
   asc,
@@ -22,8 +17,6 @@ import { DatabaseService } from '../../database/database.service';
 import { timesheetEntriesTable, timesheetsTable } from '../../db/schema';
 import { CalendarService } from '../calendar/calendar.service';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
-import { SubmitTimesheetDto } from './dto/submit-timesheet.dto';
-import { UpsertTimesheetEntriesDto } from './dto/upsert-timesheet-entries.dto';
 
 interface ListTimesheetParams {
   userId?: number;
@@ -149,6 +142,11 @@ export class TimesheetsService {
     const db = this.database.connection;
     const workDate = normalizeDate(new Date(payload.workDate));
     const now = new Date();
+
+    if (!payload.entries || payload.entries.length === 0) {
+      throw new BadRequestException('At least one entry is required');
+    }
+
     const startOfCurrentMonth = normalizeDate(
       new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
     );
@@ -180,160 +178,76 @@ export class TimesheetsService {
     }
 
     const [existing] = await db
-      .select()
+      .select({
+        id: timesheetsTable.id,
+        state: timesheetsTable.state,
+        notes: timesheetsTable.notes,
+      })
       .from(timesheetsTable)
       .where(
         and(
           eq(timesheetsTable.userId, userId),
+          eq(timesheetsTable.orgId, orgId),
           eq(timesheetsTable.workDate, workDate),
         ),
       )
       .limit(1);
 
-    if (!existing) {
-      const [created] = await db
-        .insert(timesheetsTable)
-        .values({
-          orgId,
-          userId,
-          workDate,
-          notes: payload.notes ?? null,
-          state: 'draft',
-          totalHours: '0',
-        })
-        .returning();
-
-      const usageAfterInsert = await this.countBackfilledDaysForMonth(
-        userId,
-        now,
+    if (
+      existing &&
+      ['submitted', 'approved', 'locked'].includes(existing.state)
+    ) {
+      throw new BadRequestException(
+        `Cannot modify timesheet when it is ${existing.state}`,
       );
-      const backfillRemaining = Math.max(
-        MAX_BACKFILL_PER_MONTH - usageAfterInsert,
-        0,
-      );
-
-      return {
-        ...created,
-        backfillLimit: MAX_BACKFILL_PER_MONTH,
-        backfillRemaining,
-      };
     }
 
-    if (existing.state === 'locked') {
-      throw new BadRequestException('Locked timesheets cannot be updated');
-    }
+    const notesToPersist = payload.notes ?? existing?.notes ?? null;
 
-    const [updated] = await db
-      .update(timesheetsTable)
-      .set({
-        notes: payload.notes ?? existing.notes,
-        updatedAt: new Date(),
-      })
-      .where(eq(timesheetsTable.id, existing.id))
-      .returning();
+    const result = await db.transaction(async (tx) => {
+      let timesheetId: number;
 
-    const usageAfterUpdate = await this.countBackfilledDaysForMonth(
-      userId,
-      now,
-    );
-    const backfillRemaining = Math.max(
-      MAX_BACKFILL_PER_MONTH - usageAfterUpdate,
-      0,
-    );
-
-    return {
-      ...updated,
-      backfillLimit: MAX_BACKFILL_PER_MONTH,
-      backfillRemaining,
-    };
-  }
-
-  async upsertEntries(
-    timesheetId: number,
-    payload: UpsertTimesheetEntriesDto,
-  ) {
-    const db = this.database.connection;
-
-    return await db.transaction(async (tx) => {
-      const [timesheet] = await tx
-        .select()
-        .from(timesheetsTable)
-        .where(eq(timesheetsTable.id, timesheetId))
-        .limit(1);
-
-      if (!timesheet) {
-        throw new NotFoundException(`Timesheet ${timesheetId} not found`);
-      }
-
-      if (['submitted', 'approved', 'locked'].includes(timesheet.state)) {
-        throw new BadRequestException(
-          `Cannot modify entries when timesheet is ${timesheet.state}`,
-        );
-      }
-
-      if (payload.entries.length === 0) {
-        throw new BadRequestException('At least one entry is required');
-      }
-
-      const entryIds = payload.entries
-        .map((entry) => entry.id)
-        .filter((id): id is number => !!id);
-
-      if (entryIds.length > 0) {
-        const existingEntries = await tx
-          .select({
-            id: timesheetEntriesTable.id,
-            timesheetId: timesheetEntriesTable.timesheetId,
+      if (!existing) {
+        const [created] = await tx
+          .insert(timesheetsTable)
+          .values({
+            orgId,
+            userId,
+            workDate,
+            notes: notesToPersist,
+            state: 'draft',
+            totalHours: '0',
           })
-          .from(timesheetEntriesTable)
-          .where(inArray(timesheetEntriesTable.id, entryIds));
-
-        const invalidIds = existingEntries.filter(
-          (entry) => entry.timesheetId !== timesheetId,
-        );
-        if (invalidIds.length > 0) {
-          throw new ForbiddenException('Entry does not belong to timesheet');
-        }
-      }
-
-      const now = new Date();
-      const rowsToInsert = payload.entries.filter((entry) => !entry.id);
-      const rowsToUpdate = payload.entries.filter((entry) => !!entry.id);
-
-      if (rowsToInsert.length > 0) {
-        await tx.insert(timesheetEntriesTable).values(
-          rowsToInsert.map((entry) => ({
-            orgId: timesheet.orgId,
-            timesheetId,
-            projectId: entry.projectId ?? null,
-            taskTitle: entry.taskTitle,
-            taskDescription: entry.taskDescription ?? null,
-            hoursDecimal: entry.hours.toString(),
-            tags: entry.tags ?? [],
-            createdAt: now,
+          .returning({ id: timesheetsTable.id });
+        timesheetId = created.id;
+      } else {
+        timesheetId = existing.id;
+        await tx
+          .update(timesheetsTable)
+          .set({
+            notes: notesToPersist,
             updatedAt: now,
-          })),
-        );
+          })
+          .where(eq(timesheetsTable.id, timesheetId));
+
+        await tx
+          .delete(timesheetEntriesTable)
+          .where(eq(timesheetEntriesTable.timesheetId, timesheetId));
       }
 
-      if (rowsToUpdate.length > 0) {
-        for (const entry of rowsToUpdate) {
-          await tx
-            .update(timesheetEntriesTable)
-            .set({
-              projectId:
-                entry.projectId === undefined
-                  ? timesheetEntriesTable.projectId
-                  : entry.projectId,
-              taskTitle: entry.taskTitle,
-              taskDescription: entry.taskDescription ?? null,
-              hoursDecimal: entry.hours.toString(),
-              tags: entry.tags ?? [],
-              updatedAt: now,
-            })
-            .where(eq(timesheetEntriesTable.id, entry.id!));
-        }
-      }
+      await tx.insert(timesheetEntriesTable).values(
+        payload.entries.map((entry) => ({
+          orgId,
+          timesheetId,
+          projectId: entry.projectId ?? null,
+          taskTitle: entry.taskTitle,
+          taskDescription: entry.taskDescription ?? null,
+          hoursDecimal: entry.hours.toString(),
+          tags: entry.tags ?? [],
+          createdAt: now,
+          updatedAt: now,
+        })),
+      );
 
       const [{ totalHours }] = await tx
         .select({
@@ -342,17 +256,33 @@ export class TimesheetsService {
         .from(timesheetEntriesTable)
         .where(eq(timesheetEntriesTable.timesheetId, timesheetId));
 
-      await tx
+      const [storedTimesheet] = await tx
         .update(timesheetsTable)
         .set({
           totalHours: String(totalHours ?? 0),
           updatedAt: now,
         })
-        .where(eq(timesheetsTable.id, timesheetId));
+        .where(eq(timesheetsTable.id, timesheetId))
+        .returning({
+          id: timesheetsTable.id,
+          userId: timesheetsTable.userId,
+          orgId: timesheetsTable.orgId,
+          workDate: timesheetsTable.workDate,
+          state: timesheetsTable.state,
+          totalHours: timesheetsTable.totalHours,
+          notes: timesheetsTable.notes,
+          submittedAt: timesheetsTable.submittedAt,
+          approvedAt: timesheetsTable.approvedAt,
+          rejectedAt: timesheetsTable.rejectedAt,
+          lockedAt: timesheetsTable.lockedAt,
+          createdAt: timesheetsTable.createdAt,
+          updatedAt: timesheetsTable.updatedAt,
+        });
 
-      const updatedEntries = await tx
+      const savedEntries = await tx
         .select({
           id: timesheetEntriesTable.id,
+          timesheetId: timesheetEntriesTable.timesheetId,
           projectId: timesheetEntriesTable.projectId,
           taskTitle: timesheetEntriesTable.taskTitle,
           taskDescription: timesheetEntriesTable.taskDescription,
@@ -366,77 +296,26 @@ export class TimesheetsService {
         .orderBy(asc(timesheetEntriesTable.id));
 
       return {
-        timesheetId,
-        totalHours: Number(totalHours ?? 0),
-        entries: updatedEntries,
+        timesheet: storedTimesheet,
+        entries: savedEntries,
       };
     });
-  }
 
-  async submitTimesheet(
-    timesheetId: number,
-    payload: SubmitTimesheetDto,
-  ) {
-    const db = this.database.connection;
+    const usageAfterOperation = await this.countBackfilledDaysForMonth(
+      userId,
+      now,
+    );
+    const backfillRemaining = Math.max(
+      MAX_BACKFILL_PER_MONTH - usageAfterOperation,
+      0,
+    );
 
-    return await db.transaction(async (tx) => {
-      const [timesheet] = await tx
-        .select({
-          id: timesheetsTable.id,
-          userId: timesheetsTable.userId,
-          orgId: timesheetsTable.orgId,
-          state: timesheetsTable.state,
-          totalHours: timesheetsTable.totalHours,
-          workDate: timesheetsTable.workDate,
-          notes: timesheetsTable.notes,
-        })
-        .from(timesheetsTable)
-        .where(eq(timesheetsTable.id, timesheetId))
-        .limit(1);
-
-      if (!timesheet) {
-        throw new NotFoundException(`Timesheet ${timesheetId} not found`);
-      }
-
-      if (!['draft', 'rejected'].includes(timesheet.state)) {
-        throw new BadRequestException(
-          `Timesheet in state '${timesheet.state}' cannot be submitted`,
-        );
-      }
-
-      if (Number(timesheet.totalHours ?? 0) <= 0) {
-        throw new BadRequestException(
-          'Cannot submit an empty timesheet. Please add entries first.',
-        );
-      }
-
-      const workDate = new Date(timesheet.workDate);
-      const now = new Date();
-
-      const maxFutureDate = new Date(now);
-      maxFutureDate.setUTCDate(maxFutureDate.getUTCDate() + 1);
-      if (workDate > maxFutureDate) {
-        throw new BadRequestException(
-          'Timesheets cannot be submitted more than one day in advance.',
-        );
-      }
-
-      const nowDate = new Date();
-      const [updated] = await tx
-        .update(timesheetsTable)
-        .set({
-          state: 'approved',
-          submittedAt: nowDate,
-          approvedAt: nowDate,
-          rejectedAt: null,
-          notes: payload.note ?? timesheet.notes,
-          updatedAt: nowDate,
-        })
-        .where(eq(timesheetsTable.id, timesheetId))
-        .returning();
-
-      return updated;
-    });
+    return {
+      ...result.timesheet,
+      entries: result.entries,
+      backfillLimit: MAX_BACKFILL_PER_MONTH,
+      backfillRemaining,
+    };
   }
 
   private async countBackfilledDaysForMonth(userId: number, now: Date) {
