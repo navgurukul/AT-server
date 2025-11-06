@@ -11,18 +11,10 @@ import {
   lte,
   or,
   sql,
-} from 'drizzle-orm';
+} from "drizzle-orm";
 
 import { DatabaseService } from '../../database/database.service';
-import {
-  departmentsTable,
-  leaveRequestsTable,
-  leaveTypesTable,
-  projectsTable,
-  timesheetEntriesTable,
-  timesheetsTable,
-  usersTable,
-} from '../../db/schema';
+import { departmentsTable, leaveRequestsTable, leaveTypesTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
 import { CalendarService } from '../calendar/calendar.service';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 
@@ -38,14 +30,16 @@ const HOURS_PER_WORKING_DAY = 8;
 const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 
 function normalizeDate(date: Date) {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  return new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
+  );
 }
 
 @Injectable()
 export class TimesheetsService {
   constructor(
     private readonly database: DatabaseService,
-    private readonly calendarService: CalendarService,
+    private readonly calendarService: CalendarService
   ) {}
 
   async listTimesheets(params: ListTimesheetParams) {
@@ -56,21 +50,32 @@ export class TimesheetsService {
       filters.push(eq(timesheetsTable.userId, params.userId));
     }
     if (params.state) {
-      const allowedStates = ['draft', 'submitted', 'approved', 'rejected', 'locked'] as const;
+      const allowedStates = [
+        "draft",
+        "submitted",
+        "approved",
+        "rejected",
+        "locked",
+      ] as const;
       if (allowedStates.includes(params.state as any)) {
-        filters.push(eq(timesheetsTable.state, params.state as typeof allowedStates[number]));
+        filters.push(
+          eq(
+            timesheetsTable.state,
+            params.state as (typeof allowedStates)[number]
+          )
+        );
       } else {
         throw new BadRequestException(`Invalid state: ${params.state}`);
       }
     }
     if (params.from) {
       filters.push(
-        gte(timesheetsTable.workDate, normalizeDate(new Date(params.from))),
+        gte(timesheetsTable.workDate, normalizeDate(new Date(params.from)))
       );
     }
     if (params.to) {
       filters.push(
-        lte(timesheetsTable.workDate, normalizeDate(new Date(params.to))),
+        lte(timesheetsTable.workDate, normalizeDate(new Date(params.to)))
       );
     }
 
@@ -100,7 +105,7 @@ export class TimesheetsService {
 
     const timesheets = await filteredQuery.orderBy(
       desc(timesheetsTable.workDate),
-      desc(timesheetsTable.id),
+      desc(timesheetsTable.id)
     );
 
     const timesheetIds = timesheets.map((t) => t.id);
@@ -113,10 +118,8 @@ export class TimesheetsService {
               id: timesheetEntriesTable.id,
               timesheetId: timesheetEntriesTable.timesheetId,
               projectId: timesheetEntriesTable.projectId,
-              taskTitle: timesheetEntriesTable.taskTitle,
               taskDescription: timesheetEntriesTable.taskDescription,
               hoursDecimal: timesheetEntriesTable.hoursDecimal,
-              tags: timesheetEntriesTable.tags,
               createdAt: timesheetEntriesTable.createdAt,
               updatedAt: timesheetEntriesTable.updatedAt,
             })
@@ -130,7 +133,7 @@ export class TimesheetsService {
         acc[entry.timesheetId].push(entry);
         return acc;
       },
-      {},
+      {}
     );
 
     const data = timesheets.map((timesheet) => ({
@@ -147,24 +150,44 @@ export class TimesheetsService {
   async createOrUpsert(
     payload: CreateTimesheetDto,
     userId: number,
-    orgId: number,
+    orgId: number
   ) {
     const db = this.database.connection;
     const workDate = normalizeDate(new Date(payload.workDate));
     const now = new Date();
 
     if (!payload.entries || payload.entries.length === 0) {
-      throw new BadRequestException('At least one entry is required');
+      throw new BadRequestException("At least one entry is required");
     }
+
+    const normalizedEntries = payload.entries.map((entry, index) => {
+      if (entry.projectId === undefined || entry.projectId === null) {
+        return {
+          ...entry,
+          projectId: null as number | null,
+        };
+      }
+
+      const projectIdNumber = Number(entry.projectId);
+
+      if (!Number.isInteger(projectIdNumber)) {
+        throw new BadRequestException(
+          `Entry ${index + 1} has an invalid projectId`
+        );
+      }
+
+      return {
+        ...entry,
+        projectId: projectIdNumber,
+      };
+    });
 
     const projectIds = Array.from(
       new Set(
-        payload.entries
-          .map((entry) =>
-            typeof entry.projectId === 'number' ? entry.projectId : null,
-          )
-          .filter((value): value is number => value !== null),
-      ),
+        normalizedEntries
+          .map((entry) => (entry.projectId !== null ? entry.projectId : null))
+          .filter((value): value is number => value !== null)
+      )
     );
 
     if (projectIds.length > 0) {
@@ -192,31 +215,31 @@ export class TimesheetsService {
     }
 
     const startOfCurrentMonth = normalizeDate(
-      new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
+      new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
     );
     const today = normalizeDate(now);
     const isBackfillThisMonth =
       workDate < today && workDate >= startOfCurrentMonth;
 
     if (workDate > today) {
-      throw new BadRequestException('Cannot create timesheet for future date');
+      throw new BadRequestException("Cannot create timesheet for future date");
     }
 
     if (await this.calendarService.isHoliday(orgId, workDate)) {
       throw new BadRequestException(
-        'Timesheets cannot be logged on holidays or non-working days',
+        "Timesheets cannot be logged on holidays or non-working days"
       );
     }
 
     const currentBackfillUsage = await this.countBackfilledDaysForMonth(
       userId,
-      now,
+      now
     );
 
     if (workDate < startOfCurrentMonth || isBackfillThisMonth) {
       if (currentBackfillUsage >= MAX_BACKFILL_PER_MONTH) {
         throw new BadRequestException(
-          `Backfilling is limited to ${MAX_BACKFILL_PER_MONTH} days per month`,
+          `Backfilling is limited to ${MAX_BACKFILL_PER_MONTH} days per month`
         );
       }
     }
@@ -232,17 +255,17 @@ export class TimesheetsService {
         and(
           eq(timesheetsTable.userId, userId),
           eq(timesheetsTable.orgId, orgId),
-          eq(timesheetsTable.workDate, workDate),
-        ),
+          eq(timesheetsTable.workDate, workDate)
+        )
       )
       .limit(1);
 
     if (
       existing &&
-      ['submitted', 'approved', 'locked'].includes(existing.state)
+      ["submitted", "approved", "locked"].includes(existing.state)
     ) {
       throw new BadRequestException(
-        `Cannot modify timesheet when it is ${existing.state}`,
+        `Cannot modify timesheet when it is ${existing.state}`
       );
     }
 
@@ -259,8 +282,8 @@ export class TimesheetsService {
             userId,
             workDate,
             notes: notesToPersist,
-            state: 'draft',
-            totalHours: '0',
+            state: "draft",
+            totalHours: "0",
           })
           .returning({ id: timesheetsTable.id });
         timesheetId = created.id;
@@ -275,12 +298,12 @@ export class TimesheetsService {
           .where(eq(timesheetsTable.id, timesheetId));
       }
 
-      if (payload.entries.length > 0) {
+      if (normalizedEntries.length > 0) {
         await tx.insert(timesheetEntriesTable).values(
-          payload.entries.map((entry) => ({
+          normalizedEntries.map((entry) => ({
             orgId,
             timesheetId,
-            projectId: entry.projectId ?? null,
+            projectId: entry.projectId,
             taskTitle: entry.taskTitle,
             taskDescription: entry.taskDescription ?? null,
             hoursDecimal: entry.hours.toString(),
@@ -326,10 +349,8 @@ export class TimesheetsService {
           id: timesheetEntriesTable.id,
           timesheetId: timesheetEntriesTable.timesheetId,
           projectId: timesheetEntriesTable.projectId,
-          taskTitle: timesheetEntriesTable.taskTitle,
           taskDescription: timesheetEntriesTable.taskDescription,
           hoursDecimal: timesheetEntriesTable.hoursDecimal,
-          tags: timesheetEntriesTable.tags,
           createdAt: timesheetEntriesTable.createdAt,
           updatedAt: timesheetEntriesTable.updatedAt,
         })
@@ -345,11 +366,11 @@ export class TimesheetsService {
 
     const usageAfterOperation = await this.countBackfilledDaysForMonth(
       userId,
-      now,
+      now
     );
     const backfillRemaining = Math.max(
       MAX_BACKFILL_PER_MONTH - usageAfterOperation,
-      0,
+      0
     );
 
     return {
@@ -798,7 +819,7 @@ export class TimesheetsService {
   private async countBackfilledDaysForMonth(userId: number, now: Date) {
     const db = this.database.connection;
     const startOfCurrentMonth = normalizeDate(
-      new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
+      new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
     );
     const today = normalizeDate(now);
 
@@ -809,8 +830,8 @@ export class TimesheetsService {
         and(
           eq(timesheetsTable.userId, userId),
           lt(timesheetsTable.workDate, today),
-          gte(timesheetsTable.workDate, startOfCurrentMonth),
-        ),
+          gte(timesheetsTable.workDate, startOfCurrentMonth)
+        )
       );
 
     return Number(backfillCount ?? 0);
@@ -818,7 +839,7 @@ export class TimesheetsService {
 
   private normalizeDateUTC(date: Date): Date {
     return new Date(
-      Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
+      Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
     );
   }
 
@@ -829,9 +850,12 @@ export class TimesheetsService {
   private async getWorkingDayInfo(
     orgId: number,
     start: Date,
-    end: Date,
+    end: Date
   ): Promise<
-    Map<string, { isWorkingDay: boolean; isHoliday: boolean; isWeekend: boolean }>
+    Map<
+      string,
+      { isWorkingDay: boolean; isHoliday: boolean; isWeekend: boolean }
+    >
   > {
     const normalizedStart = this.normalizeDateUTC(start);
     const normalizedEnd = this.normalizeDateUTC(end);
@@ -843,7 +867,7 @@ export class TimesheetsService {
     const holidayMap = await this.calendarService.getHolidayMap(
       orgId,
       normalizedStart,
-      normalizedEnd,
+      normalizedEnd
     );
 
     const info = new Map<
@@ -881,3 +905,4 @@ export class TimesheetsService {
     return occurrence === 2 || occurrence === 4;
   }
 }
+

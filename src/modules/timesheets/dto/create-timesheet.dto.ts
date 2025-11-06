@@ -1,5 +1,5 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+import { Type } from "class-transformer";
 import {
   IsArray,
   IsDateString,
@@ -8,7 +8,7 @@ import {
   IsOptional,
   IsString,
   ValidateNested,
-} from 'class-validator';
+} from "class-validator";
 
 class CreateTimesheetEntryDto {
   @ApiProperty({ required: false })
@@ -16,9 +16,10 @@ class CreateTimesheetEntryDto {
   @IsInt()
   projectId?: number;
 
-  @ApiProperty()
+  @ApiProperty({ required: false })
+  @IsOptional()
   @IsString()
-  taskTitle!: string;
+  taskTitle?: string;
 
   @ApiProperty({ required: false })
   @IsOptional()
