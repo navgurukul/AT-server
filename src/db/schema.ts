@@ -333,6 +333,12 @@ export const leaveBalances = pgTable('leave_balances', {
   balanceHours: numeric('balance_hours', { precision: 6, scale: 2 })
     .notNull()
     .default('0'),
+  pendingHours: numeric('pending_hours', { precision: 6, scale: 2 })
+    .notNull()
+    .default('0'),
+  bookedHours: numeric('booked_hours', { precision: 6, scale: 2 })
+    .notNull()
+    .default('0'),
   asOfDate: date('as_of_date').notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
@@ -703,3 +709,4 @@ export const orgHolidays = pgTable(
 );
 
 export const orgHolidaysTable = orgHolidays;
+

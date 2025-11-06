@@ -14,7 +14,6 @@ import {
   lte,
   or,
   lt,
-  sql,
 } from "drizzle-orm";
 
 import { DatabaseService } from "../../database/database.service";
@@ -38,6 +37,20 @@ interface ListLeaveRequestsParams {
 
 const HOURS_PER_WORKING_DAY = 8;
 const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
+const HOURS_NEGATIVE_TOLERANCE = 1e-6;
+
+type LeaveBalanceDelta = Partial<{
+  balanceHours: number;
+  pendingHours: number;
+  bookedHours: number;
+}>;
+
+interface LeaveBalanceSnapshot {
+  id: number;
+  balanceHours: number;
+  pendingHours: number;
+  bookedHours: number;
+}
 
 @Injectable()
 export class LeavesService {
@@ -49,11 +62,13 @@ export class LeavesService {
   async listBalances(userId: number) {
     const db = this.database.connection;
 
-    const balances = await db
+    const rows = await db
       .select({
         id: leaveBalancesTable.id,
         leaveTypeId: leaveBalancesTable.leaveTypeId,
         balanceHours: leaveBalancesTable.balanceHours,
+        pendingHours: leaveBalancesTable.pendingHours,
+        bookedHours: leaveBalancesTable.bookedHours,
         asOfDate: leaveBalancesTable.asOfDate,
         leaveType: {
           id: leaveTypesTable.id,
@@ -69,6 +84,16 @@ export class LeavesService {
         eq(leaveBalancesTable.leaveTypeId, leaveTypesTable.id)
       )
       .where(eq(leaveBalancesTable.userId, userId));
+
+    const balances = rows.map((row) => ({
+      id: row.id,
+      leaveTypeId: row.leaveTypeId,
+      balanceHours: this.normalizeHours(Number(row.balanceHours ?? 0)),
+      pendingHours: this.normalizeHours(Number(row.pendingHours ?? 0)),
+      bookedHours: this.normalizeHours(Number(row.bookedHours ?? 0)),
+      asOfDate: row.asOfDate,
+      leaveType: row.leaveType,
+    }));
 
     return {
       userId,
@@ -291,8 +316,6 @@ export class LeavesService {
         );
       }
 
-      const requestedDays = requestedHours / HOURS_PER_WORKING_DAY;
-
       const overlappingRequests = await tx
         .select({ value: count(leaveRequestsTable.id) })
         .from(leaveRequestsTable)
@@ -323,19 +346,15 @@ export class LeavesService {
         );
       }
 
+      let balanceSnapshot: LeaveBalanceSnapshot | null = null;
       if (leaveType.paid) {
-        const [balance] = await tx
-          .select()
-          .from(leaveBalancesTable)
-          .where(
-            and(
-              eq(leaveBalancesTable.userId, userId),
-              eq(leaveBalancesTable.leaveTypeId, payload.leaveTypeId)
-            )
-          )
-          .limit(1);
+        balanceSnapshot = await this.fetchLeaveBalanceSnapshot(
+          tx,
+          userId,
+          payload.leaveTypeId
+        );
 
-        if (!balance || Number(balance.balanceHours) < requestedDays) {
+        if (balanceSnapshot.balanceHours < requestedHours) {
           throw new BadRequestException(
             "Insufficient leave balance for this leave type"
           );
@@ -359,9 +378,24 @@ export class LeavesService {
         })
         .returning();
 
-      if (!leaveType.requiresApproval) {
-        await this.applyLeaveBalance(tx, request.id, requestedHours);
-      } else {
+      if (leaveType.requiresApproval) {
+        if (leaveType.paid) {
+          if (!balanceSnapshot) {
+            throw new BadRequestException(
+              "Leave balance not found for user and leave type"
+            );
+          }
+
+          balanceSnapshot = await this.updateLeaveBalanceFromSnapshot(
+            tx,
+            balanceSnapshot,
+            {
+              balanceHours: -requestedHours,
+              pendingHours: requestedHours,
+            }
+          );
+        }
+
         const [user] = await tx
           .select({
             managerId: usersTable.managerId,
@@ -382,6 +416,17 @@ export class LeavesService {
             })
             .onConflictDoNothing();
         }
+      } else if (leaveType.paid) {
+        if (!balanceSnapshot) {
+          throw new BadRequestException(
+            "Leave balance not found for user and leave type"
+          );
+        }
+
+        await this.updateLeaveBalanceFromSnapshot(tx, balanceSnapshot, {
+          balanceHours: -requestedHours,
+          bookedHours: requestedHours,
+        });
       }
 
       return request;
@@ -404,30 +449,77 @@ export class LeavesService {
           userId: leaveRequestsTable.userId,
           hours: leaveRequestsTable.hours,
           managerId: usersTable.managerId,
+          leaveTypeId: leaveRequestsTable.leaveTypeId,
+          leaveTypePaid: leaveTypesTable.paid,
         })
         .from(leaveRequestsTable)
         .innerJoin(
           usersTable,
-          eq(usersTable.id, leaveRequestsTable.userId),
+          eq(usersTable.id, leaveRequestsTable.userId)
+        )
+        .innerJoin(
+          leaveTypesTable,
+          eq(leaveTypesTable.id, leaveRequestsTable.leaveTypeId)
         )
         .where(eq(leaveRequestsTable.id, requestId))
         .limit(1);
 
       if (!request) {
-        throw new NotFoundException('Leave request not found');
+        throw new NotFoundException("Leave request not found");
       }
 
-      if (request.managerId === null || request.managerId !== approverId) {
-        throw new ForbiddenException('You are not authorized to review this leave request');
-      }
-
-      if (!['pending', 'approved'].includes(request.state)) {
-        throw new BadRequestException(
-          `Leave request in state ${request.state} cannot be updated`,
+      if (!approverId) {
+        throw new ForbiddenException(
+          "You are not authorized to review this leave request"
         );
       }
 
-      const newState = action === 'approve' ? 'approved' : 'rejected';
+      const [approver] = await tx
+        .select({
+          id: usersTable.id,
+          role: usersTable.rolePrimary,
+        })
+        .from(usersTable)
+        .where(eq(usersTable.id, approverId))
+        .limit(1);
+
+      if (!approver) {
+        throw new ForbiddenException(
+          "You are not authorized to review this leave request"
+        );
+      }
+
+      const isAdmin =
+        approver.role === "admin" || approver.role === "super_admin";
+
+      if (!isAdmin) {
+        if (request.managerId === null || request.managerId !== approverId) {
+          throw new ForbiddenException(
+            "You are not authorized to review this leave request"
+          );
+        }
+      }
+
+      const previousState = request.state;
+      const requestedHours = Number(request.hours ?? 0);
+
+      if (action === "approve" && previousState !== "pending") {
+        throw new BadRequestException(
+          `Only pending leave requests can be approved (current state: ${previousState})`
+        );
+      }
+
+      if (
+        action === "reject" &&
+        previousState !== "pending" &&
+        previousState !== "approved"
+      ) {
+        throw new BadRequestException(
+          `Only pending or approved leave requests can be rejected (current state: ${previousState})`
+        );
+      }
+
+      const newState = action === "approve" ? "approved" : "rejected";
       const now = new Date();
 
       const [updated] = await tx
@@ -443,30 +535,34 @@ export class LeavesService {
       await tx
         .update(approvalsTable)
         .set({
-          decision: newState === 'approved' ? 'approved' : 'rejected',
+          decision: newState,
           comment: payload.comment ?? null,
           decidedAt: now,
         })
         .where(
           and(
-            eq(approvalsTable.subjectType, 'leave_request'),
-            eq(approvalsTable.subjectId, requestId),
-            eq(approvalsTable.approverId, approverId),
-          ),
+            eq(approvalsTable.subjectType, "leave_request"),
+            eq(approvalsTable.subjectId, requestId)
+          )
         );
 
-      if (newState === 'approved') {
-        await this.applyLeaveBalance(
-          tx,
-          requestId,
-          Number(request.hours ?? 0),
-        );
-      } else if (request.state === 'approved' && newState === 'rejected') {
-        await this.restoreLeaveBalance(
-          tx,
-          requestId,
-          Number(request.hours ?? 0),
-        );
+      if (request.leaveTypePaid) {
+        if (action === "approve") {
+          await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
+            pendingHours: -requestedHours,
+            bookedHours: requestedHours,
+          });
+        } else if (previousState === "pending") {
+          await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
+            pendingHours: -requestedHours,
+            balanceHours: requestedHours,
+          });
+        } else if (previousState === "approved") {
+          await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
+            bookedHours: -requestedHours,
+            balanceHours: requestedHours,
+          });
+        }
       }
 
       return updated;
@@ -489,6 +585,30 @@ export class LeavesService {
     const db = this.database.connection;
 
     return await db.transaction(async (tx) => {
+      if (!approverId) {
+        throw new ForbiddenException(
+          "You are not authorized to review these leave requests"
+        );
+      }
+
+      const [approver] = await tx
+        .select({
+          id: usersTable.id,
+          role: usersTable.rolePrimary,
+        })
+        .from(usersTable)
+        .where(eq(usersTable.id, approverId))
+        .limit(1);
+
+      if (!approver) {
+        throw new ForbiddenException(
+          "You are not authorized to review these leave requests"
+        );
+      }
+
+      const isAdmin =
+        approver.role === "admin" || approver.role === "super_admin";
+
       const filters = [eq(leaveRequestsTable.userId, payload.userId)];
       let evaluatedIds: number[] | undefined;
 
@@ -513,11 +633,17 @@ export class LeavesService {
           state: leaveRequestsTable.state,
           hours: leaveRequestsTable.hours,
           managerId: usersTable.managerId,
+          leaveTypeId: leaveRequestsTable.leaveTypeId,
+          leaveTypePaid: leaveTypesTable.paid,
         })
         .from(leaveRequestsTable)
         .innerJoin(
           usersTable,
-          eq(usersTable.id, leaveRequestsTable.userId),
+          eq(usersTable.id, leaveRequestsTable.userId)
+        )
+        .innerJoin(
+          leaveTypesTable,
+          eq(leaveTypesTable.id, leaveRequestsTable.leaveTypeId)
         )
         .where(whereClause);
 
@@ -527,13 +653,13 @@ export class LeavesService {
         );
       }
 
-      const managedCandidates = candidates.filter(
-        (candidate) => candidate.managerId === approverId,
-      );
+      const managedCandidates = isAdmin
+        ? candidates
+        : candidates.filter((candidate) => candidate.managerId === approverId);
 
       if (managedCandidates.length === 0) {
         throw new ForbiddenException(
-          'You are not authorized to review these leave requests',
+          "You are not authorized to review these leave requests"
         );
       }
 
@@ -573,27 +699,38 @@ export class LeavesService {
         .where(
           and(
             eq(approvalsTable.subjectType, "leave_request"),
-            eq(approvalsTable.approverId, approverId),
             inArray(approvalsTable.subjectId, eligibleIds)
           )
         );
 
       if (action === "approve") {
         for (const request of eligible) {
-          await this.applyLeaveBalance(
-            tx,
-            request.id,
-            Number(request.hours ?? 0)
-          );
+          if (!request.leaveTypePaid) {
+            continue;
+          }
+          const hours = Number(request.hours ?? 0);
+          await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
+            pendingHours: -hours,
+            bookedHours: hours,
+          });
         }
       } else {
         for (const request of eligible) {
+          if (!request.leaveTypePaid) {
+            continue;
+          }
+
+          const hours = Number(request.hours ?? 0);
           if (request.state === "approved") {
-            await this.restoreLeaveBalance(
-              tx,
-              request.id,
-              Number(request.hours ?? 0)
-            );
+            await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
+              bookedHours: -hours,
+              balanceHours: hours,
+            });
+          } else if (request.state === "pending") {
+            await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
+              pendingHours: -hours,
+              balanceHours: hours,
+            });
           }
         }
       }
@@ -701,91 +838,117 @@ export class LeavesService {
     };
   }
 
-  private async applyLeaveBalance(
-    tx: DatabaseService["connection"],
-    requestId: number,
-    hours: number
-  ) {
-    const [request] = await tx
-      .select({
-        userId: leaveRequestsTable.userId,
-        leaveTypeId: leaveRequestsTable.leaveTypeId,
-      })
-      .from(leaveRequestsTable)
-      .where(eq(leaveRequestsTable.id, requestId))
-      .limit(1);
+  private normalizeHours(value: number): number {
+    const rounded = Math.round(value * 100) / 100;
+    return Math.abs(rounded) < HOURS_NEGATIVE_TOLERANCE ? 0 : rounded;
+  }
 
-    if (!request) {
-      throw new NotFoundException("Leave request not found");
+  private ensureNonNegative(value: number, label: string) {
+    if (value < -HOURS_NEGATIVE_TOLERANCE) {
+      throw new BadRequestException(
+        `Leave ${label} hours cannot be negative after the requested operation`
+      );
     }
+  }
 
-    const [balance] = await tx
+  private formatHours(value: number): string {
+    return this.normalizeHours(value).toFixed(2);
+  }
+
+  private applyDeltas(
+    snapshot: LeaveBalanceSnapshot,
+    deltas: LeaveBalanceDelta
+  ): LeaveBalanceSnapshot {
+    const balanceHours = this.normalizeHours(
+      snapshot.balanceHours + (deltas.balanceHours ?? 0)
+    );
+    const pendingHours = this.normalizeHours(
+      snapshot.pendingHours + (deltas.pendingHours ?? 0)
+    );
+    const bookedHours = this.normalizeHours(
+      snapshot.bookedHours + (deltas.bookedHours ?? 0)
+    );
+
+    this.ensureNonNegative(balanceHours, "balance");
+    this.ensureNonNegative(pendingHours, "pending");
+    this.ensureNonNegative(bookedHours, "booked");
+
+    return {
+      id: snapshot.id,
+      balanceHours,
+      pendingHours,
+      bookedHours,
+    };
+  }
+
+  private async fetchLeaveBalanceSnapshot(
+    tx: DatabaseService["connection"],
+    userId: number,
+    leaveTypeId: number
+  ): Promise<LeaveBalanceSnapshot> {
+    const [row] = await tx
       .select({
         id: leaveBalancesTable.id,
         balanceHours: leaveBalancesTable.balanceHours,
+        pendingHours: leaveBalancesTable.pendingHours,
+        bookedHours: leaveBalancesTable.bookedHours,
       })
       .from(leaveBalancesTable)
       .where(
         and(
-          eq(leaveBalancesTable.userId, request.userId),
-          eq(leaveBalancesTable.leaveTypeId, request.leaveTypeId)
+          eq(leaveBalancesTable.userId, userId),
+          eq(leaveBalancesTable.leaveTypeId, leaveTypeId)
         )
       )
+      .orderBy(desc(leaveBalancesTable.asOfDate))
       .limit(1);
 
-    if (!balance) {
+    if (!row) {
       throw new BadRequestException(
         "Leave balance not found for user and leave type"
       );
     }
 
-    const requestedDays = hours / HOURS_PER_WORKING_DAY;
-    const remaining = Number(balance.balanceHours) - requestedDays;
-    if (remaining < 0) {
-      throw new BadRequestException(
-        "Insufficient leave balance to approve this request"
-      );
-    }
-
-    await tx
-      .update(leaveBalancesTable)
-      .set({
-        balanceHours: String(Number(remaining.toFixed(2))),
-        updatedAt: new Date(),
-      })
-      .where(eq(leaveBalancesTable.id, balance.id));
+    return {
+      id: row.id,
+      balanceHours: Number(row.balanceHours ?? 0),
+      pendingHours: Number(row.pendingHours ?? 0),
+      bookedHours: Number(row.bookedHours ?? 0),
+    };
   }
 
-  private async restoreLeaveBalance(
+  private async updateLeaveBalanceFromSnapshot(
     tx: DatabaseService["connection"],
-    requestId: number,
-    hours: number
-  ) {
-    const [request] = await tx
-      .select({
-        userId: leaveRequestsTable.userId,
-        leaveTypeId: leaveRequestsTable.leaveTypeId,
-      })
-      .from(leaveRequestsTable)
-      .where(eq(leaveRequestsTable.id, requestId))
-      .limit(1);
-
-    if (!request) {
-      return;
-    }
+    snapshot: LeaveBalanceSnapshot,
+    deltas: LeaveBalanceDelta
+  ): Promise<LeaveBalanceSnapshot> {
+    const next = this.applyDeltas(snapshot, deltas);
 
     await tx
       .update(leaveBalancesTable)
       .set({
-        balanceHours: sql`${leaveBalancesTable.balanceHours}::numeric + ${hours / HOURS_PER_WORKING_DAY}`,
+        balanceHours: this.formatHours(next.balanceHours),
+        pendingHours: this.formatHours(next.pendingHours),
+        bookedHours: this.formatHours(next.bookedHours),
         updatedAt: new Date(),
       })
-      .where(
-        and(
-          eq(leaveBalancesTable.userId, request.userId),
-          eq(leaveBalancesTable.leaveTypeId, request.leaveTypeId)
-        )
-      );
+      .where(eq(leaveBalancesTable.id, snapshot.id));
+
+    return next;
+  }
+
+  private async adjustLeaveBalance(
+    tx: DatabaseService["connection"],
+    userId: number,
+    leaveTypeId: number,
+    deltas: LeaveBalanceDelta
+  ): Promise<LeaveBalanceSnapshot> {
+    const snapshot = await this.fetchLeaveBalanceSnapshot(
+      tx,
+      userId,
+      leaveTypeId
+    );
+    return this.updateLeaveBalanceFromSnapshot(tx, snapshot, deltas);
   }
 
   private isSecondOrFourthSaturday(date: Date): boolean {

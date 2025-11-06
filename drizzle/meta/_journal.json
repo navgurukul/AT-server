@@ -64,6 +64,13 @@
       "when": 1762355711936,
       "tag": "0008_rich_vapor",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1762415051000,
+      "tag": "0009_balance_hours_rework",
+      "breakpoints": true
     }
   ]
 }
