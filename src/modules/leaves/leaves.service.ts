@@ -346,8 +346,15 @@ export class LeavesService {
         );
       }
 
+      const requiresApproval =
+        leaveType.requiresApproval === undefined ||
+        leaveType.requiresApproval === null
+          ? true
+          : leaveType.requiresApproval;
+      const isPaidLeave = leaveType.paid ?? true;
+
       let balanceSnapshot: LeaveBalanceSnapshot | null = null;
-      if (leaveType.paid) {
+      if (isPaidLeave) {
         balanceSnapshot = await this.fetchLeaveBalanceSnapshot(
           tx,
           userId,
@@ -373,13 +380,13 @@ export class LeavesService {
           halfDaySegment: requestedHalfDaySegment,
           hours: requestedHours.toString(),
           reason: payload.reason ?? null,
-          state: leaveType.requiresApproval ? "pending" : "approved",
+          state: requiresApproval ? "pending" : "approved",
           requestedAt: new Date(),
         })
         .returning();
 
-      if (leaveType.requiresApproval) {
-        if (leaveType.paid) {
+      if (requiresApproval) {
+        if (isPaidLeave) {
           if (!balanceSnapshot) {
             throw new BadRequestException(
               "Leave balance not found for user and leave type"
@@ -416,7 +423,7 @@ export class LeavesService {
             })
             .onConflictDoNothing();
         }
-      } else if (leaveType.paid) {
+      } else if (isPaidLeave) {
         if (!balanceSnapshot) {
           throw new BadRequestException(
             "Leave balance not found for user and leave type"
@@ -546,7 +553,9 @@ export class LeavesService {
           )
         );
 
-      if (request.leaveTypePaid) {
+      const isPaidLeave = request.leaveTypePaid ?? true;
+
+      if (isPaidLeave) {
         if (action === "approve") {
           await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
             pendingHours: -requestedHours,
@@ -705,7 +714,8 @@ export class LeavesService {
 
       if (action === "approve") {
         for (const request of eligible) {
-          if (!request.leaveTypePaid) {
+          const isPaidLeave = request.leaveTypePaid ?? true;
+          if (!isPaidLeave) {
             continue;
           }
           const hours = Number(request.hours ?? 0);
@@ -716,7 +726,8 @@ export class LeavesService {
         }
       } else {
         for (const request of eligible) {
-          if (!request.leaveTypePaid) {
+          const isPaidLeave = request.leaveTypePaid ?? true;
+          if (!isPaidLeave) {
             continue;
           }
 
