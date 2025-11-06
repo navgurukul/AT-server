@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import {
   and,
   asc,
@@ -14,7 +14,15 @@ import {
 } from 'drizzle-orm';
 
 import { DatabaseService } from '../../database/database.service';
-import { timesheetEntriesTable, timesheetsTable } from '../../db/schema';
+import {
+  departmentsTable,
+  leaveRequestsTable,
+  leaveTypesTable,
+  projectsTable,
+  timesheetEntriesTable,
+  timesheetsTable,
+  usersTable,
+} from '../../db/schema';
 import { CalendarService } from '../calendar/calendar.service';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 
@@ -26,6 +34,8 @@ interface ListTimesheetParams {
 }
 
 const MAX_BACKFILL_PER_MONTH = 3;
+const HOURS_PER_WORKING_DAY = 8;
+const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 
 function normalizeDate(date: Date) {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
@@ -147,6 +157,40 @@ export class TimesheetsService {
       throw new BadRequestException('At least one entry is required');
     }
 
+    const projectIds = Array.from(
+      new Set(
+        payload.entries
+          .map((entry) =>
+            typeof entry.projectId === 'number' ? entry.projectId : null,
+          )
+          .filter((value): value is number => value !== null),
+      ),
+    );
+
+    if (projectIds.length > 0) {
+      const projects = await db
+        .select({
+          id: projectsTable.id,
+          orgId: projectsTable.orgId,
+        })
+        .from(projectsTable)
+        .where(inArray(projectsTable.id, projectIds));
+
+      const validProjectIds = new Set(
+        projects
+          .filter((project) => Number(project.orgId) === orgId)
+          .map((project) => project.id),
+      );
+
+      const missing = projectIds.filter((id) => !validProjectIds.has(id));
+
+      if (missing.length > 0) {
+        throw new BadRequestException(
+          `Projects not found in organisation: ${missing.join(', ')}`,
+        );
+      }
+    }
+
     const startOfCurrentMonth = normalizeDate(
       new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
     );
@@ -229,25 +273,23 @@ export class TimesheetsService {
             updatedAt: now,
           })
           .where(eq(timesheetsTable.id, timesheetId));
-
-        await tx
-          .delete(timesheetEntriesTable)
-          .where(eq(timesheetEntriesTable.timesheetId, timesheetId));
       }
 
-      await tx.insert(timesheetEntriesTable).values(
-        payload.entries.map((entry) => ({
-          orgId,
-          timesheetId,
-          projectId: entry.projectId ?? null,
-          taskTitle: entry.taskTitle,
-          taskDescription: entry.taskDescription ?? null,
-          hoursDecimal: entry.hours.toString(),
-          tags: entry.tags ?? [],
-          createdAt: now,
-          updatedAt: now,
-        })),
-      );
+      if (payload.entries.length > 0) {
+        await tx.insert(timesheetEntriesTable).values(
+          payload.entries.map((entry) => ({
+            orgId,
+            timesheetId,
+            projectId: entry.projectId ?? null,
+            taskTitle: entry.taskTitle,
+            taskDescription: entry.taskDescription ?? null,
+            hoursDecimal: entry.hours.toString(),
+            tags: entry.tags ?? [],
+            createdAt: now,
+            updatedAt: now,
+          })),
+        );
+      }
 
       const [{ totalHours }] = await tx
         .select({
@@ -318,6 +360,441 @@ export class TimesheetsService {
     };
   }
 
+  async getMonthlyDashboard(params: {
+    userId: number;
+    orgId: number;
+    year: number;
+    month: number;
+  }) {
+    const { userId, orgId, year, month } = params;
+
+    if (!year || !month) {
+      throw new BadRequestException('year and month are required');
+    }
+    if (month < 1 || month > 12) {
+      throw new BadRequestException('month must be between 1 and 12');
+    }
+
+    const monthStart = new Date(Date.UTC(year, month - 1, 1));
+    const nextMonthStart = new Date(Date.UTC(year, month, 1));
+    const monthEnd = new Date(nextMonthStart);
+    monthEnd.setUTCDate(monthEnd.getUTCDate() - 1);
+
+    const db = this.database.connection;
+
+    const [user] = await db
+      .select({
+        id: usersTable.id,
+        orgId: usersTable.orgId,
+        name: usersTable.name,
+        departmentId: usersTable.departmentId,
+      })
+      .from(usersTable)
+      .where(eq(usersTable.id, userId))
+      .limit(1);
+
+    if (!user || Number(user.orgId) !== orgId) {
+      throw new NotFoundException('User not found for this organisation');
+    }
+
+    const timesheets = await db
+      .select({
+        id: timesheetsTable.id,
+        workDate: timesheetsTable.workDate,
+        state: timesheetsTable.state,
+        totalHours: timesheetsTable.totalHours,
+        notes: timesheetsTable.notes,
+        submittedAt: timesheetsTable.submittedAt,
+        approvedAt: timesheetsTable.approvedAt,
+        rejectedAt: timesheetsTable.rejectedAt,
+        lockedAt: timesheetsTable.lockedAt,
+        createdAt: timesheetsTable.createdAt,
+        updatedAt: timesheetsTable.updatedAt,
+      })
+      .from(timesheetsTable)
+      .where(
+        and(
+          eq(timesheetsTable.userId, userId),
+          eq(timesheetsTable.orgId, orgId),
+          gte(timesheetsTable.workDate, monthStart),
+          lt(timesheetsTable.workDate, nextMonthStart),
+        ),
+      )
+      .orderBy(asc(timesheetsTable.workDate));
+
+    const timesheetIds = timesheets.map((row) => row.id);
+
+    const entryRows =
+      timesheetIds.length === 0
+        ? []
+        : await db
+            .select({
+              id: timesheetEntriesTable.id,
+              timesheetId: timesheetEntriesTable.timesheetId,
+              projectId: timesheetEntriesTable.projectId,
+              projectName: projectsTable.name,
+              departmentId: departmentsTable.id,
+              departmentName: departmentsTable.name,
+              taskTitle: timesheetEntriesTable.taskTitle,
+              taskDescription: timesheetEntriesTable.taskDescription,
+              hoursDecimal: timesheetEntriesTable.hoursDecimal,
+              tags: timesheetEntriesTable.tags,
+              createdAt: timesheetEntriesTable.createdAt,
+              updatedAt: timesheetEntriesTable.updatedAt,
+            })
+            .from(timesheetEntriesTable)
+            .leftJoin(
+              projectsTable,
+              eq(projectsTable.id, timesheetEntriesTable.projectId),
+            )
+            .leftJoin(
+              departmentsTable,
+              eq(departmentsTable.id, projectsTable.departmentId),
+            )
+            .where(inArray(timesheetEntriesTable.timesheetId, timesheetIds))
+            .orderBy(asc(timesheetEntriesTable.id));
+
+    const entriesByTimesheet = new Map<
+      number,
+      Array<{
+        id: number;
+        projectId: number | null;
+        projectName: string | null;
+        departmentId: number | null;
+        departmentName: string | null;
+        taskTitle: string | null;
+        taskDescription: string | null;
+        hours: number;
+        tags: string[];
+        createdAt: Date | null;
+        updatedAt: Date | null;
+      }>
+    >();
+
+    for (const entry of entryRows) {
+      const bucket =
+        entriesByTimesheet.get(entry.timesheetId) ??
+        ([] as Array<{
+          id: number;
+          projectId: number | null;
+          projectName: string | null;
+          departmentId: number | null;
+          departmentName: string | null;
+          taskTitle: string | null;
+          taskDescription: string | null;
+          hours: number;
+          tags: string[];
+          createdAt: Date | null;
+          updatedAt: Date | null;
+        }>);
+
+      bucket.push({
+        id: entry.id,
+        projectId: entry.projectId ?? null,
+        projectName: entry.projectName ?? null,
+        departmentId: entry.departmentId ?? null,
+        departmentName: entry.departmentName ?? null,
+        taskTitle: entry.taskTitle ?? null,
+        taskDescription: entry.taskDescription ?? null,
+        hours: entry.hoursDecimal ? Number(entry.hoursDecimal) : 0,
+        tags: entry.tags ?? [],
+        createdAt: entry.createdAt ?? null,
+        updatedAt: entry.updatedAt ?? null,
+      });
+
+      entriesByTimesheet.set(entry.timesheetId, bucket);
+    }
+
+    const timesheetMap = new Map<
+      string,
+      {
+        id: number;
+        state: string;
+        totalHours: number;
+        notes: string | null;
+        submittedAt: Date | null;
+        approvedAt: Date | null;
+        rejectedAt: Date | null;
+        lockedAt: Date | null;
+        createdAt: Date | null;
+        updatedAt: Date | null;
+        entries: Array<{
+          id: number;
+          projectId: number | null;
+          projectName: string | null;
+          departmentId: number | null;
+          departmentName: string | null;
+          taskTitle: string | null;
+          taskDescription: string | null;
+          hours: number;
+          tags: string[];
+          createdAt: Date | null;
+          updatedAt: Date | null;
+        }>;
+      }
+    >();
+
+    for (const row of timesheets) {
+      const workDate = new Date(row.workDate);
+      const key = this.formatDateKey(workDate);
+      timesheetMap.set(key, {
+        id: row.id,
+        state: row.state,
+        totalHours: row.totalHours ? Number(row.totalHours) : 0,
+        notes: row.notes ?? null,
+        submittedAt: row.submittedAt ? new Date(row.submittedAt) : null,
+        approvedAt: row.approvedAt ? new Date(row.approvedAt) : null,
+        rejectedAt: row.rejectedAt ? new Date(row.rejectedAt) : null,
+        lockedAt: row.lockedAt ? new Date(row.lockedAt) : null,
+        createdAt: row.createdAt ? new Date(row.createdAt) : null,
+        updatedAt: row.updatedAt ? new Date(row.updatedAt) : null,
+        entries: entriesByTimesheet.get(row.id) ?? [],
+      });
+    }
+
+    const leaveRequests = await db
+      .select({
+        id: leaveRequestsTable.id,
+        startDate: leaveRequestsTable.startDate,
+        endDate: leaveRequestsTable.endDate,
+        hours: leaveRequestsTable.hours,
+        state: leaveRequestsTable.state,
+        durationType: leaveRequestsTable.durationType,
+        halfDaySegment: leaveRequestsTable.halfDaySegment,
+        leaveTypeId: leaveRequestsTable.leaveTypeId,
+        leaveTypeCode: leaveTypesTable.code,
+        leaveTypeName: leaveTypesTable.name,
+      })
+      .from(leaveRequestsTable)
+      .innerJoin(
+        leaveTypesTable,
+        eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id),
+      )
+      .where(
+        and(
+          eq(leaveRequestsTable.userId, userId),
+          lte(leaveRequestsTable.startDate, nextMonthStart),
+          gte(leaveRequestsTable.endDate, monthStart),
+        ),
+      )
+      .orderBy(asc(leaveRequestsTable.startDate));
+
+    const workingDayInfo = await this.getWorkingDayInfo(orgId, monthStart, monthEnd);
+
+    const leaveDaily = new Map<
+      string,
+      {
+        totalHours: number;
+        entries: Array<{
+          requestId: number;
+          state: string;
+          durationType: string;
+          halfDaySegment: string | null;
+          hours: number;
+          leaveType: {
+            id: number;
+            code: string | null;
+            name: string | null;
+          };
+        }>;
+      }
+    >();
+
+    let totalLeaveHours = 0;
+
+    for (const request of leaveRequests) {
+      const requestStart = this.normalizeDateUTC(new Date(request.startDate));
+      const requestEnd = this.normalizeDateUTC(new Date(request.endDate));
+
+      const windowStart = requestStart > monthStart ? requestStart : monthStart;
+      const windowEnd = requestEnd < monthEnd ? requestEnd : monthEnd;
+
+      if (windowEnd < windowStart) {
+        continue;
+      }
+
+      const dayKeys: string[] = [];
+      const cursor = new Date(windowStart);
+      while (cursor <= windowEnd) {
+        const key = this.formatDateKey(cursor);
+        const info = workingDayInfo.get(key);
+        if (info?.isWorkingDay) {
+          dayKeys.push(key);
+        }
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+
+      if (dayKeys.length === 0) {
+        continue;
+      }
+
+      const requestHours = request.hours ? Number(request.hours) : 0;
+      const perDayHours =
+        request.durationType === 'half_day' || dayKeys.length === 0
+          ? 0
+          : requestHours / dayKeys.length;
+
+      let halfDayAssigned = false;
+
+      for (const key of dayKeys) {
+        let hoursForDay: number;
+
+        if (request.durationType === 'half_day') {
+          if (halfDayAssigned) {
+            continue;
+          }
+          const halfDayHours =
+            requestHours > 0 ? requestHours : HALF_DAY_HOURS;
+          hoursForDay = halfDayHours;
+          halfDayAssigned = true;
+        } else {
+          hoursForDay = perDayHours;
+        }
+
+        if (hoursForDay <= 0) {
+          continue;
+        }
+
+        totalLeaveHours += hoursForDay;
+
+        const bucket =
+          leaveDaily.get(key) ??
+          ({
+            totalHours: 0,
+            entries: [],
+          } as {
+            totalHours: number;
+            entries: Array<{
+              requestId: number;
+              state: string;
+              durationType: string;
+              halfDaySegment: string | null;
+              hours: number;
+              leaveType: {
+                id: number;
+                code: string | null;
+                name: string | null;
+              };
+            }>;
+          });
+
+        bucket.totalHours += hoursForDay;
+        bucket.entries.push({
+          requestId: request.id,
+          state: request.state,
+          durationType: request.durationType,
+          halfDaySegment: request.halfDaySegment ?? null,
+          hours: Number(hoursForDay.toFixed(2)),
+          leaveType: {
+            id: request.leaveTypeId,
+            code: request.leaveTypeCode ?? null,
+            name: request.leaveTypeName ?? null,
+          },
+        });
+
+        leaveDaily.set(key, bucket);
+      }
+    }
+
+    const totalTimesheetHours = timesheets.reduce((acc, row) => {
+      const hours = row.totalHours ? Number(row.totalHours) : 0;
+      return acc + hours;
+    }, 0);
+
+    const days: Array<{
+      date: string;
+      isWorkingDay: boolean;
+      isWeekend: boolean;
+      isHoliday: boolean;
+      timesheet:
+        | ({
+            id: number;
+            state: string;
+            totalHours: number;
+            notes: string | null;
+            submittedAt: Date | null;
+            approvedAt: Date | null;
+            rejectedAt: Date | null;
+            lockedAt: Date | null;
+            createdAt: Date | null;
+            updatedAt: Date | null;
+          } & {
+            entries: Array<{
+              id: number;
+              projectId: number | null;
+              projectName: string | null;
+              departmentId: number | null;
+              departmentName: string | null;
+              taskTitle: string | null;
+              taskDescription: string | null;
+              hours: number;
+              tags: string[];
+              createdAt: Date | null;
+              updatedAt: Date | null;
+            }>;
+          })
+        | null;
+      leaves: {
+        totalHours: number;
+        entries: Array<{
+          requestId: number;
+          state: string;
+          durationType: string;
+          halfDaySegment: string | null;
+          hours: number;
+          leaveType: {
+            id: number;
+            code: string | null;
+            name: string | null;
+          };
+        }>;
+      } | null;
+    }> = [];
+
+    const cursor = new Date(monthStart);
+    while (cursor <= monthEnd) {
+      const key = this.formatDateKey(cursor);
+      const info = workingDayInfo.get(key);
+      const timesheet = timesheetMap.get(key) ?? null;
+      const leaveInfo = leaveDaily.get(key) ?? null;
+
+      days.push({
+        date: key,
+        isWorkingDay: info?.isWorkingDay ?? false,
+        isWeekend: info?.isWeekend ?? false,
+        isHoliday: info?.isHoliday ?? false,
+        timesheet,
+        leaves: leaveInfo
+          ? {
+              totalHours: Number(leaveInfo.totalHours.toFixed(2)),
+              entries: leaveInfo.entries,
+            }
+          : null,
+      });
+
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+
+    return {
+      user: {
+        id: user.id,
+        name: user.name,
+        departmentId: user.departmentId ?? null,
+      },
+      period: {
+        year,
+        month,
+        start: this.formatDateKey(monthStart),
+        end: this.formatDateKey(monthEnd),
+      },
+      totals: {
+        timesheetHours: Number(totalTimesheetHours.toFixed(2)),
+        leaveHours: Number(totalLeaveHours.toFixed(2)),
+      },
+      days,
+    };
+  }
+
   private async countBackfilledDaysForMonth(userId: number, now: Date) {
     const db = this.database.connection;
     const startOfCurrentMonth = normalizeDate(
@@ -338,5 +815,69 @@ export class TimesheetsService {
 
     return Number(backfillCount ?? 0);
   }
-}
 
+  private normalizeDateUTC(date: Date): Date {
+    return new Date(
+      Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
+    );
+  }
+
+  private formatDateKey(date: Date): string {
+    return this.normalizeDateUTC(date).toISOString().slice(0, 10);
+  }
+
+  private async getWorkingDayInfo(
+    orgId: number,
+    start: Date,
+    end: Date,
+  ): Promise<
+    Map<string, { isWorkingDay: boolean; isHoliday: boolean; isWeekend: boolean }>
+  > {
+    const normalizedStart = this.normalizeDateUTC(start);
+    const normalizedEnd = this.normalizeDateUTC(end);
+
+    if (normalizedEnd < normalizedStart) {
+      return new Map();
+    }
+
+    const holidayMap = await this.calendarService.getHolidayMap(
+      orgId,
+      normalizedStart,
+      normalizedEnd,
+    );
+
+    const info = new Map<
+      string,
+      { isWorkingDay: boolean; isHoliday: boolean; isWeekend: boolean }
+    >();
+
+    const cursor = new Date(normalizedStart);
+    while (cursor <= normalizedEnd) {
+      const key = this.formatDateKey(cursor);
+      const dayOfWeek = cursor.getUTCDay();
+      const isSunday = dayOfWeek === 0;
+      const isSaturday = dayOfWeek === 6;
+      const isSecondFourthSaturday =
+        isSaturday && this.isSecondOrFourthSaturday(cursor);
+      const override = holidayMap.get(key);
+      const defaultWorking = !(isSunday || isSecondFourthSaturday);
+      const isWorkingDay = override ? override.isWorkingDay : defaultWorking;
+      const isHoliday = override ? !override.isWorkingDay : false;
+
+      info.set(key, {
+        isWorkingDay,
+        isHoliday,
+        isWeekend: isSunday || isSaturday,
+      });
+
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+
+    return info;
+  }
+
+  private isSecondOrFourthSaturday(date: Date): boolean {
+    const occurrence = Math.ceil(date.getUTCDate() / 7);
+    return occurrence === 2 || occurrence === 4;
+  }
+}

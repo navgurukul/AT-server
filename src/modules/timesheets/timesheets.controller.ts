@@ -38,6 +38,33 @@ export class TimesheetsController {
     });
   }
 
+  @Get('monthly')
+  @ApiQuery({ name: 'year', required: true })
+  @ApiQuery({ name: 'month', required: true })
+  @ApiQuery({ name: 'userId', required: false })
+  @Permissions('timesheet:view')
+  getMonthlyDashboard(
+    @Query('year') year: string,
+    @Query('month') month: string,
+    @Query('userId') userId: string | undefined,
+    @CurrentUser() user: AuthenticatedUser | undefined,
+  ) {
+    if (!user) {
+      return null;
+    }
+
+    const parsedYear = Number.parseInt(year, 10);
+    const parsedMonth = Number.parseInt(month, 10);
+    const parsedUserId = userId ? Number.parseInt(userId, 10) : user.id;
+
+    return this.timesheetsService.getMonthlyDashboard({
+      userId: Number.isNaN(parsedUserId) ? user.id : parsedUserId,
+      orgId: user.orgId,
+      year: parsedYear,
+      month: parsedMonth,
+    });
+  }
+
   @Post()
   @Permissions('timesheet:edit:self')
   createOrUpsert(
