@@ -3,7 +3,7 @@ import {
   Injectable,
   NotFoundException,
   ConflictException,
-} from '@nestjs/common';
+} from "@nestjs/common";
 import {
   and,
   count,
@@ -14,9 +14,9 @@ import {
   isNull,
   or,
   sql,
-} from 'drizzle-orm';
+} from "drizzle-orm";
 
-import { DatabaseService } from '../../database/database.service';
+import { DatabaseService } from "../../database/database.service";
 import {
   costRatesTable,
   departmentsTable,
@@ -25,28 +25,27 @@ import {
   timesheetEntriesTable,
   timesheetsTable,
   usersTable,
-} from '../../db/schema';
-import { AssignMemberDto } from './dto/assign-member.dto';
-import { CreateProjectDto } from './dto/create-project.dto';
-import { UpdateProjectDto } from './dto/update-project.dto';
+} from "../../db/schema";
+import { AssignMemberDto } from "./dto/assign-member.dto";
+import { CreateProjectDto } from "./dto/create-project.dto";
+import { UpdateProjectDto } from "./dto/update-project.dto";
 
 interface ListProjectsParams {
   orgId?: number;
   status?: string;
   search?: string;
   departmentId?: number;
-  departmentName?: string;
   projectManagerId?: number;
   page?: number;
   limit?: number;
 }
 
 const ALLOWED_PROJECT_STATUSES = [
-  'active',
-  'draft',
-  'on_hold',
-  'completed',
-  'archived',
+  "active",
+  "draft",
+  "on_hold",
+  "completed",
+  "archived",
 ] as const;
 
 const PROJECT_SELECTION = {
@@ -82,14 +81,14 @@ export class ProjectsService {
 
     if (existingCode.length > 0) {
       throw new ConflictException(
-        `Project code '${payload.code}' is already in use`,
+        `Project code '${payload.code}' is already in use`
       );
     }
 
     const requestedStatus =
       payload.status && ALLOWED_PROJECT_STATUSES.includes(payload.status as any)
         ? (payload.status as (typeof ALLOWED_PROJECT_STATUSES)[number])
-        : 'active';
+        : "active";
 
     const [department] = await db
       .select({
@@ -102,13 +101,13 @@ export class ProjectsService {
 
     if (!department) {
       throw new NotFoundException(
-        `Department with id ${payload.departmentId} not found`,
+        `Department with id ${payload.departmentId} not found`
       );
     }
 
     if (Number(department.orgId) !== payload.orgId) {
       throw new BadRequestException(
-        'Department does not belong to the provided organisation',
+        "Department does not belong to the provided organisation"
       );
     }
 
@@ -124,13 +123,13 @@ export class ProjectsService {
 
     if (!manager) {
       throw new NotFoundException(
-        `Project manager with id ${payload.projectManagerId} not found`,
+        `Project manager with id ${payload.projectManagerId} not found`
       );
     }
 
     if (Number(manager.orgId) !== payload.orgId) {
       throw new BadRequestException(
-        'Project manager must belong to the same organisation',
+        "Project manager must belong to the same organisation"
       );
     }
 
@@ -174,41 +173,15 @@ export class ProjectsService {
       filters.push(
         eq(
           projectsTable.status,
-          params.status as (typeof ALLOWED_PROJECT_STATUSES)[number],
-        ),
+          params.status as (typeof ALLOWED_PROJECT_STATUSES)[number]
+        )
       );
     }
     if (params.departmentId) {
       filters.push(eq(projectsTable.departmentId, params.departmentId));
     }
     if (params.projectManagerId) {
-      filters.push(
-        eq(projectsTable.projectManagerId, params.projectManagerId),
-      );
-    }
-
-    if (params.departmentName) {
-      const term = `%${params.departmentName.trim().toLowerCase()}%`;
-      const matchingDepartments = await db
-        .select({ id: departmentsTable.id })
-        .from(departmentsTable)
-        .where(ilike(departmentsTable.name, term));
-
-      if (matchingDepartments.length === 0) {
-        return {
-          data: [],
-          page,
-          limit,
-          total: 0,
-        };
-      }
-
-      const matchedDepartmentIds = matchingDepartments.map((department) =>
-        Number(department.id),
-      );
-      filters.push(
-        inArray(projectsTable.departmentId, matchedDepartmentIds),
-      );
+      filters.push(eq(projectsTable.projectManagerId, params.projectManagerId));
     }
 
     if (params.search) {
@@ -216,10 +189,7 @@ export class ProjectsService {
       if (cleaned.length > 0) {
         const term = `%${cleaned.toLowerCase()}%`;
         filters.push(
-          or(
-            ilike(projectsTable.name, term),
-            ilike(projectsTable.code, term),
-          ),
+          or(ilike(projectsTable.name, term), ilike(projectsTable.code, term))
         );
       }
     }
@@ -228,7 +198,9 @@ export class ProjectsService {
 
     const baseQuery = db.select(PROJECT_SELECTION).from(projectsTable);
 
-    const filteredQuery = whereClause ? baseQuery.where(whereClause) : baseQuery;
+    const filteredQuery = whereClause
+      ? baseQuery.where(whereClause)
+      : baseQuery;
 
     const projects = await filteredQuery
       .orderBy(desc(projectsTable.createdAt))
@@ -240,9 +212,7 @@ export class ProjectsService {
           .select({ value: count(projectsTable.id) })
           .from(projectsTable)
           .where(whereClause)
-      : db
-          .select({ value: count(projectsTable.id) })
-          .from(projectsTable);
+      : db.select({ value: count(projectsTable.id) }).from(projectsTable);
     const [{ value: total }] = await countQuery;
 
     const enrichedProjects = await this.hydrateProjects(projects);
@@ -265,7 +235,7 @@ export class ProjectsService {
       .limit(1);
 
     if (!existing) {
-      throw new NotFoundException('Project with id ' + id + ' not found');
+      throw new NotFoundException("Project with id " + id + " not found");
     }
 
     if (payload.code && payload.code !== existing.code) {
@@ -275,7 +245,9 @@ export class ProjectsService {
         .where(eq(projectsTable.code, payload.code))
         .limit(1);
       if (codeUsed) {
-        throw new ConflictException('Project code ' + payload.code + ' is already in use');
+        throw new ConflictException(
+          "Project code " + payload.code + " is already in use"
+        );
       }
     }
 
@@ -292,11 +264,15 @@ export class ProjectsService {
         .limit(1);
 
       if (!department) {
-        throw new NotFoundException('Department with id ' + payload.departmentId + ' not found');
+        throw new NotFoundException(
+          "Department with id " + payload.departmentId + " not found"
+        );
       }
 
       if (Number(department.orgId) !== Number(existing.orgId)) {
-        throw new BadRequestException('Department does not belong to the same organisation');
+        throw new BadRequestException(
+          "Department does not belong to the same organisation"
+        );
       }
 
       updateValues.departmentId = payload.departmentId;
@@ -314,11 +290,15 @@ export class ProjectsService {
         .limit(1);
 
       if (!manager) {
-        throw new NotFoundException('Project manager with id ' + payload.projectManagerId + ' not found');
+        throw new NotFoundException(
+          "Project manager with id " + payload.projectManagerId + " not found"
+        );
       }
 
       if (Number(manager.orgId) !== Number(existing.orgId)) {
-        throw new BadRequestException('Project manager must belong to the same organisation');
+        throw new BadRequestException(
+          "Project manager must belong to the same organisation"
+        );
       }
 
       updateValues.projectManagerId = payload.projectManagerId;
@@ -328,9 +308,10 @@ export class ProjectsService {
     if (payload.code !== undefined) updateValues.code = payload.code;
     if (payload.status !== undefined) {
       if (!ALLOWED_PROJECT_STATUSES.includes(payload.status as any)) {
-        throw new BadRequestException('Invalid project status');
+        throw new BadRequestException("Invalid project status");
       }
-      updateValues.status = payload.status as (typeof ALLOWED_PROJECT_STATUSES)[number];
+      updateValues.status =
+        payload.status as (typeof ALLOWED_PROJECT_STATUSES)[number];
     }
     if (payload.startDate !== undefined) {
       updateValues.startDate = payload.startDate
@@ -385,9 +366,7 @@ export class ProjectsService {
       .where(eq(usersTable.id, payload.userId))
       .limit(1);
     if (!user) {
-      throw new NotFoundException(
-        `User with id ${payload.userId} not found`,
-      );
+      throw new NotFoundException(`User with id ${payload.userId} not found`);
     }
 
     const startDate = payload.startDate ? new Date(payload.startDate) : null;
@@ -399,8 +378,8 @@ export class ProjectsService {
       .where(
         and(
           eq(projectMembersTable.projectId, projectId),
-          eq(projectMembersTable.userId, payload.userId),
-        ),
+          eq(projectMembersTable.userId, payload.userId)
+        )
       )
       .limit(1);
 
@@ -409,17 +388,18 @@ export class ProjectsService {
         .update(projectMembersTable)
         .set({
           role: payload.role ?? projectMembersTable.role,
-          allocationPct: payload.allocationPct !== undefined
-            ? String(payload.allocationPct)
-            : projectMembersTable.allocationPct,
+          allocationPct:
+            payload.allocationPct !== undefined
+              ? String(payload.allocationPct)
+              : projectMembersTable.allocationPct,
           startDate,
           endDate,
         })
         .where(
           and(
             eq(projectMembersTable.projectId, projectId),
-            eq(projectMembersTable.userId, payload.userId),
-          ),
+            eq(projectMembersTable.userId, payload.userId)
+          )
         )
         .returning();
       return updated;
@@ -430,8 +410,11 @@ export class ProjectsService {
       .values({
         projectId,
         userId: payload.userId,
-        role: payload.role ?? 'contributor',
-        allocationPct: payload.allocationPct !== undefined ? String(payload.allocationPct) : '100',
+        role: payload.role ?? "contributor",
+        allocationPct:
+          payload.allocationPct !== undefined
+            ? String(payload.allocationPct)
+            : "100",
         startDate,
         endDate,
       })
@@ -448,14 +431,14 @@ export class ProjectsService {
       .where(
         and(
           eq(projectMembersTable.projectId, projectId),
-          eq(projectMembersTable.userId, userId),
-        ),
+          eq(projectMembersTable.userId, userId)
+        )
       )
       .returning();
 
     if (result.length === 0) {
       throw new NotFoundException(
-        `Membership for user ${userId} on project ${projectId} not found`,
+        `Membership for user ${userId} on project ${projectId} not found`
       );
     }
 
@@ -464,7 +447,7 @@ export class ProjectsService {
 
   async getProjectCosts(
     projectId: number,
-    params: { from?: string; to?: string },
+    params: { from?: string; to?: string }
   ) {
     const db = this.database.connection;
 
@@ -483,8 +466,8 @@ export class ProjectsService {
 
     const dateClause = [
       eq(timesheetEntriesTable.projectId, projectId),
-      eq(timesheetsTable.state, 'approved') ||
-        eq(timesheetsTable.state, 'locked'),
+      eq(timesheetsTable.state, "approved") ||
+        eq(timesheetsTable.state, "locked"),
     ];
 
     if (fromDate) {
@@ -509,7 +492,7 @@ export class ProjectsService {
           AND t.state IN ('approved', 'locked')
           ${fromDate ? sql`AND t.work_date >= ${fromDate}` : sql``}
           ${toDate ? sql`AND t.work_date <= ${toDate}` : sql``}
-      `,
+      `
     );
 
     const row = costQuery.rows?.[0] as
@@ -536,7 +519,7 @@ export class ProjectsService {
 
   async getProjectContributors(
     projectId: number,
-    params: { from?: string; to?: string },
+    params: { from?: string; to?: string }
   ) {
     const db = this.database.connection;
 
@@ -544,7 +527,7 @@ export class ProjectsService {
 
     const { fromDate, toDateExclusive, toDate } = this.resolveDateRange(
       params.from,
-      params.to,
+      params.to
     );
 
     const contributors = await db.execute(
@@ -562,22 +545,22 @@ export class ProjectsService {
         WHERE te.project_id = ${projectId}
           AND t.state IN ('approved','locked')
           ${fromDate ? sql`AND t.work_date >= ${fromDate}` : sql``}
-          ${
-            toDateExclusive ? sql`AND t.work_date < ${toDateExclusive}` : sql``
-          }
+          ${toDateExclusive ? sql`AND t.work_date < ${toDateExclusive}` : sql``}
         GROUP BY t.user_id, u.name, u.email
         ORDER BY total_hours DESC
-      `,
+      `
     );
 
-    const rows = (contributors.rows as {
-      user_id: number;
-      user_name: string | null;
-      user_email: string | null;
-      total_hours: string | null;
-      first_entry: string | Date | null;
-      last_entry: string | Date | null;
-    }[]).map((row) => ({
+    const rows = (
+      contributors.rows as {
+        user_id: number;
+        user_name: string | null;
+        user_email: string | null;
+        total_hours: string | null;
+        first_entry: string | Date | null;
+        last_entry: string | Date | null;
+      }[]
+    ).map((row) => ({
       userId: Number(row.user_id),
       userName: row.user_name ?? null,
       userEmail: row.user_email ?? null,
@@ -599,7 +582,7 @@ export class ProjectsService {
   async getProjectUserHours(
     projectId: number,
     userId: number,
-    params: { from?: string; to?: string },
+    params: { from?: string; to?: string }
   ) {
     const db = this.database.connection;
 
@@ -621,7 +604,7 @@ export class ProjectsService {
 
     const { fromDate, toDateExclusive, toDate } = this.resolveDateRange(
       params.from,
-      params.to,
+      params.to
     );
 
     const dailyHours = await db.execute(
@@ -635,19 +618,16 @@ export class ProjectsService {
           AND t.user_id = ${userId}
           AND t.state IN ('approved','locked')
           ${fromDate ? sql`AND t.work_date >= ${fromDate}` : sql``}
-          ${
-            toDateExclusive ? sql`AND t.work_date < ${toDateExclusive}` : sql``
-          }
+          ${toDateExclusive ? sql`AND t.work_date < ${toDateExclusive}` : sql``}
         GROUP BY t.work_date
         ORDER BY t.work_date
-      `,
+      `
     );
 
     const entries = await db.execute(
       sql`
         SELECT
           t.work_date::date AS work_date,
-          te.task_title AS task_title,
           te.hours_decimal AS hours_decimal
         FROM ${timesheetsTable} t
         INNER JOIN ${timesheetEntriesTable} te ON te.timesheet_id = t.id
@@ -655,28 +635,28 @@ export class ProjectsService {
           AND t.user_id = ${userId}
           AND t.state IN ('approved','locked')
           ${fromDate ? sql`AND t.work_date >= ${fromDate}` : sql``}
-          ${
-            toDateExclusive ? sql`AND t.work_date < ${toDateExclusive}` : sql``
-          }
+          ${toDateExclusive ? sql`AND t.work_date < ${toDateExclusive}` : sql``}
         ORDER BY t.work_date, te.id
-      `,
+      `
     );
 
-    const daily = (dailyHours.rows as {
-      work_date: string | Date;
-      total_hours: string | null;
-    }[]).map((row) => ({
+    const daily = (
+      dailyHours.rows as {
+        work_date: string | Date;
+        total_hours: string | null;
+      }[]
+    ).map((row) => ({
       date: new Date(row.work_date),
       totalHours: row.total_hours ? Number(row.total_hours) : 0,
     }));
 
-    const detailedEntries = (entries.rows as {
-      work_date: string | Date;
-      task_title: string | null;
-      hours_decimal: string | number | null;
-    }[]).map((row) => ({
+    const detailedEntries = (
+      entries.rows as {
+        work_date: string | Date;
+        hours_decimal: string | number | null;
+      }[]
+    ).map((row) => ({
       date: new Date(row.work_date),
-      taskTitle: row.task_title ?? null,
       hours: Number(row.hours_decimal ?? 0),
     }));
 
@@ -707,7 +687,7 @@ export class ProjectsService {
         departmentId: number | null;
         projectManagerId: number | null;
       }
-    >,
+    >
   ) {
     if (projects.length === 0) {
       return [];
@@ -720,16 +700,16 @@ export class ProjectsService {
       new Set(
         projects
           .map((project) => project.departmentId)
-          .filter((id): id is number => id !== null && id !== undefined),
-      ),
+          .filter((id): id is number => id !== null && id !== undefined)
+      )
     );
 
     const projectManagerIds = Array.from(
       new Set(
         projects
           .map((project) => project.projectManagerId)
-          .filter((id): id is number => id !== null && id !== undefined),
-      ),
+          .filter((id): id is number => id !== null && id !== undefined)
+      )
     );
 
     const departments =
@@ -812,7 +792,7 @@ export class ProjectsService {
             .from(projectMembersTable)
             .innerJoin(
               usersTable,
-              eq(projectMembersTable.userId, usersTable.id),
+              eq(projectMembersTable.userId, usersTable.id)
             )
             .where(inArray(projectMembersTable.projectId, projectIds));
 
@@ -822,18 +802,18 @@ export class ProjectsService {
         acc[curr.projectId].push(curr);
         return acc;
       },
-      {},
+      {}
     );
 
     return projects.map((project) => ({
       ...project,
       department:
         project.departmentId !== null
-          ? departmentsById[project.departmentId] ?? null
+          ? (departmentsById[project.departmentId] ?? null)
           : null,
       projectManager:
         project.projectManagerId !== null
-          ? managersById[project.projectManagerId] ?? null
+          ? (managersById[project.projectManagerId] ?? null)
           : null,
       members: membersByProject[project.id] ?? [],
     }));
@@ -862,10 +842,3 @@ export class ProjectsService {
     }
   }
 }
-
-
-
-
-
-
-

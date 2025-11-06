@@ -1,5 +1,5 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+import { Type } from "class-transformer";
 import {
   IsArray,
   IsDateString,
@@ -8,17 +8,13 @@ import {
   IsOptional,
   IsString,
   ValidateNested,
-} from 'class-validator';
+} from "class-validator";
 
 class CreateTimesheetEntryDto {
   @ApiProperty({ required: false })
   @IsOptional()
   @IsInt()
   projectId?: number;
-
-  @ApiProperty()
-  @IsString()
-  taskTitle!: string;
 
   @ApiProperty({ required: false })
   @IsOptional()
@@ -28,12 +24,6 @@ class CreateTimesheetEntryDto {
   @ApiProperty()
   @IsNumber({ maxDecimalPlaces: 2 })
   hours!: number;
-
-  @ApiPropertyOptional({ type: [String] })
-  @IsOptional()
-  @IsArray()
-  @IsString({ each: true })
-  tags?: string[];
 }
 
 export class CreateTimesheetDto {
