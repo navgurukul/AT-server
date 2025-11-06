@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  ForbiddenException,
   Get,
   Post,
   Query,
@@ -42,7 +43,6 @@ export class TimesheetsController {
   @ApiQuery({ name: 'year', required: true })
   @ApiQuery({ name: 'month', required: true })
   @ApiQuery({ name: 'userId', required: false })
-  @Permissions('timesheet:view')
   getMonthlyDashboard(
     @Query('year') year: string,
     @Query('month') month: string,
@@ -57,8 +57,21 @@ export class TimesheetsController {
     const parsedMonth = Number.parseInt(month, 10);
     const parsedUserId = userId ? Number.parseInt(userId, 10) : user.id;
 
+    const targetUserId = Number.isNaN(parsedUserId) ? user.id : parsedUserId;
+
+    const canViewAll = user.permissions.includes('timesheet:view');
+    const canViewSelf = user.permissions.includes('timesheet:view:self');
+
+    if (targetUserId !== user.id && !canViewAll) {
+      throw new ForbiddenException('Missing required permission: timesheet:view');
+    }
+
+    if (targetUserId === user.id && !(canViewAll || canViewSelf)) {
+      throw new ForbiddenException('Missing required permission: timesheet:view');
+    }
+
     return this.timesheetsService.getMonthlyDashboard({
-      userId: Number.isNaN(parsedUserId) ? user.id : parsedUserId,
+      userId: targetUserId,
       orgId: user.orgId,
       year: parsedYear,
       month: parsedMonth,

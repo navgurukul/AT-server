@@ -118,8 +118,10 @@ export class TimesheetsService {
               id: timesheetEntriesTable.id,
               timesheetId: timesheetEntriesTable.timesheetId,
               projectId: timesheetEntriesTable.projectId,
+              taskTitle: timesheetEntriesTable.taskTitle,
               taskDescription: timesheetEntriesTable.taskDescription,
               hoursDecimal: timesheetEntriesTable.hoursDecimal,
+              tags: timesheetEntriesTable.tags,
               createdAt: timesheetEntriesTable.createdAt,
               updatedAt: timesheetEntriesTable.updatedAt,
             })
@@ -161,24 +163,37 @@ export class TimesheetsService {
     }
 
     const normalizedEntries = payload.entries.map((entry, index) => {
-      if (entry.projectId === undefined || entry.projectId === null) {
-        return {
-          ...entry,
-          projectId: null as number | null,
-        };
+      const projectIdRaw = entry.projectId;
+      let projectId: number | null = null;
+
+      if (projectIdRaw !== undefined && projectIdRaw !== null) {
+        const parsed = Number.parseInt(String(projectIdRaw), 10);
+        if (Number.isNaN(parsed)) {
+          throw new BadRequestException(
+            `Entry ${index + 1} has an invalid projectId`
+          );
+        }
+        projectId = parsed;
       }
 
-      const projectIdNumber = Number(entry.projectId);
+      const taskTitle =
+        entry.taskTitle && entry.taskTitle.trim().length > 0
+          ? entry.taskTitle.trim()
+          : null;
 
-      if (!Number.isInteger(projectIdNumber)) {
-        throw new BadRequestException(
-          `Entry ${index + 1} has an invalid projectId`
-        );
-      }
+      const tags = Array.isArray(entry.tags)
+        ? entry.tags.filter((tag) => typeof tag === "string" && tag.trim() !== "")
+        : [];
 
       return {
-        ...entry,
-        projectId: projectIdNumber,
+        projectId,
+        taskTitle,
+        taskDescription:
+          entry.taskDescription && entry.taskDescription.trim().length > 0
+            ? entry.taskDescription.trim()
+            : null,
+        hours: entry.hours,
+        tags,
       };
     });
 
@@ -214,13 +229,7 @@ export class TimesheetsService {
       }
     }
 
-    const startOfCurrentMonth = normalizeDate(
-      new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
-    );
     const today = normalizeDate(now);
-    const isBackfillThisMonth =
-      workDate < today && workDate >= startOfCurrentMonth;
-
     if (workDate > today) {
       throw new BadRequestException("Cannot create timesheet for future date");
     }
@@ -231,12 +240,14 @@ export class TimesheetsService {
       );
     }
 
+    const isBackfill = workDate < today;
     const currentBackfillUsage = await this.countBackfilledDaysForMonth(
       userId,
+      workDate,
       now
     );
 
-    if (workDate < startOfCurrentMonth || isBackfillThisMonth) {
+    if (isBackfill) {
       if (currentBackfillUsage >= MAX_BACKFILL_PER_MONTH) {
         throw new BadRequestException(
           `Backfilling is limited to ${MAX_BACKFILL_PER_MONTH} days per month`
@@ -284,6 +295,7 @@ export class TimesheetsService {
             notes: notesToPersist,
             state: "draft",
             totalHours: "0",
+            submittedAt: now,
           })
           .returning({ id: timesheetsTable.id });
         timesheetId = created.id;
@@ -293,6 +305,7 @@ export class TimesheetsService {
           .update(timesheetsTable)
           .set({
             notes: notesToPersist,
+            submittedAt: now,
             updatedAt: now,
           })
           .where(eq(timesheetsTable.id, timesheetId));
@@ -325,6 +338,7 @@ export class TimesheetsService {
         .update(timesheetsTable)
         .set({
           totalHours: String(totalHours ?? 0),
+          submittedAt: now,
           updatedAt: now,
         })
         .where(eq(timesheetsTable.id, timesheetId))
@@ -349,8 +363,10 @@ export class TimesheetsService {
           id: timesheetEntriesTable.id,
           timesheetId: timesheetEntriesTable.timesheetId,
           projectId: timesheetEntriesTable.projectId,
+          taskTitle: timesheetEntriesTable.taskTitle,
           taskDescription: timesheetEntriesTable.taskDescription,
           hoursDecimal: timesheetEntriesTable.hoursDecimal,
+          tags: timesheetEntriesTable.tags,
           createdAt: timesheetEntriesTable.createdAt,
           updatedAt: timesheetEntriesTable.updatedAt,
         })
@@ -366,12 +382,13 @@ export class TimesheetsService {
 
     const usageAfterOperation = await this.countBackfilledDaysForMonth(
       userId,
+      workDate,
       now
     );
-    const backfillRemaining = Math.max(
-      MAX_BACKFILL_PER_MONTH - usageAfterOperation,
-      0
-    );
+
+    const backfillRemaining = isBackfill
+      ? Math.max(MAX_BACKFILL_PER_MONTH - usageAfterOperation, 0)
+      : Math.max(MAX_BACKFILL_PER_MONTH - currentBackfillUsage, 0);
 
     return {
       ...result.timesheet,
@@ -816,12 +833,35 @@ export class TimesheetsService {
     };
   }
 
-  private async countBackfilledDaysForMonth(userId: number, now: Date) {
+  private async countBackfilledDaysForMonth(
+    userId: number,
+    referenceDate: Date,
+    now: Date
+  ) {
     const db = this.database.connection;
-    const startOfCurrentMonth = normalizeDate(
-      new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
+
+    const startOfMonth = normalizeDate(
+      new Date(
+        Date.UTC(
+          referenceDate.getUTCFullYear(),
+          referenceDate.getUTCMonth(),
+          1
+        )
+      )
     );
+    const startOfNextMonth = normalizeDate(
+      new Date(
+        Date.UTC(
+          referenceDate.getUTCFullYear(),
+          referenceDate.getUTCMonth() + 1,
+          1
+        )
+      )
+    );
+
     const today = normalizeDate(now);
+    const upperBound =
+      today < startOfNextMonth ? today : startOfNextMonth;
 
     const [{ value: backfillCount }] = await db
       .select({ value: count(timesheetsTable.id) })
@@ -829,8 +869,8 @@ export class TimesheetsService {
       .where(
         and(
           eq(timesheetsTable.userId, userId),
-          lt(timesheetsTable.workDate, today),
-          gte(timesheetsTable.workDate, startOfCurrentMonth)
+          lt(timesheetsTable.workDate, upperBound),
+          gte(timesheetsTable.workDate, startOfMonth)
         )
       );
 
