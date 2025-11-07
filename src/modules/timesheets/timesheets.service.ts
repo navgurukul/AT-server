@@ -7,6 +7,7 @@ import {
   eq,
   gte,
   inArray,
+  isNull,
   lt,
   lte,
   or,
@@ -162,7 +163,18 @@ export class TimesheetsService {
       throw new BadRequestException("At least one entry is required");
     }
 
-    const normalizedEntries = payload.entries.map((entry, index) => {
+    const normalizedEntriesMap = new Map<
+      string,
+      {
+        projectId: number | null;
+        taskTitle: string | null;
+        taskDescription: string | null;
+        hours: number;
+        tags: string[];
+      }
+    >();
+
+    payload.entries.forEach((entry, index) => {
       const projectIdRaw = entry.projectId;
       let projectId: number | null = null;
 
@@ -185,7 +197,7 @@ export class TimesheetsService {
         ? entry.tags.filter((tag) => typeof tag === "string" && tag.trim() !== "")
         : [];
 
-      return {
+      const normalized = {
         projectId,
         taskTitle,
         taskDescription:
@@ -195,7 +207,12 @@ export class TimesheetsService {
         hours: entry.hours,
         tags,
       };
+
+      const key = projectId === null ? "__null__" : projectId.toString();
+      normalizedEntriesMap.set(key, normalized);
     });
+
+    const normalizedEntries = Array.from(normalizedEntriesMap.values());
 
     const projectIds = Array.from(
       new Set(
@@ -312,6 +329,40 @@ export class TimesheetsService {
       }
 
       if (normalizedEntries.length > 0) {
+        const nonNullProjectIds = Array.from(
+          new Set(
+            normalizedEntries
+              .map((entry) => entry.projectId)
+              .filter((id): id is number => id !== null)
+          )
+        );
+        const includesNullProject = normalizedEntries.some(
+          (entry) => entry.projectId === null
+        );
+
+        const projectConditions = [];
+        if (nonNullProjectIds.length > 0) {
+          projectConditions.push(
+            inArray(timesheetEntriesTable.projectId, nonNullProjectIds)
+          );
+        }
+        if (includesNullProject) {
+          projectConditions.push(isNull(timesheetEntriesTable.projectId));
+        }
+
+        if (projectConditions.length > 0) {
+          await tx
+            .delete(timesheetEntriesTable)
+            .where(
+              and(
+                eq(timesheetEntriesTable.timesheetId, timesheetId),
+                projectConditions.length === 1
+                  ? projectConditions[0]
+                  : or(...projectConditions)
+              )
+            );
+        }
+
         await tx.insert(timesheetEntriesTable).values(
           normalizedEntries.map((entry) => ({
             orgId,
