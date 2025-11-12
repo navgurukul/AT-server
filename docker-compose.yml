@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://devmain:ms3Qa38uZ7Ae5M6NNnMZ@db-pg.cosodeda78lq.ap-south-1.rds.amazonaws.com:5432/dev?options=-c search_path%3Dpublic}
+      PORT: 3000
+      NODE_ENV: production
+    ports:
+      - "9900:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["npm", "run", "start:prod"]
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-navtrack}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASS:-postgres}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:

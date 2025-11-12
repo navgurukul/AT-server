@@ -90,10 +90,7 @@ async function bootstrap() {
   
   SwaggerModule.setup('docs', app, swaggerDocument);
 
-  const port = process.env.PORT ? Number(process.env.PORT) : 9900;
-  console.log(`Server starting at port: ${port}`);
-
-  await app.listen(port);
+  await app.listen(3000, '0.0.0.0');
 
   if (module?.hot) {
     module.hot.accept();

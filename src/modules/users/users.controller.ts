@@ -5,6 +5,7 @@ import {
   Param,
   ParseIntPipe,
   Patch,
+  Post,
   Query,
 } from '@nestjs/common';
 import { ApiQuery, ApiTags } from '@nestjs/swagger';
@@ -69,5 +70,11 @@ export class UsersController {
     @CurrentUser() _actor: AuthenticatedUser,
   ) {
     return this.usersService.updateUser(id, payload);
+  }
+
+  @Post('sync/google-sheet')
+  @Permissions('users:manage')
+  syncFromGoogleSheet() {
+    return this.usersService.syncUsersFromSheet();
   }
 }

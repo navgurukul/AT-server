@@ -97,6 +97,15 @@ export const departments = pgTable("departments", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });
 
+export const employeeDepartments = pgTable("employee_departments", {
+  id: serial("id").primaryKey(),
+  name: varchar("name", { length: 160 }).notNull().unique(),
+  code: varchar("code", { length: 50 }),
+  description: text("description"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+});
+
 export const users = pgTable(
   "users",
   {
@@ -112,6 +121,19 @@ export const users = pgTable(
     departmentId: integer("department_id").references(() => departments.id, {
       onDelete: "set null",
     }),
+    employeeDepartmentId: integer("employee_department_id").references(
+      () => employeeDepartments.id,
+      { onDelete: "set null" },
+    ),
+    workLocationType: varchar("work_location_type", { length: 120 }),
+    dateOfJoining: date("date_of_joining"),
+    employmentType: varchar("employment_type", { length: 160 }),
+    employmentStatus: varchar("employment_status", { length: 64 }),
+    dateOfExit: date("date_of_exit"),
+    slackId: varchar("slack_id", { length: 160 }),
+    alumniStatus: varchar("alumni_status", { length: 120 }),
+    gender: varchar("gender", { length: 32 }),
+    discordId: varchar("discord_id", { length: 160 }),
     rolePrimary: roleKeyEnum().notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
@@ -660,6 +682,7 @@ export const schema = {
 // Legacy aliases to maintain compatibility with existing imports
 export const orgsTable = orgs;
 export const departmentsTable = departments;
+export const employeeDepartmentsTable = employeeDepartments;
 export const usersTable = users;
 export const rolesTable = roles;
 export const userRolesTable = userRoles;

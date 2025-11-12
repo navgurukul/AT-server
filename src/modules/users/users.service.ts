@@ -1,9 +1,12 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { JWT } from 'google-auth-library';
+import { hash } from 'bcryptjs';
 import { and, count, eq, ilike, inArray, or } from 'drizzle-orm';
 
 import { DatabaseService } from '../../database/database.service';
 import {
   departmentsTable,
+  employeeDepartmentsTable,
   permissionsTable,
   rolePermissionsTable,
   rolesTable,
@@ -78,6 +81,16 @@ export class UsersService {
         status: usersTable.status,
         managerId: usersTable.managerId,
         departmentId: usersTable.departmentId,
+        employeeDepartmentId: usersTable.employeeDepartmentId,
+        workLocationType: usersTable.workLocationType,
+        dateOfJoining: usersTable.dateOfJoining,
+        employmentType: usersTable.employmentType,
+        employmentStatus: usersTable.employmentStatus,
+        dateOfExit: usersTable.dateOfExit,
+        slackId: usersTable.slackId,
+        alumniStatus: usersTable.alumniStatus,
+        gender: usersTable.gender,
+        discordId: usersTable.discordId,
         rolePrimary: usersTable.rolePrimary,
         avatarUrl: usersTable.avatarUrl,
         createdAt: usersTable.createdAt,
@@ -166,6 +179,44 @@ export class UsersService {
       return acc;
     }, {});
 
+    const employeeDepartmentIds = Array.from(
+      new Set(
+        users
+          .map((user) => user.employeeDepartmentId)
+          .filter(
+            (id): id is number => id !== null && id !== undefined,
+          ),
+      ),
+    );
+
+    const employeeDepartments =
+      employeeDepartmentIds.length === 0
+        ? []
+        : await db
+            .select({
+              id: employeeDepartmentsTable.id,
+              name: employeeDepartmentsTable.name,
+              code: employeeDepartmentsTable.code,
+              description: employeeDepartmentsTable.description,
+            })
+            .from(employeeDepartmentsTable)
+            .where(inArray(employeeDepartmentsTable.id, employeeDepartmentIds));
+
+    const employeeDepartmentsById = employeeDepartments.reduce<
+      Record<
+        number,
+        { id: number; name: string; code: string | null; description: string | null }
+      >
+    >((acc, curr) => {
+      acc[curr.id] = {
+        id: Number(curr.id),
+        name: curr.name,
+        code: curr.code ?? null,
+        description: curr.description ?? null,
+      };
+      return acc;
+    }, {});
+
     const enrichedUsers = users.map((user) => ({
       ...user,
       roles: rolesByUser[user.id] ?? [],
@@ -181,6 +232,14 @@ export class UsersService {
         user.departmentId !== null && user.departmentId !== undefined
           ? departmentsById[user.departmentId] ?? null
           : null,
+      employeeDepartmentId:
+        user.employeeDepartmentId !== null && user.employeeDepartmentId !== undefined
+          ? Number(user.employeeDepartmentId)
+          : null,
+      employeeDepartment:
+        user.employeeDepartmentId !== null && user.employeeDepartmentId !== undefined
+          ? employeeDepartmentsById[user.employeeDepartmentId] ?? null
+          : null,
     }));
 
     const total = Number(totalResult[0]?.value ?? 0);
@@ -192,180 +251,3 @@ export class UsersService {
       total,
     };
   }
-
-  async updateUser(id: number, payload: UpdateUserDto) {
-    const db = this.database.connection;
-
-    const [existing] = await db
-      .select({
-        id: usersTable.id,
-        orgId: usersTable.orgId,
-      })
-      .from(usersTable)
-      .where(eq(usersTable.id, id))
-      .limit(1);
-
-    if (!existing) {
-      throw new NotFoundException(`User with id ${id} not found`);
-    }
-
-    const updateStatements: Partial<{
-      managerId: number;
-      departmentId: number | null;
-    }> = {};
-    if (payload.managerId !== undefined) {
-      updateStatements.managerId = payload.managerId;
-    }
-
-    if (payload.departmentId !== undefined) {
-      const [department] = await db
-        .select({
-          id: departmentsTable.id,
-          orgId: departmentsTable.orgId,
-        })
-        .from(departmentsTable)
-        .where(eq(departmentsTable.id, payload.departmentId))
-        .limit(1);
-
-      if (!department) {
-        throw new NotFoundException(
-          `Department with id ${payload.departmentId} not found`,
-        );
-      }
-
-      if (department.orgId !== existing.orgId) {
-        throw new BadRequestException(
-          'Department belongs to a different organisation',
-        );
-      }
-
-      updateStatements.departmentId = department.id;
-    }
-
-    if (Object.keys(updateStatements).length > 0) {
-      await db
-        .update(usersTable)
-        .set(updateStatements)
-        .where(eq(usersTable.id, id));
-    }
-
-    if (payload.roles) {
-      const roles = await db
-        .select({
-          id: rolesTable.id,
-          key: rolesTable.key,
-        })
-        .from(rolesTable)
-        .where(inArray(rolesTable.key, payload.roles));
-
-      const missingRoles = payload.roles.filter(
-        (roleKey) => !roles.some((role) => role.key === roleKey),
-      );
-      if (missingRoles.length > 0) {
-        throw new NotFoundException(
-          `Roles not found: ${missingRoles.join(', ')}`,
-        );
-      }
-
-      await db
-        .delete(userRolesTable)
-        .where(eq(userRolesTable.userId, id));
-
-      if (roles.length > 0) {
-        await db.insert(userRolesTable).values(
-          roles.map((role) => ({
-            roleId: role.id,
-            userId: id,
-          })),
-        );
-      }
-    }
-
-    const [user] = await db
-      .select({
-        id: usersTable.id,
-        name: usersTable.name,
-        email: usersTable.email,
-        orgId: usersTable.orgId,
-        status: usersTable.status,
-        managerId: usersTable.managerId,
-        departmentId: usersTable.departmentId,
-      })
-      .from(usersTable)
-      .where(eq(usersTable.id, id))
-      .limit(1);
-
-    const userRoles = await db
-      .select({
-        roleKey: rolesTable.key,
-        permissions: permissionsTable.key,
-      })
-      .from(userRolesTable)
-      .innerJoin(rolesTable, eq(userRolesTable.roleId, rolesTable.id))
-      .innerJoin(
-        rolePermissionsTable,
-        eq(rolePermissionsTable.roleId, rolesTable.id),
-      )
-      .innerJoin(
-        permissionsTable,
-        eq(rolePermissionsTable.permissionId, permissionsTable.id),
-      )
-      .where(eq(userRolesTable.userId, id));
-
-    const groupedRoles = userRoles.reduce<Record<string, string[]>>(
-      (acc, curr) => {
-        acc[curr.roleKey] = acc[curr.roleKey] ?? [];
-        acc[curr.roleKey].push(curr.permissions);
-        return acc;
-      },
-      {},
-    );
-
-    let department:
-      | {
-          id: number;
-          name: string;
-          code: string | null;
-          description: string | null;
-        }
-      | null = null;
-    if (user.departmentId !== null && user.departmentId !== undefined) {
-      const [departmentRow] = await db
-        .select({
-          id: departmentsTable.id,
-          name: departmentsTable.name,
-          code: departmentsTable.code,
-          description: departmentsTable.description,
-        })
-        .from(departmentsTable)
-        .where(eq(departmentsTable.id, user.departmentId))
-        .limit(1);
-
-      if (departmentRow) {
-        department = {
-          id: Number(departmentRow.id),
-          name: departmentRow.name,
-          code: departmentRow.code ?? null,
-          description: departmentRow.description ?? null,
-        };
-      }
-    }
-
-    return {
-      ...user,
-      managerId:
-        user.managerId !== null && user.managerId !== undefined
-          ? Number(user.managerId)
-          : null,
-      departmentId:
-        user.departmentId !== null && user.departmentId !== undefined
-          ? Number(user.departmentId)
-          : null,
-      department,
-      roles: Object.keys(groupedRoles),
-      permissions: [
-        ...new Set(userRoles.map((assignment) => assignment.permissions)),
-      ],
-    };
-  }
-}

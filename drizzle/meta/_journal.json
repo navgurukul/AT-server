@@ -85,6 +85,13 @@
       "when": 1762415977000,
       "tag": "0011_add_timesheet_entry_fields",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1762422000000,
+      "tag": "0012_employee_profile_fields",
+      "breakpoints": true
     }
   ]
 }

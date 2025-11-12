@@ -1,0 +1,17 @@
+node_modules
+dist
+coverage
+.nest
+.turbo
+.git
+.gitignore
+.vscode
+Dockerfile
+docker-compose.yml
+*.log
+*.tmp
+tmp
+.DS_Store
+pnpm-lock.yaml
+yarn.lock
+npm-debug.log*
