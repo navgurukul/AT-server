@@ -16,11 +16,6 @@ export class UpdateUserDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsInt()
-  departmentId?: number;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsInt()
   employeeDepartmentId?: number;
 
   @ApiPropertyOptional()

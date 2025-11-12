@@ -8,7 +8,7 @@ import { AuthenticatedUser } from '../../common/types/authenticated-user.interfa
 import { DatabaseService } from '../../database/database.service';
 import {
   authBlacklistedTokensTable,
-  departmentsTable,
+  employeeDepartmentsTable,
   permissionsTable,
   rolePermissionsTable,
   rolesTable,
@@ -66,7 +66,9 @@ export class AuthService {
     }
 
     const now = new Date();
-    const departmentId = user.departmentId ? Number(user.departmentId) : null;
+    const employeeDepartmentId = user.employeeDepartmentId
+      ? Number(user.employeeDepartmentId)
+      : null;
 
     if (!user.googleUserId) {
       await db
@@ -87,7 +89,7 @@ export class AuthService {
         .where(eq(usersTable.id, user.id));
     }
 
-    let department:
+    let employeeDepartment:
       | {
           id: number;
           name: string;
@@ -95,24 +97,24 @@ export class AuthService {
           description: string | null;
         }
       | null = null;
-    if (departmentId) {
-      const [departmentRow] = await db
+    if (employeeDepartmentId) {
+      const [employeeDepartmentRow] = await db
         .select({
-          id: departmentsTable.id,
-          name: departmentsTable.name,
-          code: departmentsTable.code,
-          description: departmentsTable.description,
+          id: employeeDepartmentsTable.id,
+          name: employeeDepartmentsTable.name,
+          code: employeeDepartmentsTable.code,
+          description: employeeDepartmentsTable.description,
         })
-        .from(departmentsTable)
-        .where(eq(departmentsTable.id, departmentId))
+        .from(employeeDepartmentsTable)
+        .where(eq(employeeDepartmentsTable.id, employeeDepartmentId))
         .limit(1);
 
-      if (departmentRow) {
-        department = {
-          id: Number(departmentRow.id),
-          name: departmentRow.name,
-          code: departmentRow.code ?? null,
-          description: departmentRow.description ?? null,
+      if (employeeDepartmentRow) {
+        employeeDepartment = {
+          id: Number(employeeDepartmentRow.id),
+          name: employeeDepartmentRow.name,
+          code: employeeDepartmentRow.code ?? null,
+          description: employeeDepartmentRow.description ?? null,
         };
       }
     }
@@ -127,7 +129,7 @@ export class AuthService {
       roles,
       permissions,
       managerId: user.managerId ? Number(user.managerId) : null,
-      departmentId,
+      employeeDepartmentId,
     };
 
     const accessToken = await this.signAccessToken(jwtPayload);
@@ -145,8 +147,8 @@ export class AuthService {
         roles,
         permissions,
         managerId: user.managerId ? Number(user.managerId) : null,
-        departmentId,
-        department,
+        employeeDepartmentId,
+        employeeDepartment,
         avatarUrl: googleProfile.picture ?? user.avatarUrl ?? null,
       },
     };
@@ -173,7 +175,7 @@ export class AuthService {
         email: usersTable.email,
         orgId: usersTable.orgId,
         managerId: usersTable.managerId,
-        departmentId: usersTable.departmentId,
+        employeeDepartmentId: usersTable.employeeDepartmentId,
       })
       .from(usersTable)
       .where(eq(usersTable.id, payload.sub));
@@ -187,8 +189,8 @@ export class AuthService {
     const managerId = userRecord.managerId
       ? Number(userRecord.managerId)
       : null;
-    const departmentId = userRecord.departmentId
-      ? Number(userRecord.departmentId)
+    const employeeDepartmentId = userRecord.employeeDepartmentId
+      ? Number(userRecord.employeeDepartmentId)
       : null;
 
     const enrichedPayload: JwtPayload = {
@@ -198,7 +200,7 @@ export class AuthService {
       roles,
       permissions,
       managerId,
-      departmentId,
+      employeeDepartmentId,
     };
 
     const newAccessToken = await this.signAccessToken(enrichedPayload);
@@ -222,32 +224,32 @@ export class AuthService {
   async getProfile(user: AuthenticatedUser) {
     const db = this.databaseService.connection;
 
-    if (!user.departmentId) {
+    if (!user.employeeDepartmentId) {
       return {
         ...user,
-        department: null,
+        employeeDepartment: null,
       };
     }
 
-    const [department] = await db
+    const [employeeDepartment] = await db
       .select({
-        id: departmentsTable.id,
-        name: departmentsTable.name,
-        code: departmentsTable.code,
-        description: departmentsTable.description,
+        id: employeeDepartmentsTable.id,
+        name: employeeDepartmentsTable.name,
+        code: employeeDepartmentsTable.code,
+        description: employeeDepartmentsTable.description,
       })
-      .from(departmentsTable)
-      .where(eq(departmentsTable.id, user.departmentId))
+      .from(employeeDepartmentsTable)
+      .where(eq(employeeDepartmentsTable.id, user.employeeDepartmentId))
       .limit(1);
 
     return {
       ...user,
-      department: department
+      employeeDepartment: employeeDepartment
         ? {
-            id: Number(department.id),
-            name: department.name,
-            code: department.code ?? null,
-            description: department.description ?? null,
+            id: Number(employeeDepartment.id),
+            name: employeeDepartment.name,
+            code: employeeDepartment.code ?? null,
+            description: employeeDepartment.description ?? null,
           }
         : null,
     };

@@ -27,6 +27,7 @@ interface ListTimesheetParams {
 }
 
 const MAX_BACKFILL_PER_MONTH = 3;
+const MAX_HOURS_PER_DAY = 15;
 const HOURS_PER_WORKING_DAY = 8;
 const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 
@@ -197,6 +198,13 @@ export class TimesheetsService {
         ? entry.tags.filter((tag) => typeof tag === "string" && tag.trim() !== "")
         : [];
 
+      const hours = Number(entry.hours);
+      if (Number.isNaN(hours) || hours <= 0) {
+        throw new BadRequestException(
+          `Entry ${index + 1} must include a valid positive number of hours`
+        );
+      }
+
       const normalized = {
         projectId,
         taskTitle,
@@ -204,7 +212,7 @@ export class TimesheetsService {
           entry.taskDescription && entry.taskDescription.trim().length > 0
             ? entry.taskDescription.trim()
             : null,
-        hours: entry.hours,
+        hours,
         tags,
       };
 
@@ -213,6 +221,16 @@ export class TimesheetsService {
     });
 
     const normalizedEntries = Array.from(normalizedEntriesMap.values());
+    const totalHoursForDay = normalizedEntries.reduce(
+      (acc, entry) => acc + entry.hours,
+      0
+    );
+
+    if (totalHoursForDay > MAX_HOURS_PER_DAY) {
+      throw new BadRequestException(
+        `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day`
+      );
+    }
 
     const projectIds = Array.from(
       new Set(
@@ -476,7 +494,7 @@ export class TimesheetsService {
         id: usersTable.id,
         orgId: usersTable.orgId,
         name: usersTable.name,
-        departmentId: usersTable.departmentId,
+        employeeDepartmentId: usersTable.employeeDepartmentId,
       })
       .from(usersTable)
       .where(eq(usersTable.id, userId))
@@ -868,7 +886,8 @@ export class TimesheetsService {
       user: {
         id: user.id,
         name: user.name,
-        departmentId: user.departmentId ?? null,
+        employeeDepartmentId:
+          user.employeeDepartmentId ?? null,
       },
       period: {
         year,

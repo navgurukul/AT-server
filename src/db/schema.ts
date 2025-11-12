@@ -54,6 +54,12 @@ export const leaveStateEnum = pgEnum("leave_state", [
   "cancelled",
 ]);
 
+export const compOffStatusEnum = pgEnum("comp_off_status", [
+  "granted",
+  "expired",
+  "revoked",
+]);
+
 export const decisionEnum = pgEnum("decision", [
   "pending",
   "approved",
@@ -118,9 +124,6 @@ export const users = pgTable(
     passwordHash: varchar("password_hash", { length: 255 }).notNull(),
     status: userStatusEnum().notNull().default("active"),
     managerId: integer("manager_id"),
-    departmentId: integer("department_id").references(() => departments.id, {
-      onDelete: "set null",
-    }),
     employeeDepartmentId: integer("employee_department_id").references(
       () => employeeDepartments.id,
       { onDelete: "set null" },
@@ -389,6 +392,32 @@ export const leaveRequests = pgTable("leave_requests", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   requestedAt: timestamp("requested_at", { withTimezone: true }).defaultNow(),
   decidedByUserId: integer("decided_by_user_id").references(() => users.id),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+});
+
+export const compOffCredits = pgTable("comp_off_credits", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id")
+    .notNull()
+    .references(() => orgs.id),
+  userId: integer("user_id")
+    .notNull()
+    .references(() => users.id),
+  managerId: integer("manager_id")
+    .notNull()
+    .references(() => users.id),
+  createdBy: integer("created_by")
+    .notNull()
+    .references(() => users.id),
+  timesheetId: integer("timesheet_id").references(() => timesheets.id),
+  workDate: date("work_date").notNull(),
+  durationType: varchar("duration_type", { length: 20 }).notNull(),
+  creditedHours: numeric("credited_hours", { precision: 5, scale: 2 }).notNull(),
+  timesheetHours: numeric("timesheet_hours", { precision: 5, scale: 2 }),
+  status: compOffStatusEnum().notNull().default("granted"),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  notes: text("notes"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });
 
@@ -697,6 +726,7 @@ export const leaveTypesTable = leaveTypes;
 export const leavePoliciesTable = leavePolicies;
 export const leaveBalancesTable = leaveBalances;
 export const leaveRequestsTable = leaveRequests;
+export const compOffCreditsTable = compOffCredits;
 export const approvalsTable = approvals;
 export const payrollWindowsTable = payrollWindows;
 export const jobsTable = jobs;

@@ -15,6 +15,8 @@ import { AuthenticatedUser } from "../../common/types/authenticated-user.interfa
 import { CreateLeaveRequestDto } from "./dto/create-leave-request.dto";
 import { ReviewLeaveRequestDto } from "./dto/review-leave-request.dto";
 import { BulkReviewLeaveRequestsDto } from "./dto/bulk-review-leave-requests.dto";
+import { GrantCompOffDto } from "./dto/grant-comp-off.dto";
+import { RevokeCompOffDto } from "./dto/revoke-comp-off.dto";
 import { LeavesService } from "./leaves.service";
 
 @ApiTags("leaves")
@@ -69,6 +71,47 @@ export class LeavesController {
       return null;
     }
     return this.leavesService.createLeaveRequest(user.id, user.orgId, payload);
+  }
+
+  @Get("comp-offs")
+  @Permissions("leave:view:self")
+  listCompOffCredits(
+    @Query("userId") userId: string | undefined,
+    @Query("status") status: "granted" | "expired" | "revoked" | undefined,
+    @CurrentUser() actor: AuthenticatedUser | undefined
+  ) {
+    if (!actor) {
+      return null;
+    }
+    return this.leavesService.listCompOffCredits(actor, {
+      userId: userId ? Number.parseInt(userId, 10) : undefined,
+      status,
+    });
+  }
+
+  @Post("comp-offs")
+  @Permissions("leave:approve:team")
+  grantCompOff(
+    @Body() payload: GrantCompOffDto,
+    @CurrentUser() actor: AuthenticatedUser | undefined
+  ) {
+    if (!actor) {
+      return null;
+    }
+    return this.leavesService.grantCompOffCredit(actor, payload);
+  }
+
+  @Post("comp-offs/:id/revoke")
+  @Permissions("leave:approve:team")
+  revokeCompOff(
+    @Param("id", ParseIntPipe) creditId: number,
+    @Body() payload: RevokeCompOffDto,
+    @CurrentUser() actor: AuthenticatedUser | undefined
+  ) {
+    if (!actor) {
+      return null;
+    }
+    return this.leavesService.revokeCompOffCredit(actor, creditId, payload);
   }
 
   @Post("requests/:id/approve")

@@ -77,4 +77,10 @@ export class UsersController {
   syncFromGoogleSheet() {
     return this.usersService.syncUsersFromSheet();
   }
+
+  @Post('sync/manager-roles')
+  @Permissions('users:manage')
+  syncManagerRoles() {
+    return this.usersService.ensureReportingManagersHaveManagerRole();
+  }
 }

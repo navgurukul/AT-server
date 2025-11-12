@@ -1,8 +1,8 @@
-import { Injectable } from '@nestjs/common';
-import { and, eq, gte, lte } from 'drizzle-orm';
+import { Injectable } from "@nestjs/common";
+import { and, eq, gte, lte } from "drizzle-orm";
 
-import { DatabaseService } from '../../database/database.service';
-import { orgHolidaysTable } from '../../db/schema';
+import { DatabaseService } from "../../database/database.service";
+import { orgHolidaysTable } from "../../db/schema";
 
 @Injectable()
 export class CalendarService {
@@ -12,11 +12,15 @@ export class CalendarService {
     return date.toISOString().slice(0, 10);
   }
 
+  private normalize(date: Date): Date {
+    return new Date(
+      Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
+    );
+  }
+
   async isHoliday(orgId: number, date: Date): Promise<boolean> {
     const db = this.database.connection;
-    const normalized = new Date(
-      Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
-    );
+    const normalized = this.normalize(date);
     const key = this.formatDateKey(normalized);
 
     const [holiday] = await db
@@ -25,7 +29,7 @@ export class CalendarService {
       })
       .from(orgHolidaysTable)
       .where(
-        and(eq(orgHolidaysTable.orgId, orgId), eq(orgHolidaysTable.date, key)),
+        and(eq(orgHolidaysTable.orgId, orgId), eq(orgHolidaysTable.date, key))
       )
       .limit(1);
 
@@ -51,8 +55,8 @@ export class CalendarService {
         and(
           eq(orgHolidaysTable.orgId, orgId),
           gte(orgHolidaysTable.date, startKey),
-          lte(orgHolidaysTable.date, endKey),
-        ),
+          lte(orgHolidaysTable.date, endKey)
+        )
       );
 
     const map = new Map<string, { isWorkingDay: boolean }>();
@@ -63,5 +67,37 @@ export class CalendarService {
     }
 
     return map;
+  }
+
+  private isSecondOrFourthSaturday(date: Date): boolean {
+    const occurrence = Math.ceil(date.getUTCDate() / 7);
+    return occurrence === 2 || occurrence === 4;
+  }
+
+  async getDayInfo(orgId: number, date: Date): Promise<{
+    isWorkingDay: boolean;
+    isWeekend: boolean;
+    isHoliday: boolean;
+  }> {
+    const normalized = this.normalize(date);
+    const dayOfWeek = normalized.getUTCDay();
+    const isSunday = dayOfWeek === 0;
+    const isSaturday = dayOfWeek === 6;
+    const isWeekend = isSunday || isSaturday;
+    const isSecondFourthSaturday =
+      isSaturday && this.isSecondOrFourthSaturday(normalized);
+    const defaultWorking = !(isSunday || isSecondFourthSaturday);
+
+    const map = await this.getHolidayMap(orgId, normalized, normalized);
+    const override = map.get(this.formatDateKey(normalized));
+    const isWorkingDay =
+      override !== undefined ? override.isWorkingDay : defaultWorking;
+    const isHoliday = override ? !override.isWorkingDay : false;
+
+    return {
+      isWorkingDay,
+      isWeekend,
+      isHoliday,
+    };
   }
 }

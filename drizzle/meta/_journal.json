@@ -92,6 +92,13 @@
       "when": 1762422000000,
       "tag": "0012_employee_profile_fields",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1762423200000,
+      "tag": "0013_drop_user_department_column",
+      "breakpoints": true
     }
   ]
 }
