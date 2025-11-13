@@ -578,7 +578,10 @@ export class LeavesService {
           and(
             eq(compOffCreditsTable.orgId, actor.orgId),
             eq(compOffCreditsTable.userId, payload.userId),
-            eq(compOffCreditsTable.workDate, workDateKey),
+            eq(
+              compOffCreditsTable.workDate,
+              sql`CAST(${workDateKey} AS date)`
+            ),
             eq(compOffCreditsTable.status, "granted")
           )
         );
@@ -625,7 +628,7 @@ export class LeavesService {
           managerId: directManagerId ?? actor.id,
           createdBy: actor.id,
           timesheetId: timesheet.id,
-          workDate: workDateKey,
+          workDate: sql`CAST(${workDateKey} AS date)`,
           durationType: payload.duration,
           creditedHours: creditedHoursValue,
           timesheetHours: timesheetHoursValue,
