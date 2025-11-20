@@ -34,7 +34,7 @@ import {
 } from "../../db/schema";
 import { CalendarService } from "../calendar/calendar.service";
 import { CreateLeaveRequestDto } from "./dto/create-leave-request.dto";
-import { BulkReviewLeaveRequestsDto } from "./dto/bulk-review-leave-requests.dto";
+import { BulkReviewLeaveIdsDto } from "./dto/bulk-review-leave-ids.dto";
 import { ReviewLeaveRequestDto } from "./dto/review-leave-request.dto";
 import { GrantCompOffDto } from "./dto/grant-comp-off.dto";
 import { RevokeCompOffDto } from "./dto/revoke-comp-off.dto";
@@ -356,10 +356,6 @@ export class LeavesService {
         );
       }
 
-      if (payload.hours !== undefined && payload.hours <= 0) {
-        throw new BadRequestException("Leave hours must be greater than zero");
-      }
-
       switch (payload.durationType) {
         case "half_day":
           if (workingDays !== 1) {
@@ -378,7 +374,10 @@ export class LeavesService {
           break;
         case "full_day":
           requestedDurationType = "full_day";
-          requestedHours = totalHours;
+          requestedHours =
+            payload.hours !== undefined && payload.hours > 0
+              ? payload.hours
+              : totalHours;
           break;
         case "custom":
           if (payload.hours === undefined) {
@@ -395,7 +394,10 @@ export class LeavesService {
             requestedHours = payload.hours;
           } else {
             requestedDurationType = "full_day";
-            requestedHours = totalHours;
+            requestedHours =
+              payload.hours !== undefined && payload.hours > 0
+                ? payload.hours
+                : totalHours;
           }
       }
 
@@ -1083,16 +1085,15 @@ export class LeavesService {
     });
   }
   async bulkReviewLeaveRequests(
-    payload: BulkReviewLeaveRequestsDto,
+    payload: BulkReviewLeaveIdsDto,
     action: "approve" | "reject",
     approverId: number
   ) {
     const hasExplicitIds = payload.requestIds && payload.requestIds.length > 0;
-    const hasRange =
-      payload.month !== undefined && payload.year !== undefined;
-    if (!hasExplicitIds && !hasRange && !payload.userId) {
+    const hasRange = payload.month !== undefined && payload.year !== undefined;
+    if (!hasExplicitIds && !hasRange) {
       throw new BadRequestException(
-        "Provide requestIds, or month/year, or userId to bulk review."
+        "Provide requestIds or both month and year for bulk review."
       );
     }
 
@@ -1124,10 +1125,6 @@ export class LeavesService {
         approver.role === "admin" || approver.role === "super_admin";
 
       const filters = [];
-
-      if (payload.userId) {
-        filters.push(eq(leaveRequestsTable.userId, payload.userId));
-      }
       let evaluatedIds: number[] | undefined;
 
       if (payload.requestIds?.length) {
@@ -1142,17 +1139,12 @@ export class LeavesService {
         filters.push(lt(leaveRequestsTable.startDate, startOfNextMonth));
       }
 
-      if (filters.length === 0) {
-        throw new BadRequestException(
-          "No selection criteria provided for bulk review."
-        );
-      }
-
       const whereClause = filters.length === 1 ? filters[0] : and(...filters);
 
       const candidates = await tx
         .select({
           id: leaveRequestsTable.id,
+          orgId: leaveRequestsTable.orgId,
           userId: leaveRequestsTable.userId,
           state: leaveRequestsTable.state,
           hours: leaveRequestsTable.hours,
@@ -1234,6 +1226,11 @@ export class LeavesService {
             continue;
           }
           const hours = Number(request.hours ?? 0);
+          await this.ensureLeaveBalanceRow(
+            tx,
+            request.userId,
+            request.leaveTypeId
+          );
           await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
             pendingHours: -hours,
             bookedHours: hours,
@@ -1248,11 +1245,21 @@ export class LeavesService {
 
           const hours = Number(request.hours ?? 0);
           if (request.state === "approved") {
+            await this.ensureLeaveBalanceRow(
+              tx,
+              request.userId,
+              request.leaveTypeId
+            );
             await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
               bookedHours: -hours,
               balanceHours: hours,
             });
           } else if (request.state === "pending") {
+            await this.ensureLeaveBalanceRow(
+              tx,
+              request.userId,
+              request.leaveTypeId
+            );
             await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
               pendingHours: -hours,
               balanceHours: hours,

@@ -6,6 +6,7 @@ import {
   ParseIntPipe,
   Post,
   Query,
+  ValidationPipe,
 } from "@nestjs/common";
 import { ApiQuery, ApiTags } from "@nestjs/swagger";
 
@@ -14,7 +15,7 @@ import { CurrentUser } from "../../common/decorators/current-user.decorator";
 import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
 import { CreateLeaveRequestDto } from "./dto/create-leave-request.dto";
 import { ReviewLeaveRequestDto } from "./dto/review-leave-request.dto";
-import { BulkReviewLeaveRequestsDto } from "./dto/bulk-review-leave-requests.dto";
+import { BulkReviewLeaveIdsDto } from "./dto/bulk-review-leave-ids.dto";
 import { GrantCompOffDto } from "./dto/grant-comp-off.dto";
 import { RevokeCompOffDto } from "./dto/revoke-comp-off.dto";
 import { LeavesService } from "./leaves.service";
@@ -67,6 +68,7 @@ export class LeavesController {
     @Body() payload: CreateLeaveRequestDto,
     @CurrentUser() user: AuthenticatedUser | undefined
   ) {
+    console.log("Requesting leave with payload:", payload);
     if (!user) {
       return null;
     }
@@ -162,10 +164,12 @@ export class LeavesController {
     );
   }
 
-  @Post("requests/bulk/approve")
+  // Alternate bulk approve using body payload (simpler for clients)
+  @Post("requests/approve")
   @Permissions("leave:approve:team")
-  bulkApprove(
-    @Body() payload: BulkReviewLeaveRequestsDto,
+  bulkApproveBody(
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: false, transform: true }))
+    payload: BulkReviewLeaveIdsDto,
     @CurrentUser() user: AuthenticatedUser | undefined
   ) {
     return this.leavesService.bulkReviewLeaveRequests(
@@ -175,10 +179,11 @@ export class LeavesController {
     );
   }
 
-  @Post("requests/bulk/reject")
+  @Post("requests/reject")
   @Permissions("leave:approve:team")
-  bulkReject(
-    @Body() payload: BulkReviewLeaveRequestsDto,
+  bulkRejectBody(
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: false, transform: true }))
+    payload: BulkReviewLeaveIdsDto,
     @CurrentUser() user: AuthenticatedUser | undefined
   ) {
     return this.leavesService.bulkReviewLeaveRequests(
@@ -187,4 +192,32 @@ export class LeavesController {
       user?.id ?? 0
     );
   }
+
+  // @Post("requests/bulk/approve")
+  // @Permissions("leave:approve:team")
+  // bulkApprove(
+  //   @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: false, transform: true }))
+  //   payload: BulkReviewLeaveIdsDto,
+  //   @CurrentUser() user: AuthenticatedUser | undefined
+  // ) {
+  //   return this.leavesService.bulkReviewLeaveRequests(
+  //     payload,
+  //     "approve",
+  //     user?.id ?? 0
+  //   );
+  // }
+
+  // @Post("requests/bulk/reject")
+  // @Permissions("leave:approve:team")
+  // bulkReject(
+  //   @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: false, transform: true }))
+  //   payload: BulkReviewLeaveIdsDto,
+  //   @CurrentUser() user: AuthenticatedUser | undefined
+  // ) {
+  //   return this.leavesService.bulkReviewLeaveRequests(
+  //     payload,
+  //     "reject",
+  //     user?.id ?? 0
+  //   );
+  // }
 }

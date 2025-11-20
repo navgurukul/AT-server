@@ -1,20 +1,20 @@
-import { ApiPropertyOptional } from '@nestjs/swagger';
+import { ApiPropertyOptional } from "@nestjs/swagger";
 import {
   ArrayNotEmpty,
   IsArray,
   IsInt,
+  IsNumber,
   IsOptional,
   IsString,
   Max,
   Min,
   ValidateIf,
-} from 'class-validator';
-import { Type } from 'class-transformer';
+} from "class-validator";
+import { Type } from "class-transformer";
 
-export class BulkReviewLeaveRequestsDto {
+export class BulkReviewLeaveIdsDto {
   @ApiPropertyOptional({
-    description:
-      'Calendar month (1-12) used to select leave requests when explicit IDs are not supplied.',
+    description: "Calendar month (1-12) to select requests when IDs are not supplied.",
     minimum: 1,
     maximum: 12,
   })
@@ -25,7 +25,7 @@ export class BulkReviewLeaveRequestsDto {
   month?: number;
 
   @ApiPropertyOptional({
-    description: 'Calendar year that pairs with the month filter.',
+    description: "Calendar year paired with the month filter.",
   })
   @IsOptional()
   @ValidateIf((payload) => payload.month !== undefined)
@@ -34,14 +34,12 @@ export class BulkReviewLeaveRequestsDto {
 
   @ApiPropertyOptional({
     type: [Number],
-    description:
-      'Explicit leave request identifiers to review; overrides month/year filtering when present.',
+    description: "Explicit leave request IDs to review; overrides month/year when present.",
   })
   @IsOptional()
   @IsArray()
   @ArrayNotEmpty()
   @IsInt({ each: true })
-  @Type(() => Number)
   requestIds?: number[];
 
   @ApiPropertyOptional()
@@ -49,4 +47,3 @@ export class BulkReviewLeaveRequestsDto {
   @IsString()
   comment?: string;
 }
-
