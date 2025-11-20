@@ -2,7 +2,7 @@ import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { OAuth2Client, TokenPayload } from 'google-auth-library';
-import { eq, inArray, lt } from 'drizzle-orm';
+import { and, count, eq, gte, inArray, lt } from 'drizzle-orm';
 
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { DatabaseService } from '../../database/database.service';
@@ -14,12 +14,14 @@ import {
   rolesTable,
   userRolesTable,
   usersTable,
+  timesheetsTable,
 } from '../../db/schema';
 import { LoginDto } from './dto/login.dto';
 import { JwtPayload } from './types/jwt-payload.interface';
 
 @Injectable()
 export class AuthService {
+  private static readonly MAX_BACKFILL_PER_MONTH = 3;
   private readonly logger = new Logger(AuthService.name);
   private readonly googleClient: OAuth2Client;
 
@@ -223,11 +225,13 @@ export class AuthService {
 
   async getProfile(user: AuthenticatedUser) {
     const db = this.databaseService.connection;
+    const backfill = await this.getBackfillQuota(user.id);
 
     if (!user.employeeDepartmentId) {
       return {
         ...user,
         employeeDepartment: null,
+        backfill,
       };
     }
 
@@ -252,6 +256,7 @@ export class AuthService {
             description: employeeDepartment.description ?? null,
           }
         : null,
+      backfill,
     };
   }
 
@@ -341,6 +346,66 @@ export class AuthService {
     await db
       .delete(authBlacklistedTokensTable)
       .where(lt(authBlacklistedTokensTable.expiresAt, new Date()));
+  }
+
+  private async getBackfillQuota(userId: number) {
+    const now = new Date();
+    const usage = await this.countBackfilledDaysForMonth(userId, now, now);
+    const limit = AuthService.MAX_BACKFILL_PER_MONTH;
+    const remaining = Math.max(limit - usage, 0);
+    return {
+      limit,
+      remaining,
+    };
+  }
+
+  private async countBackfilledDaysForMonth(
+    userId: number,
+    referenceDate: Date,
+    now: Date,
+  ) {
+    const db = this.databaseService.connection;
+
+    const startOfMonth = this.normalizeDate(
+      new Date(
+        Date.UTC(
+          referenceDate.getUTCFullYear(),
+          referenceDate.getUTCMonth(),
+          1,
+        ),
+      ),
+    );
+    const startOfNextMonth = this.normalizeDate(
+      new Date(
+        Date.UTC(
+          referenceDate.getUTCFullYear(),
+          referenceDate.getUTCMonth() + 1,
+          1,
+        ),
+      ),
+    );
+
+    const today = this.normalizeDate(now);
+    const upperBound = today < startOfNextMonth ? today : startOfNextMonth;
+
+    const [{ value }] = await db
+      .select({ value: count(timesheetsTable.id) })
+      .from(timesheetsTable)
+      .where(
+        and(
+          eq(timesheetsTable.userId, userId),
+          lt(timesheetsTable.workDate, upperBound),
+          gte(timesheetsTable.workDate, startOfMonth),
+        ),
+      );
+
+    return Number(value ?? 0);
+  }
+
+  private normalizeDate(date: Date): Date {
+    return new Date(
+      Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
+    );
   }
 
   private async signAccessToken(payload: JwtPayload) {
