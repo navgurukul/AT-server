@@ -75,6 +75,8 @@ export class LeavesController {
 
   @Get("my-requests")
   @Permissions("leave:view:self")
+  @ApiQuery({ name: "from", required: false })
+  @ApiQuery({ name: "to", required: false })
   listMyRequests(
     @CurrentUser() user: AuthenticatedUser | undefined,
     @Query("from") from?: string,
