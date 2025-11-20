@@ -31,8 +31,7 @@ export class UsersController {
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
-    return this.usersService.searchUsers({
-      role: 'manager',
+    return this.usersService.listReferencedManagers({
       query: q ?? undefined,
       page: page ? Number.parseInt(page, 10) : undefined,
       limit: limit ? Number.parseInt(limit, 10) : undefined,

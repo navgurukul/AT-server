@@ -82,7 +82,7 @@ export class UsersService {
       filters.push(inArray(usersTable.id, roleFilteredUserIds));
     }
 
-    const whereClause = filters.length > 0 ? and(...filters) : undefined;
+    const whereClause = filters.length > 0 ? and(...(filters as any)) : undefined;
 
     const baseUsersQuery = db
       .select({
@@ -208,6 +208,132 @@ export class UsersService {
       page,
       limit,
       total,
+    };
+  }
+
+  async listReferencedManagers(params: { query?: string; page?: number; limit?: number }) {
+    const db = this.database.connection;
+
+    // Ensure any referenced managers have the manager role.
+    await this.ensureReportingManagersHaveManagerRole();
+
+    const managerIdRows = await db
+      .select({ managerId: usersTable.managerId })
+      .from(usersTable)
+      .where(isNotNull(usersTable.managerId));
+
+    const managerIds = [
+      ...new Set(
+        managerIdRows
+          .map((row) =>
+            row.managerId === null || row.managerId === undefined
+              ? null
+              : Number(row.managerId),
+          )
+          .filter((id): id is number => id !== null && !Number.isNaN(id)),
+      ),
+    ];
+
+    if (managerIds.length === 0) {
+      return { data: [], page: 1, limit: params.limit ?? 25, total: 0 };
+    }
+
+    const limit = params.limit && params.limit > 0 ? params.limit : 25;
+    const page = params.page && params.page > 0 ? params.page : 1;
+    const offset = (page - 1) * limit;
+
+    const filters: unknown[] = [inArray(usersTable.id, managerIds)];
+    if (params.query) {
+      const q = `%${params.query.toLowerCase()}%`;
+      filters.push(or(ilike(usersTable.name, q), ilike(usersTable.email, q)));
+    }
+
+    const whereClause = filters.length > 0 ? and(...(filters as any)) : undefined;
+
+    const baseUsersQuery = db
+      .select({
+        id: usersTable.id,
+        name: usersTable.name,
+        email: usersTable.email,
+        orgId: usersTable.orgId,
+        status: usersTable.status,
+        managerId: usersTable.managerId,
+        employeeDepartmentId: usersTable.employeeDepartmentId,
+        workLocationType: usersTable.workLocationType,
+        dateOfJoining: usersTable.dateOfJoining,
+        employmentType: usersTable.employmentType,
+        employmentStatus: usersTable.employmentStatus,
+        dateOfExit: usersTable.dateOfExit,
+        slackId: usersTable.slackId,
+        alumniStatus: usersTable.alumniStatus,
+        gender: usersTable.gender,
+        discordId: usersTable.discordId,
+        rolePrimary: usersTable.rolePrimary,
+        avatarUrl: usersTable.avatarUrl,
+        createdAt: usersTable.createdAt,
+        updatedAt: usersTable.updatedAt,
+      })
+      .from(usersTable);
+
+    const usersQuery = whereClause
+      ? baseUsersQuery.where(whereClause)
+      : baseUsersQuery;
+
+    const users = await usersQuery.limit(limit).offset(offset);
+
+    const totalResultQuery = db
+      .select({ value: count(usersTable.id) })
+      .from(usersTable);
+    const totalResult = await (
+      whereClause
+        ? totalResultQuery.where(whereClause)
+        : totalResultQuery
+    );
+
+    const userIds = users.map((user) => user.id);
+    const roleAssignments =
+      userIds.length === 0
+        ? []
+        : await db
+            .select({
+              userId: userRolesTable.userId,
+              roleKey: rolesTable.key,
+            })
+            .from(userRolesTable)
+            .innerJoin(rolesTable, eq(userRolesTable.roleId, rolesTable.id))
+            .where(inArray(userRolesTable.userId, userIds));
+
+    const rolesByUser = roleAssignments.reduce<Record<number, string[]>>(
+      (acc, curr) => {
+        acc[curr.userId] = acc[curr.userId] ?? [];
+        acc[curr.userId].push(curr.roleKey);
+        return acc;
+      },
+      {},
+    );
+
+    const data = users.map((user) => {
+      const roles = rolesByUser[user.id] ?? [];
+      const filteredRoles =
+        roles.includes('super_admin') || roles.includes('admin')
+          ? roles.filter((r) => r !== 'manager')
+          : roles;
+
+      return {
+        ...user,
+        roles: Array.from(new Set(filteredRoles)),
+        managerId:
+          user.managerId !== null && user.managerId !== undefined
+            ? Number(user.managerId)
+            : null,
+      };
+    });
+
+    return {
+      data,
+      page,
+      limit,
+      total: Number(totalResult[0]?.value ?? 0),
     };
   }
 

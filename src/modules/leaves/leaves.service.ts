@@ -160,6 +160,9 @@ export class LeavesService {
       filters.push(eq(usersTable.managerId, params.managerId));
     }
 
+    // Additional guard: never show non-working-day requests in this listing logic
+    // (handled at creation time), so existing data is trusted here.
+
     const baseQuery = db
       .select({
         id: leaveRequestsTable.id,
@@ -215,6 +218,71 @@ export class LeavesService {
       requestedAt: row.requestedAt,
       updatedAt: row.updatedAt,
       decidedByUserId: row.decidedByUserId ?? null,
+    }));
+  }
+
+  async listUserLeaveHistory(
+    userId: number,
+    orgId: number,
+    params: { from?: string; to?: string } = {}
+  ) {
+    const db = this.database.connection;
+    const { from, to } = params;
+
+    const fromDate = from ? this.normalizeDateUTC(new Date(from)) : undefined;
+    const toDate = to
+      ? this.normalizeDateUTC(new Date(to))
+      : fromDate ?? undefined;
+
+    const conditions = [
+      eq(leaveRequestsTable.orgId, orgId),
+      eq(leaveRequestsTable.userId, userId),
+    ];
+    if (fromDate) {
+      conditions.push(gte(leaveRequestsTable.endDate, fromDate));
+    }
+    if (toDate) {
+      conditions.push(lte(leaveRequestsTable.startDate, toDate));
+    }
+
+    const rows = await db
+      .select({
+        id: leaveRequestsTable.id,
+        startDate: leaveRequestsTable.startDate,
+        endDate: leaveRequestsTable.endDate,
+        durationType: leaveRequestsTable.durationType,
+        halfDaySegment: leaveRequestsTable.halfDaySegment,
+        hours: leaveRequestsTable.hours,
+        reason: leaveRequestsTable.reason,
+        state: leaveRequestsTable.state,
+        requestedAt: leaveRequestsTable.requestedAt,
+        updatedAt: leaveRequestsTable.updatedAt,
+        leaveType: {
+          id: leaveTypesTable.id,
+          code: leaveTypesTable.code,
+          name: leaveTypesTable.name,
+        },
+      })
+      .from(leaveRequestsTable)
+      .innerJoin(
+        leaveTypesTable,
+        eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id),
+      )
+      .where(and(...conditions))
+      .orderBy(desc(leaveRequestsTable.requestedAt));
+
+    return rows.map((row) => ({
+      id: row.id,
+      startDate: row.startDate,
+      endDate: row.endDate,
+      durationType: row.durationType,
+      halfDaySegment: row.halfDaySegment ?? null,
+      hours: row.hours ? Number(row.hours) : 0,
+      reason: row.reason ?? null,
+      state: row.state,
+      requestedAt: row.requestedAt,
+      updatedAt: row.updatedAt,
+      leaveType: row.leaveType,
     }));
   }
   async createLeaveRequest(
@@ -395,6 +463,12 @@ export class LeavesService {
             "Insufficient leave balance for this leave type"
           );
         }
+      }
+
+      if (await this.hasBlockingTimesheet(orgId, userId, startDate, endDate, requestedDurationType)) {
+        throw new BadRequestException(
+          "Cannot request leave for dates where timesheets already exist"
+        );
       }
 
       const [request] = await tx
@@ -1203,9 +1277,14 @@ export class LeavesService {
 
     const cursor = new Date(start);
     while (cursor <= finish) {
-      if (await this.calendarService.isHoliday(orgId, cursor)) {
+      if (this.isFixedHoliday(cursor)) {
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+        continue;
+      }
+      const dayInfo = await this.calendarService.getDayInfo(orgId, cursor);
+      if (!dayInfo.isWorkingDay) {
         throw new BadRequestException(
-          `Cannot request leave on holiday or non-working day ${cursor
+          `Cannot request leave on non-working day ${cursor
             .toISOString()
             .slice(0, 10)}`
         );
@@ -1234,24 +1313,11 @@ export class LeavesService {
       )
     );
 
-    const holidayMap = await this.calendarService.getHolidayMap(
-      orgId,
-      start,
-      finish
-    );
-
     let workingDays = 0;
     const cursor = new Date(start);
     while (cursor <= finish) {
-      const dayOfWeek = cursor.getUTCDay();
-      const override = holidayMap.get(cursor.toISOString().slice(0, 10));
-      const isSunday = dayOfWeek === 0;
-      const isSecondOrFourthSaturday =
-        dayOfWeek === 6 && this.isSecondOrFourthSaturday(cursor);
-      const defaultWorkingDay = !(isSunday || isSecondOrFourthSaturday);
-      const isWorkingDay = override ? override.isWorkingDay : defaultWorkingDay;
-
-      if (isWorkingDay) {
+      const isNonWorking = await this.isNonWorkingDay(orgId, cursor);
+      if (!isNonWorking) {
         workingDays += 1;
       }
 
@@ -1264,9 +1330,58 @@ export class LeavesService {
     };
   }
 
+  private async hasBlockingTimesheet(
+    orgId: number,
+    userId: number,
+    startDate: Date,
+    endDate: Date,
+    requestedDurationType: "half_day" | "full_day" | "custom"
+  ): Promise<boolean> {
+    // Half-day leave can coexist with timesheets (other half worked).
+    if (requestedDurationType === "half_day") {
+      return false;
+    }
+
+    const db = this.database.connection;
+    const start = this.normalizeDateUTC(startDate);
+    const end = this.normalizeDateUTC(endDate);
+
+    const rows = await db
+      .select({ id: timesheetsTable.id })
+      .from(timesheetsTable)
+      .where(
+        and(
+          eq(timesheetsTable.orgId, orgId),
+          eq(timesheetsTable.userId, userId),
+          gte(timesheetsTable.workDate, start),
+          lte(timesheetsTable.workDate, end)
+        )
+      )
+      .limit(1);
+
+    return rows.length > 0;
+  }
+
   private normalizeHours(value: number): number {
     const rounded = Math.round(value * 100) / 100;
     return Math.abs(rounded) < HOURS_NEGATIVE_TOLERANCE ? 0 : rounded;
+  }
+
+  private isFixedHoliday(date: Date): boolean {
+    const mmdd = `${(date.getUTCMonth() + 1).toString().padStart(2, "0")}-${date
+      .getUTCDate()
+      .toString()
+      .padStart(2, "0")}`;
+    return mmdd === "01-26" || mmdd === "08-15" || mmdd === "10-02" || mmdd === "12-31";
+  }
+
+  private async isNonWorkingDay(orgId: number, date: Date): Promise<boolean> {
+    if (this.isFixedHoliday(date)) {
+      return true;
+    }
+
+    const info = await this.calendarService.getDayInfo(orgId, date);
+    return !info.isWorkingDay || info.isHoliday;
   }
 
   private hasOrgWideCompOffAccess(actor: AuthenticatedUser): boolean {

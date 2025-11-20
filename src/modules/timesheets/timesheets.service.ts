@@ -15,7 +15,7 @@ import {
 } from "drizzle-orm";
 
 import { DatabaseService } from '../../database/database.service';
-import { departmentsTable, leaveRequestsTable, leaveTypesTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
+import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
 import { CalendarService } from '../calendar/calendar.service';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 
@@ -26,7 +26,8 @@ interface ListTimesheetParams {
   state?: string;
 }
 
-const MAX_BACKFILL_PER_MONTH = 3;
+const DEFAULT_BACKFILL_PER_MONTH = 3;
+const BACKFILL_CUTOFF_DAY = 25;
 const MAX_HOURS_PER_DAY = 15;
 const HOURS_PER_WORKING_DAY = 8;
 const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
@@ -276,18 +277,20 @@ export class TimesheetsService {
     }
 
     const isBackfill = workDate < today;
-    const currentBackfillUsage = await this.countBackfilledDaysForMonth(
-      userId,
-      workDate,
-      now
-    );
+    const backfillAllowance = isBackfill
+      ? await this.getBackfillAllowance(orgId, userId, workDate, now)
+      : { limit: DEFAULT_BACKFILL_PER_MONTH, used: 0, remaining: DEFAULT_BACKFILL_PER_MONTH };
 
-    if (isBackfill) {
-      if (currentBackfillUsage >= MAX_BACKFILL_PER_MONTH) {
-        throw new BadRequestException(
-          `Backfilling is limited to ${MAX_BACKFILL_PER_MONTH} days per month`
-        );
-      }
+    if (isBackfill && today.getUTCDate() > BACKFILL_CUTOFF_DAY) {
+      throw new BadRequestException(
+        `Backfilling is not allowed after the ${BACKFILL_CUTOFF_DAY}th of the month`
+      );
+    }
+
+    if (isBackfill && backfillAllowance.remaining <= 0) {
+      throw new BadRequestException(
+        `Backfilling is limited to ${backfillAllowance.limit} days per month`
+      );
     }
 
     const [existing] = await db
@@ -319,6 +322,7 @@ export class TimesheetsService {
 
     const result = await db.transaction(async (tx) => {
       let timesheetId: number;
+      const isNewTimesheet = !existing;
 
       if (!existing) {
         const [created] = await tx
@@ -443,27 +447,109 @@ export class TimesheetsService {
         .where(eq(timesheetEntriesTable.timesheetId, timesheetId))
         .orderBy(asc(timesheetEntriesTable.id));
 
+      // If this is a new backfill entry, increment usage counters for the month.
+      if (isBackfill && isNewTimesheet) {
+        await this.incrementBackfillUsage(tx, orgId, userId, workDate, now);
+      }
+
       return {
         timesheet: storedTimesheet,
         entries: savedEntries,
       };
     });
 
-    const usageAfterOperation = await this.countBackfilledDaysForMonth(
-      userId,
-      workDate,
-      now
-    );
-
     const backfillRemaining = isBackfill
-      ? Math.max(MAX_BACKFILL_PER_MONTH - usageAfterOperation, 0)
-      : Math.max(MAX_BACKFILL_PER_MONTH - currentBackfillUsage, 0);
+      ? Math.max(backfillAllowance.remaining - (existing ? 0 : 1), 0)
+      : backfillAllowance.remaining;
 
     return {
       ...result.timesheet,
       entries: result.entries,
-      backfillLimit: MAX_BACKFILL_PER_MONTH,
+      backfillLimit: backfillAllowance.limit,
       backfillRemaining,
+    };
+  }
+
+  async updateBackfillLimit(payload: {
+    orgId: number;
+    userId: number;
+    year: number;
+    month: number;
+    limit: number;
+  }) {
+    const { orgId, userId, year, month, limit } = payload;
+    const db = this.database.connection;
+    const now = new Date();
+
+    const [counter] = await db
+      .select({
+        id: backfillCountersTable.id,
+        used: backfillCountersTable.used,
+        limit: backfillCountersTable.limit,
+      })
+      .from(backfillCountersTable)
+      .where(
+        and(
+          eq(backfillCountersTable.orgId, orgId),
+          eq(backfillCountersTable.userId, userId),
+          eq(backfillCountersTable.year, year),
+          eq(backfillCountersTable.month, month)
+        )
+      )
+      .limit(1);
+
+    let used = counter ? Number(counter.used ?? 0) : 0;
+
+    if (!counter) {
+      used = await this.countBackfilledDaysForMonth(
+        orgId,
+        userId,
+        new Date(Date.UTC(year, month - 1, 1)),
+        now
+      );
+
+      await db
+        .insert(backfillCountersTable)
+        .values({
+          orgId,
+          userId,
+          year,
+          month,
+          used,
+          limit,
+          lastUsedAt: null,
+        })
+        .onConflictDoUpdate({
+          target: [
+            backfillCountersTable.orgId,
+            backfillCountersTable.userId,
+            backfillCountersTable.year,
+            backfillCountersTable.month,
+          ],
+          set: {
+            used,
+            limit,
+            lastUsedAt: now,
+          },
+        });
+    } else {
+      await db
+        .update(backfillCountersTable)
+        .set({
+          limit,
+          lastUsedAt: now,
+        })
+        .where(eq(backfillCountersTable.id, counter.id));
+    }
+
+    return {
+      userId,
+      orgId,
+      year,
+      month,
+      used,
+      limit,
+      remaining: Math.max(limit - used, 0),
     };
   }
 
@@ -904,6 +990,7 @@ export class TimesheetsService {
   }
 
   private async countBackfilledDaysForMonth(
+    orgId: number,
     userId: number,
     referenceDate: Date,
     now: Date
@@ -938,6 +1025,7 @@ export class TimesheetsService {
       .from(timesheetsTable)
       .where(
         and(
+          eq(timesheetsTable.orgId, orgId),
           eq(timesheetsTable.userId, userId),
           lt(timesheetsTable.workDate, upperBound),
           gte(timesheetsTable.workDate, startOfMonth)
@@ -945,6 +1033,156 @@ export class TimesheetsService {
       );
 
     return Number(backfillCount ?? 0);
+  }
+
+  private async getBackfillAllowance(
+    orgId: number,
+    userId: number,
+    referenceDate: Date,
+    now: Date
+  ) {
+    const year = referenceDate.getUTCFullYear();
+    const month = referenceDate.getUTCMonth() + 1;
+
+    let counter = await this.getOrCreateBackfillCounter(
+      orgId,
+      userId,
+      year,
+      month,
+      now
+    );
+
+    const remaining = Math.max(counter.limit - counter.used, 0);
+    return {
+      limit: counter.limit,
+      used: counter.used,
+      remaining,
+    };
+  }
+
+  private async getOrCreateBackfillCounter(
+    orgId: number,
+    userId: number,
+    year: number,
+    month: number,
+    now: Date
+  ) {
+    const db = this.database.connection;
+
+    const [existing] = await db
+      .select({
+        id: backfillCountersTable.id,
+        used: backfillCountersTable.used,
+        limit: backfillCountersTable.limit,
+      })
+      .from(backfillCountersTable)
+      .where(
+        and(
+          eq(backfillCountersTable.orgId, orgId),
+          eq(backfillCountersTable.userId, userId),
+          eq(backfillCountersTable.year, year),
+          eq(backfillCountersTable.month, month)
+        )
+      )
+      .limit(1);
+
+    if (existing) {
+      return {
+        id: existing.id,
+        used: Number(existing.used ?? 0),
+        limit: Number(existing.limit ?? DEFAULT_BACKFILL_PER_MONTH),
+      };
+    }
+
+    const computedUsed = await this.countBackfilledDaysForMonth(
+      orgId,
+      userId,
+      new Date(Date.UTC(year, month - 1, 1)),
+      now
+    );
+
+    const [created] = await db
+      .insert(backfillCountersTable)
+      .values({
+        orgId,
+        userId,
+        year,
+        month,
+        used: computedUsed,
+        limit: DEFAULT_BACKFILL_PER_MONTH,
+        lastUsedAt: null,
+      })
+      .returning({
+        id: backfillCountersTable.id,
+        used: backfillCountersTable.used,
+        limit: backfillCountersTable.limit,
+      });
+
+    return {
+      id: created.id,
+      used: Number(created.used ?? computedUsed),
+      limit: Number(created.limit ?? DEFAULT_BACKFILL_PER_MONTH),
+    };
+  }
+
+  private async incrementBackfillUsage(
+    tx: DatabaseService["connection"],
+    orgId: number,
+    userId: number,
+    workDate: Date,
+    now: Date
+  ) {
+    const year = workDate.getUTCFullYear();
+    const month = workDate.getUTCMonth() + 1;
+    const workDateKey = this.formatDateKey(workDate);
+
+    const insertedDate = await tx
+      .insert(backfillDatesTable)
+      .values({
+        orgId,
+        userId,
+        year,
+        month,
+        workDate: workDateKey,
+      })
+      .onConflictDoNothing()
+      .returning({ id: backfillDatesTable.id });
+
+    if (insertedDate.length === 0) {
+      // Already counted
+      return;
+    }
+
+    const updated = await tx
+      .update(backfillCountersTable)
+      .set({
+        used: sql`${backfillCountersTable.used} + 1`,
+        lastUsedAt: now,
+      })
+      .where(
+        and(
+          eq(backfillCountersTable.orgId, orgId),
+          eq(backfillCountersTable.userId, userId),
+          eq(backfillCountersTable.year, year),
+          eq(backfillCountersTable.month, month)
+        )
+      )
+      .returning({ id: backfillCountersTable.id, used: backfillCountersTable.used });
+
+    if (updated.length === 0) {
+      await tx
+        .insert(backfillCountersTable)
+        .values({
+          orgId,
+          userId,
+          year,
+          month,
+          used: 1,
+          limit: DEFAULT_BACKFILL_PER_MONTH,
+          lastUsedAt: now,
+        })
+        .onConflictDoNothing();
+    }
   }
 
   private normalizeDateUTC(date: Date): Date {

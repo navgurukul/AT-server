@@ -587,11 +587,12 @@ export const backfillCounters = pgTable(
     userId: integer("user_id")
       .notNull()
       .references(() => users.id),
-    year: smallint("year").notNull(),
-    month: smallint("month").notNull(),
-    used: smallint("used").notNull().default(0),
-    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
-  },
+  year: smallint("year").notNull(),
+  month: smallint("month").notNull(),
+  used: smallint("used").notNull().default(0),
+  lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+  limit: smallint("limit").notNull().default(3),
+},
   (table) => ({
     uniqUserMonth: uniqueIndex("uniq_backfill_user_month").on(
       table.orgId,

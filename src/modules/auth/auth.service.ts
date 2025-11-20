@@ -14,6 +14,7 @@ import {
   rolesTable,
   userRolesTable,
   usersTable,
+  backfillCountersTable,
   timesheetsTable,
 } from '../../db/schema';
 import { LoginDto } from './dto/login.dto';
@@ -225,7 +226,7 @@ export class AuthService {
 
   async getProfile(user: AuthenticatedUser) {
     const db = this.databaseService.connection;
-    const backfill = await this.getBackfillQuota(user.id);
+    const backfill = await this.getBackfillQuota(user.id, user.orgId);
 
     if (!user.employeeDepartmentId) {
       return {
@@ -348,11 +349,41 @@ export class AuthService {
       .where(lt(authBlacklistedTokensTable.expiresAt, new Date()));
   }
 
-  private async getBackfillQuota(userId: number) {
+  private async getBackfillQuota(userId: number, orgId: number) {
     const now = new Date();
-    const usage = await this.countBackfilledDaysForMonth(userId, now, now);
-    const limit = AuthService.MAX_BACKFILL_PER_MONTH;
-    const remaining = Math.max(limit - usage, 0);
+    const year = now.getUTCFullYear();
+    const month = now.getUTCMonth() + 1;
+
+    const [counter] = await this.databaseService.connection
+      .select({
+        used: backfillCountersTable.used,
+        limit: backfillCountersTable.limit,
+      })
+      .from(backfillCountersTable)
+      .where(
+        and(
+          eq(backfillCountersTable.orgId, orgId),
+          eq(backfillCountersTable.userId, userId),
+          eq(backfillCountersTable.year, year),
+          eq(backfillCountersTable.month, month),
+        ),
+      )
+      .limit(1);
+
+    const usage =
+      counter && counter.used !== null && counter.used !== undefined
+        ? Number(counter.used)
+        : await this.countBackfilledDaysForMonth(userId, now, now, orgId);
+
+    const limit =
+      counter && counter.limit !== null && counter.limit !== undefined
+        ? Number(counter.limit)
+        : AuthService.MAX_BACKFILL_PER_MONTH;
+
+    const remaining =
+      now.getUTCDate() > 25
+        ? 0
+        : Math.max(limit - usage, 0);
     return {
       limit,
       remaining,
@@ -363,6 +394,7 @@ export class AuthService {
     userId: number,
     referenceDate: Date,
     now: Date,
+    orgId?: number,
   ) {
     const db = this.databaseService.connection;
 
@@ -388,16 +420,17 @@ export class AuthService {
     const today = this.normalizeDate(now);
     const upperBound = today < startOfNextMonth ? today : startOfNextMonth;
 
+    const conditions = [
+      eq(timesheetsTable.userId, userId),
+      orgId ? eq(timesheetsTable.orgId, orgId) : undefined,
+      lt(timesheetsTable.workDate, upperBound),
+      gte(timesheetsTable.workDate, startOfMonth),
+    ].filter((c): c is NonNullable<typeof c> => Boolean(c));
+
     const [{ value }] = await db
       .select({ value: count(timesheetsTable.id) })
       .from(timesheetsTable)
-      .where(
-        and(
-          eq(timesheetsTable.userId, userId),
-          lt(timesheetsTable.workDate, upperBound),
-          gte(timesheetsTable.workDate, startOfMonth),
-        ),
-      );
+      .where(and(...conditions));
 
     return Number(value ?? 0);
   }

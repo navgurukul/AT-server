@@ -12,6 +12,7 @@ import { Permissions } from '../../common/decorators/permissions.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
+import { UpdateBackfillLimitDto } from './dto/update-backfill-limit.dto';
 import { TimesheetsService } from './timesheets.service';
 
 @ApiTags('timesheets')
@@ -88,5 +89,23 @@ export class TimesheetsController {
       return null;
     }
     return this.timesheetsService.createOrUpsert(payload, user.id, user.orgId);
+  }
+
+  @Post('backfill/limit')
+  @Permissions('users:manage')
+  updateBackfillLimit(
+    @Body() payload: UpdateBackfillLimitDto,
+    @CurrentUser() actor: AuthenticatedUser | undefined,
+  ) {
+    if (!actor) {
+      return null;
+    }
+    return this.timesheetsService.updateBackfillLimit({
+      orgId: actor.orgId,
+      userId: payload.userId,
+      year: payload.year,
+      month: payload.month,
+      limit: payload.limit,
+    });
   }
 }

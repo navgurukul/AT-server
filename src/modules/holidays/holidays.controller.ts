@@ -24,11 +24,14 @@ export class HolidaysController {
   @Get()
   @Permissions('holiday:manage')
   list(
-    @Query('orgId', ParseIntPipe) orgId: number,
+    @Query('orgId') orgId?: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
   ) {
-    return this.holidaysService.list(orgId, { from: from ?? undefined, to: to ?? undefined });
+    return this.holidaysService.list(orgId ? Number.parseInt(orgId, 10) : undefined, {
+      from: from ?? undefined,
+      to: to ?? undefined,
+    });
   }
 
   @Post()

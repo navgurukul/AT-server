@@ -73,6 +73,22 @@ export class LeavesController {
     return this.leavesService.createLeaveRequest(user.id, user.orgId, payload);
   }
 
+  @Get("my-requests")
+  @Permissions("leave:view:self")
+  listMyRequests(
+    @CurrentUser() user: AuthenticatedUser | undefined,
+    @Query("from") from?: string,
+    @Query("to") to?: string
+  ) {
+    if (!user) {
+      return null;
+    }
+    return this.leavesService.listUserLeaveHistory(user.id, user.orgId, {
+      from: from ?? undefined,
+      to: to ?? undefined,
+    });
+  }
+
   @Get("comp-offs")
   @Permissions("leave:view:self")
   listCompOffCredits(

@@ -18,33 +18,60 @@ function normalizeDateString(input: string): string {
 export class HolidaysService {
   constructor(private readonly database: DatabaseService) {}
 
-  async list(orgId: number, params: { from?: string; to?: string }) {
-    const db = this.database.connection;
+  private fixedHolidaysForYear(year: number) {
+    const dates = [
+      { month: 1, day: 26, name: "Republic Day" },
+      { month: 8, day: 15, name: "Independence Day" },
+      { month: 10, day: 2, name: "Gandhi Jayanti" },
+      { month: 12, day: 31, name: "New Year's Eve" },
+    ];
 
-    const filters = [eq(orgHolidaysTable.orgId, orgId)];
+    return dates.map((h) => {
+      const date = new Date(Date.UTC(year, h.month - 1, h.day));
+      const iso = date.toISOString().slice(0, 10);
+      const dayName = date.toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" });
+      return {
+        id: null,
+        orgId: null,
+        date: iso,
+        name: h.name,
+        day: dayName,
+        isWorkingDay: false,
+        createdAt: null,
+        updatedAt: null,
+      };
+    });
+  }
 
-    if (params.from) {
-      filters.push(gte(orgHolidaysTable.date, normalizeDateString(params.from)));
+  async list(orgId: number | undefined, params: { from?: string; to?: string }) {
+    const from = params.from ? new Date(params.from) : undefined;
+    const to = params.to ? new Date(params.to) : undefined;
+
+    if (!params.from && !params.to) {
+      const year = new Date().getUTCFullYear();
+      return this.fixedHolidaysForYear(year);
     }
-    if (params.to) {
-      filters.push(lte(orgHolidaysTable.date, normalizeDateString(params.to)));
+
+    const startYear = from ? from.getUTCFullYear() : to ? to.getUTCFullYear() : new Date().getUTCFullYear();
+    const endYear = to ? to.getUTCFullYear() : startYear;
+
+    const holidays: ReturnType<HolidaysService["fixedHolidaysForYear"]> = [];
+    for (let y = startYear; y <= endYear; y += 1) {
+      holidays.push(...this.fixedHolidaysForYear(y));
     }
 
-    const whereClause = filters.length > 1 ? and(...filters) : filters[0];
+    const filtered = holidays.filter((h) => {
+      const d = new Date(h.date);
+      if (from && d < from) {
+        return false;
+      }
+      if (to && d > to) {
+        return false;
+      }
+      return true;
+    });
 
-    return db
-      .select({
-        id: orgHolidaysTable.id,
-        orgId: orgHolidaysTable.orgId,
-        date: orgHolidaysTable.date,
-        name: orgHolidaysTable.name,
-        isWorkingDay: orgHolidaysTable.isWorkingDay,
-        createdAt: orgHolidaysTable.createdAt,
-        updatedAt: orgHolidaysTable.updatedAt,
-      })
-      .from(orgHolidaysTable)
-      .where(whereClause)
-      .orderBy(orgHolidaysTable.date);
+    return filtered;
   }
 
   async create(payload: CreateHolidayDto) {
