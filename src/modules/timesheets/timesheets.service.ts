@@ -15,7 +15,7 @@ import {
 } from "drizzle-orm";
 
 import { DatabaseService } from '../../database/database.service';
-import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
+import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, notificationsTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
 import { CalendarService } from '../calendar/calendar.service';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 
@@ -161,6 +161,12 @@ export class TimesheetsService {
     const workDate = normalizeDate(new Date(payload.workDate));
     const now = new Date();
 
+    const [userInfo] = await db
+      .select({ name: usersTable.name })
+      .from(usersTable)
+      .where(eq(usersTable.id, userId))
+      .limit(1);
+
     if (!payload.entries || payload.entries.length === 0) {
       throw new BadRequestException("At least one entry is required");
     }
@@ -241,17 +247,28 @@ export class TimesheetsService {
       )
     );
 
+    let projectRecords:
+      | Array<{
+          id: number;
+          orgId: number;
+          slackChannelId: string | null;
+          name: string | null;
+        }>
+      | null = null;
+
     if (projectIds.length > 0) {
-      const projects = await db
+      projectRecords = await db
         .select({
           id: projectsTable.id,
           orgId: projectsTable.orgId,
+          slackChannelId: projectsTable.slackChannelId,
+          name: projectsTable.name,
         })
         .from(projectsTable)
         .where(inArray(projectsTable.id, projectIds));
 
       const validProjectIds = new Set(
-        projects
+        projectRecords
           .filter((project) => Number(project.orgId) === orgId)
           .map((project) => project.id),
       );
@@ -350,6 +367,11 @@ export class TimesheetsService {
           .where(eq(timesheetsTable.id, timesheetId));
       }
 
+      let projectChannelMap: Record<
+        number,
+        { channel: string | null; name: string | null }
+      > = {};
+
       if (normalizedEntries.length > 0) {
         const nonNullProjectIds = Array.from(
           new Set(
@@ -383,6 +405,19 @@ export class TimesheetsService {
                   : or(...projectConditions)
               )
             );
+        }
+
+        if (projectRecords) {
+          projectChannelMap = projectRecords.reduce<Record<number, { channel: string | null; name: string | null }>>(
+            (acc, project) => {
+              acc[Number(project.id)] = {
+                channel: project.slackChannelId ?? null,
+                name: project.name ?? null,
+              };
+              return acc;
+            },
+            {},
+          );
         }
 
         await tx.insert(timesheetEntriesTable).values(
@@ -455,12 +490,55 @@ export class TimesheetsService {
       return {
         timesheet: storedTimesheet,
         entries: savedEntries,
+        projectChannelMap,
       };
     });
 
     const backfillRemaining = isBackfill
       ? Math.max(backfillAllowance.remaining - (existing ? 0 : 1), 0)
       : backfillAllowance.remaining;
+
+    // Send Slack notifications per project channel
+    const entriesByProject = result.entries.reduce<
+      Record<
+        number,
+        {
+          hours: number;
+          descriptions: string[];
+        }
+      >
+    >((acc, entry) => {
+      if (entry.projectId !== null && entry.projectId !== undefined) {
+        const pid = Number(entry.projectId);
+        const hoursVal = Number(entry.hoursDecimal ?? 0);
+        if (!acc[pid]) {
+          acc[pid] = { hours: 0, descriptions: [] };
+        }
+        acc[pid].hours += hoursVal;
+        const desc = entry.taskDescription || entry.taskTitle;
+        if (desc && desc.trim().length > 0) {
+          acc[pid].descriptions.push(desc.trim());
+        }
+      }
+      return acc;
+    }, {});
+
+    for (const [pidStr, data] of Object.entries(entriesByProject)) {
+      const pid = Number(pidStr);
+      const projectMeta = result.projectChannelMap?.[pid];
+      const channel = projectMeta?.channel ?? null;
+      if (!channel) continue;
+      await this.enqueueSlackNotification(orgId, channel, 'timesheet_entry', {
+        userId,
+        userName: userInfo?.name ?? `User ${userId}`,
+        workDate,
+        workDateFormatted: this.formatDateDDMMYYYY(workDate),
+        projectId: pid,
+        projectName: projectMeta?.name ?? null,
+        hours: data.hours,
+        description: data.descriptions.join("; "),
+      });
+    }
 
     return {
       ...result.timesheet,
@@ -1035,6 +1113,22 @@ export class TimesheetsService {
     return Number(backfillCount ?? 0);
   }
 
+  private async enqueueSlackNotification(
+    orgId: number,
+    channelId: string,
+    template: string,
+    payload: Record<string, unknown>
+  ) {
+    await this.database.connection.insert(notificationsTable).values({
+      orgId,
+      channel: 'slack',
+      toRef: { channelId },
+      template,
+      payload,
+      state: 'pending',
+    });
+  }
+
   private async getBackfillAllowance(
     orgId: number,
     userId: number,
@@ -1193,6 +1287,14 @@ export class TimesheetsService {
 
   private formatDateKey(date: Date): string {
     return this.normalizeDateUTC(date).toISOString().slice(0, 10);
+  }
+
+  private formatDateDDMMYYYY(date: Date): string {
+    const d = this.normalizeDateUTC(date);
+    const dd = d.getUTCDate().toString().padStart(2, "0");
+    const mm = (d.getUTCMonth() + 1).toString().padStart(2, "0");
+    const yyyy = d.getUTCFullYear();
+    return `${dd}-${mm}-${yyyy}`;
   }
 
   private async getWorkingDayInfo(

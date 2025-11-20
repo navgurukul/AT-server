@@ -64,6 +64,7 @@ const PROJECT_SELECTION = {
   createdAt: projectsTable.createdAt,
   updatedAt: projectsTable.updatedAt,
   description: projectsTable.description,
+  slackChannelId: projectsTable.slackChannelId,
 };
 
 @Injectable()
@@ -148,6 +149,10 @@ export class ProjectsService {
         budgetAmountMinor:
           payload.budgetAmountMinor !== undefined
             ? payload.budgetAmountMinor.toString()
+            : null,
+        slackChannelId:
+          payload.slackChannelId && payload.slackChannelId.trim().length > 0
+            ? payload.slackChannelId.trim()
             : null,
       })
       .returning(PROJECT_SELECTION);
@@ -326,6 +331,12 @@ export class ProjectsService {
     }
     if (payload.budgetAmountMinor !== undefined) {
       updateValues.budgetAmountMinor = payload.budgetAmountMinor.toString();
+    }
+    if (payload.slackChannelId !== undefined) {
+      updateValues.slackChannelId =
+        payload.slackChannelId && payload.slackChannelId.trim().length > 0
+          ? payload.slackChannelId.trim()
+          : null;
     }
 
     let resultingProject = existing;

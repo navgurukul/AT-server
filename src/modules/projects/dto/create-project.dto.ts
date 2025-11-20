@@ -58,4 +58,10 @@ export class CreateProjectDto {
   @IsNumber()
   @Min(0)
   budgetAmountMinor?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  slackChannelId?: string;
 }

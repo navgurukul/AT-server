@@ -15,6 +15,7 @@ import {
   or,
   lt,
   sql,
+  isNotNull,
 } from "drizzle-orm";
 
 import { DatabaseService } from "../../database/database.service";
@@ -25,6 +26,9 @@ import {
   leavePoliciesTable,
   leaveRequestsTable,
   leaveTypesTable,
+  notificationsTable,
+  projectsTable,
+  timesheetEntriesTable,
   timesheetsTable,
   usersTable,
 } from "../../db/schema";
@@ -293,12 +297,17 @@ export class LeavesService {
     const db = this.database.connection;
     const startDate = new Date(payload.startDate);
     const endDate = new Date(payload.endDate);
+    let requiresApproval = true;
+    let isPaidLeave = true;
+    let requestedDurationType: "half_day" | "full_day" | "custom" = "full_day";
+    let requestedHours = 0;
+    let requestedHalfDaySegment: "first_half" | "second_half" | null = null;
 
     if (endDate < startDate) {
       throw new BadRequestException("End date cannot be before start date");
     }
 
-    return await db.transaction(async (tx) => {
+    const request = await db.transaction(async (tx) => {
       const [leaveType] = await tx
         .select()
         .from(leaveTypesTable)
@@ -350,10 +359,6 @@ export class LeavesService {
       if (payload.hours !== undefined && payload.hours <= 0) {
         throw new BadRequestException("Leave hours must be greater than zero");
       }
-
-      let requestedDurationType: "half_day" | "full_day" | "custom";
-      let requestedHours: number;
-      let requestedHalfDaySegment: "first_half" | "second_half" | null = null;
 
       switch (payload.durationType) {
         case "half_day":
@@ -443,12 +448,12 @@ export class LeavesService {
         );
       }
 
-      const requiresApproval =
+      requiresApproval =
         leaveType.requiresApproval === undefined ||
         leaveType.requiresApproval === null
           ? true
           : leaveType.requiresApproval;
-      const isPaidLeave = leaveType.paid ?? true;
+      isPaidLeave = leaveType.paid ?? true;
 
       let balanceSnapshot: LeaveBalanceSnapshot | null = null;
       if (isPaidLeave) {
@@ -541,6 +546,17 @@ export class LeavesService {
 
       return request;
     });
+
+    await this.notifyLatestProjectSlackChannel(userId, orgId, {
+      type: "leave_request",
+      startDate,
+      endDate,
+      durationType: requestedDurationType,
+      halfDaySegment: requestedHalfDaySegment,
+      state: isPaidLeave ? (requiresApproval ? "pending" : "approved") : "pending",
+    });
+
+    return request;
   }
 
   async grantCompOffCredit(
@@ -1071,12 +1087,12 @@ export class LeavesService {
     action: "approve" | "reject",
     approverId: number
   ) {
-    if (
-      (!payload.requestIds || payload.requestIds.length === 0) &&
-      (payload.month === undefined || payload.year === undefined)
-    ) {
+    const hasExplicitIds = payload.requestIds && payload.requestIds.length > 0;
+    const hasRange =
+      payload.month !== undefined && payload.year !== undefined;
+    if (!hasExplicitIds && !hasRange && !payload.userId) {
       throw new BadRequestException(
-        "Provide either requestIds or both month and year for bulk review."
+        "Provide requestIds, or month/year, or userId to bulk review."
       );
     }
 
@@ -1107,19 +1123,29 @@ export class LeavesService {
       const isAdmin =
         approver.role === "admin" || approver.role === "super_admin";
 
-      const filters = [eq(leaveRequestsTable.userId, payload.userId)];
+      const filters = [];
+
+      if (payload.userId) {
+        filters.push(eq(leaveRequestsTable.userId, payload.userId));
+      }
       let evaluatedIds: number[] | undefined;
 
       if (payload.requestIds?.length) {
         evaluatedIds = Array.from(new Set(payload.requestIds));
         filters.push(inArray(leaveRequestsTable.id, evaluatedIds));
-      } else {
+      } else if (hasRange) {
         const year = payload.year as number;
         const month = payload.month as number;
         const start = new Date(Date.UTC(year, month - 1, 1));
         const startOfNextMonth = new Date(Date.UTC(year, month, 1));
         filters.push(gte(leaveRequestsTable.startDate, start));
         filters.push(lt(leaveRequestsTable.startDate, startOfNextMonth));
+      }
+
+      if (filters.length === 0) {
+        throw new BadRequestException(
+          "No selection criteria provided for bulk review."
+        );
       }
 
       const whereClause = filters.length === 1 ? filters[0] : and(...filters);
@@ -1382,6 +1408,49 @@ export class LeavesService {
 
     const info = await this.calendarService.getDayInfo(orgId, date);
     return !info.isWorkingDay || info.isHoliday;
+  }
+
+  private async notifyLatestProjectSlackChannel(
+    userId: number,
+    orgId: number,
+    payload: Record<string, unknown>
+  ) {
+    const db = this.database.connection;
+    const [latest] = await db
+      .select({
+        slackChannelId: projectsTable.slackChannelId,
+      })
+      .from(timesheetsTable)
+      .innerJoin(
+        timesheetEntriesTable,
+        eq(timesheetsTable.id, timesheetEntriesTable.timesheetId),
+      )
+      .innerJoin(
+        projectsTable,
+        eq(timesheetEntriesTable.projectId, projectsTable.id),
+      )
+      .where(
+        and(
+          eq(timesheetsTable.userId, userId),
+          eq(timesheetsTable.orgId, orgId),
+          isNotNull(projectsTable.slackChannelId),
+        ),
+      )
+      .orderBy(desc(timesheetsTable.workDate))
+      .limit(1);
+
+    if (!latest?.slackChannelId) {
+      return;
+    }
+
+    await db.insert(notificationsTable).values({
+      orgId,
+      channel: "slack",
+      toRef: { channelId: latest.slackChannelId },
+      template: "leave_request",
+      payload,
+      state: "pending",
+    });
   }
 
   private hasOrgWideCompOffAccess(actor: AuthenticatedUser): boolean {

@@ -225,6 +225,7 @@ export const projects = pgTable("projects", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
   description: text("description"),
+  slackChannelId: varchar("slack_channel_id", { length: 200 }),
 });
 
 export const projectMembers = pgTable(

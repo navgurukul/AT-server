@@ -1,4 +1,11 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  DefaultValuePipe,
+  ParseIntPipe,
+  Post,
+  Query,
+} from "@nestjs/common";
 import { ApiTags } from '@nestjs/swagger';
 
 import { Permissions } from '../../common/decorators/permissions.decorator';
@@ -14,5 +21,13 @@ export class NotifyController {
   @Permissions('notifications:preview')
   preview(@Body() payload: PreviewNotificationDto) {
     return this.notifyService.previewTemplate(payload.template, payload.payload);
+  }
+
+  @Post('dispatch')
+  @Permissions('notifications:preview')
+  dispatch(
+    @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit: number,
+  ) {
+    return this.notifyService.dispatchPendingSlack(limit);
   }
 }

@@ -134,6 +134,13 @@
       "when": 1763034000000,
       "tag": "0018_backfill_counters_backfill",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1763037000000,
+      "tag": "0019_add_project_slack_channel",
+      "breakpoints": true
     }
   ]
 }

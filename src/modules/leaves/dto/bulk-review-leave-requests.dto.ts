@@ -11,9 +11,10 @@ import {
 } from 'class-validator';
 
 export class BulkReviewLeaveRequestsDto {
-  @ApiProperty()
+  @ApiPropertyOptional()
+  @IsOptional()
   @IsInt()
-  userId!: number;
+  userId?: number;
 
   @ApiPropertyOptional({
     description:
