@@ -30,6 +30,7 @@ import {
   projectsTable,
   timesheetEntriesTable,
   timesheetsTable,
+  userRoles,
   usersTable,
 } from "../../db/schema";
 import { CalendarService } from "../calendar/calendar.service";
@@ -954,7 +955,7 @@ export class LeavesService {
     approverId: number
   ) {
     const db = this.database.connection;
-
+console.log("approver id:", approverId);
     return await db.transaction(async (tx) => {
       const [request] = await tx
         .select({
@@ -988,31 +989,20 @@ export class LeavesService {
         );
       }
 
-      const [approver] = await tx
-        .select({
-          id: usersTable.id,
-          role: usersTable.rolePrimary,
-        })
-        .from(usersTable)
-        .where(eq(usersTable.id, approverId))
+      const [userRole] = await tx
+        .select()
+        .from(userRoles)
+        .where(eq(userRoles.userId, approverId))
         .limit(1);
+     console.log("user role:", userRole);
+  
 
-      if (!approver) {
+       if(userRole.roleId == 3 || (userRole.roleId == 2 && request.managerId != approverId) || (userRole.roleId == 4 && request.userId == approverId)) {
         throw new ForbiddenException(
-          "You are not authorized to review this leave request"
-        );
-      }
-
-      const isAdmin =
-        approver.role === "admin" || approver.role === "super_admin";
-
-      if (!isAdmin) {
-        if (request.managerId === null || request.managerId !== approverId) {
-          throw new ForbiddenException(
             "You are not authorized to review this leave request"
           );
-        }
       }
+
 
       const previousState = request.state;
       const requestedHours = Number(request.hours ?? 0);
