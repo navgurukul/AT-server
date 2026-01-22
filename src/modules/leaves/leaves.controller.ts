@@ -39,6 +39,7 @@ export class LeavesController {
   @ApiQuery({ name: "managerId", required: false })
   @Permissions("leave:view:team")
   listRequests(
+    @CurrentUser() user: AuthenticatedUser | undefined,
     @Query("state") state?: string,
     @Query("managerId") managerId?: string
   ) {
@@ -48,8 +49,10 @@ export class LeavesController {
         : undefined;
 
     return this.leavesService.listLeaveRequests({
+      actor: user,
       state: normalizedState,
       managerId: managerId ? Number.parseInt(managerId, 10) : undefined,
+      excludeUserId: user?.id,
     });
   }
 
