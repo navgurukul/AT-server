@@ -42,8 +42,10 @@ import { RevokeCompOffDto } from "./dto/revoke-comp-off.dto";
 import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
 
 interface ListLeaveRequestsParams {
+  actor?: AuthenticatedUser;
   state?: "pending" | "approved" | "rejected" | "cancelled";
   managerId?: number;
+  excludeUserId?: number;
 }
 
 interface ListCompOffParams {
@@ -163,6 +165,30 @@ export class LeavesService {
     }
     if (params.managerId) {
       filters.push(eq(usersTable.managerId, params.managerId));
+    }
+    if (params.excludeUserId) {
+      filters.push(sql`${leaveRequestsTable.userId} != ${params.excludeUserId}`);
+    }
+
+    // Filter by manager's mentees if actor is provided and no explicit managerId is specified
+    if (params.actor && !params.managerId) {
+      // Only show leave requests from their direct reports (mentees)
+      const mentees = await db
+        .select({ id: usersTable.id })
+        .from(usersTable)
+        .where(
+          and(
+            eq(usersTable.managerId, params.actor.id),
+            eq(usersTable.orgId, params.actor.orgId)
+          )
+        );
+
+      const menteeIds = mentees.map((m) => m.id);
+      if (menteeIds.length === 0) {
+        // Manager has no mentees, return empty list
+        return [];
+      }
+      filters.push(inArray(leaveRequestsTable.userId, menteeIds));
     }
 
     // Additional guard: never show non-working-day requests in this listing logic
@@ -955,7 +981,7 @@ export class LeavesService {
     approverId: number
   ) {
     const db = this.database.connection;
-console.log("approver id:", approverId);
+// console.log("approver id:", approverId);
     return await db.transaction(async (tx) => {
       const [request] = await tx
         .select({
@@ -982,6 +1008,7 @@ console.log("approver id:", approverId);
       if (!request) {
         throw new NotFoundException("Leave request not found");
       }
+      // console.log("approverID:", approverId);
 
       if (!approverId) {
         throw new ForbiddenException(
@@ -994,7 +1021,7 @@ console.log("approver id:", approverId);
         .from(userRoles)
         .where(eq(userRoles.userId, approverId))
         .limit(1);
-     console.log("user role:", userRole);
+      // console.log("user role:", userRole);
   
 
        if(userRole.roleId == 3 || (userRole.roleId == 2 && request.managerId != approverId) || (userRole.roleId == 4 && request.userId == approverId)) {
@@ -1111,6 +1138,18 @@ console.log("approver id:", approverId);
         );
       }
 
+      const [userRole] = await tx
+        .select()
+        .from(userRoles)
+        .where(eq(userRoles.userId, approverId))
+        .limit(1);
+
+      if (userRole.roleId == 3) {
+        throw new ForbiddenException(
+          "You are not authorized to review these leave requests"
+        );
+      }
+
       const isAdmin =
         approver.role === "admin" || approver.role === "super_admin";
 
@@ -1161,7 +1200,21 @@ console.log("approver id:", approverId);
 
       const managedCandidates = isAdmin
         ? candidates
-        : candidates.filter((candidate) => candidate.managerId === approverId);
+        : candidates.filter((candidate) => {
+            // For non-admin users, apply role-based checks
+            // roleId 2 = manager: can approve reports only
+            // roleId 4 = employee: cannot approve own requests
+            if (userRole.roleId == 2 && candidate.managerId !== approverId) {
+              return false;
+            }
+            if (userRole.roleId == 1 && candidate.userId === approverId) {
+              return false;
+            }
+            if (userRole.roleId == 4 && candidate.userId === approverId) {
+              return false;
+            }
+            return true;
+          });
 
       if (managedCandidates.length === 0) {
         throw new ForbiddenException(
