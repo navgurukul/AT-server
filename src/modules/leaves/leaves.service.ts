@@ -643,9 +643,11 @@ export class LeavesService {
       const isDirectManager = directManagerId === actor.id;
       const isPrivileged = this.hasOrgWideCompOffAccess(actor);
 
-      if (!isDirectManager && !isPrivileged) {
+      // Admin/SuperAdmin can grant comp-off for all employees
+      // Managers can grant comp-off only for their mentees (direct reports)
+      if (!this.canGrantCompOffForUser(actor, targetUser)) {
         throw new ForbiddenException(
-          "Only the employee's reporting manager or an administrator can grant comp-off credits"
+          "Only administrators can grant comp-off for any employee, or managers can grant for their direct reports"
         );
       }
 
@@ -927,15 +929,11 @@ export class LeavesService {
         throw new NotFoundException("User not found for this comp-off");
       }
 
-      const isAuthorized =
-        (targetUser.managerId !== null &&
-          targetUser.managerId !== undefined &&
-          Number(targetUser.managerId) === actor.id) ||
-        this.hasOrgWideCompOffAccess(actor);
+      const isAuthorized = this.canGrantCompOffForUser(actor, targetUser);
 
       if (!isAuthorized) {
         throw new ForbiddenException(
-          "Only the reporting manager or an administrator can revoke this comp-off"
+          "Only administrators can revoke comp-off for any employee, or managers can revoke for their direct reports"
         );
       }
 
@@ -1545,6 +1543,25 @@ export class LeavesService {
   private hasOrgWideCompOffAccess(actor: AuthenticatedUser): boolean {
     const privilegedRoles = new Set(["admin", "super_admin", "superadmin"]);
     return (actor.roles ?? []).some((role) => privilegedRoles.has(role));
+  }
+
+  private canGrantCompOffForUser(
+    actor: AuthenticatedUser,
+    targetUser: { managerId: number | null | undefined }
+  ): boolean {
+    // Admin/SuperAdmin can grant for all employees
+    if (this.hasOrgWideCompOffAccess(actor)) {
+      return true;
+    }
+    // Managers can grant only for their mentees (direct reports)
+    if (
+      targetUser.managerId !== null &&
+      targetUser.managerId !== undefined &&
+      Number(targetUser.managerId) === actor.id
+    ) {
+      return true;
+    }
+    return false;
   }
 
   private hasPermission(actor: AuthenticatedUser, permission: string): boolean {
