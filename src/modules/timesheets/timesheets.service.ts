@@ -523,6 +523,9 @@ export class TimesheetsService {
       return acc;
     }, {});
 
+    // Immediate notifications disabled - use daily aggregation endpoint instead
+    // POST /v1/timesheets/daily-summary to send grouped notifications
+    /* 
     for (const [pidStr, data] of Object.entries(entriesByProject)) {
       const pid = Number(pidStr);
       const projectMeta = result.projectChannelMap?.[pid];
@@ -539,6 +542,7 @@ export class TimesheetsService {
         description: data.descriptions.join("; "),
       });
     }
+    */
 
     return {
       ...result.timesheet,
