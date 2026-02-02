@@ -10,8 +10,10 @@ import {
   isNull,
   lt,
   lte,
+  not,
   or,
   sql,
+  SQL,
 } from "drizzle-orm";
 
 import { DatabaseService } from '../../database/database.service';
@@ -239,6 +241,17 @@ export class TimesheetsService {
       );
     }
 
+    const nonNullProjectIds = Array.from(
+      new Set(
+        normalizedEntries
+          .map((entry) => entry.projectId)
+          .filter((id): id is number => id !== null)
+      )
+    );
+    const includesNullProject = normalizedEntries.some(
+      (entry) => entry.projectId === null
+    );
+
     const projectIds = Array.from(
       new Set(
         normalizedEntries
@@ -335,6 +348,53 @@ export class TimesheetsService {
       );
     }
 
+    if (existing) {
+      const keepConditions = [
+        eq(timesheetEntriesTable.timesheetId, existing.id),
+      ];
+
+      if (nonNullProjectIds.length > 0) {
+        const inProjects = inArray(
+          timesheetEntriesTable.projectId,
+          nonNullProjectIds
+        ) as SQL<unknown>;
+
+        if (!inProjects) {
+          throw new BadRequestException('Invalid project selection');
+        }
+
+        const notInProjects = not(inProjects) as SQL<unknown>;
+        const isNullProject = isNull(
+          timesheetEntriesTable.projectId
+        ) as SQL<unknown>;
+
+        if (includesNullProject) {
+          keepConditions.push(notInProjects);
+          keepConditions.push(not(isNullProject));
+        } else {
+          keepConditions.push(sql`${notInProjects} OR ${isNullProject}`);
+        }
+      } else if (includesNullProject) {
+        keepConditions.push(not(isNull(timesheetEntriesTable.projectId)));
+      }
+
+      const [{ totalHours: remainingHours }] = await db
+        .select({
+          totalHours: sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
+        })
+        .from(timesheetEntriesTable)
+        .where(and(...keepConditions));
+
+      const combinedHours =
+        Number(remainingHours ?? 0) + Number(totalHoursForDay ?? 0);
+
+      if (combinedHours > MAX_HOURS_PER_DAY) {
+        throw new BadRequestException(
+          `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day`
+        );
+      }
+    }
+
     const notesToPersist = payload.notes ?? existing?.notes ?? null;
 
     const result = await db.transaction(async (tx) => {
@@ -373,17 +433,6 @@ export class TimesheetsService {
       > = {};
 
       if (normalizedEntries.length > 0) {
-        const nonNullProjectIds = Array.from(
-          new Set(
-            normalizedEntries
-              .map((entry) => entry.projectId)
-              .filter((id): id is number => id !== null)
-          )
-        );
-        const includesNullProject = normalizedEntries.some(
-          (entry) => entry.projectId === null
-        );
-
         const projectConditions = [];
         if (nonNullProjectIds.length > 0) {
           projectConditions.push(

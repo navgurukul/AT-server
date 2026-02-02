@@ -28,6 +28,7 @@ import {
   leaveTypesTable,
   notificationsTable,
   projectsTable,
+  rolesTable,
   timesheetEntriesTable,
   timesheetsTable,
   userRoles,
@@ -166,29 +167,40 @@ export class LeavesService {
     if (params.managerId) {
       filters.push(eq(usersTable.managerId, params.managerId));
     }
-    if (params.excludeUserId) {
-      filters.push(sql`${leaveRequestsTable.userId} != ${params.excludeUserId}`);
+
+    // Always exclude the current user's own leave requests
+    if (params.excludeUserId || params.actor?.id) {
+      filters.push(sql`${leaveRequestsTable.userId} != ${params.excludeUserId ?? params.actor?.id}`);
     }
 
     // Filter by manager's mentees if actor is provided and no explicit managerId is specified
     if (params.actor && !params.managerId) {
-      // Only show leave requests from their direct reports (mentees)
-      const mentees = await db
-        .select({ id: usersTable.id })
-        .from(usersTable)
-        .where(
-          and(
-            eq(usersTable.managerId, params.actor.id),
-            eq(usersTable.orgId, params.actor.orgId)
-          )
-        );
+      // Admin and superadmin can see all employee leaves (except their own)
+      const isAdmin = params.actor.roles?.includes("admin");
+      const isSuperAdmin = params.actor.roles?.includes("super_admin");
+      
+      if (!isAdmin && !isSuperAdmin) {
+        // Manager: Only show leave requests from their direct reports (mentees)
+        const mentees = await db
+          .select({ id: usersTable.id })
+          .from(usersTable)
+          .where(
+            and(
+              eq(usersTable.managerId, params.actor.id),
+              eq(usersTable.orgId, params.actor.orgId)
+            )
+          );
 
-      const menteeIds = mentees.map((m) => m.id);
-      if (menteeIds.length === 0) {
-        // Manager has no mentees, return empty list
-        return [];
+        const menteeIds = mentees.map((m) => m.id);
+        if (menteeIds.length === 0) {
+          // Manager has no mentees, return empty list
+          return [];
+        }
+        filters.push(inArray(leaveRequestsTable.userId, menteeIds));
+      } else {
+        // Admin/Superadmin: filter by organization (own requests already excluded above)
+        filters.push(eq(usersTable.orgId, params.actor.orgId));
       }
-      filters.push(inArray(leaveRequestsTable.userId, menteeIds));
     }
 
     // Additional guard: never show non-working-day requests in this listing logic
@@ -631,9 +643,11 @@ export class LeavesService {
       const isDirectManager = directManagerId === actor.id;
       const isPrivileged = this.hasOrgWideCompOffAccess(actor);
 
-      if (!isDirectManager && !isPrivileged) {
+      // Admin/SuperAdmin can grant comp-off for all employees
+      // Managers can grant comp-off only for their mentees (direct reports)
+      if (!this.canGrantCompOffForUser(actor, targetUser)) {
         throw new ForbiddenException(
-          "Only the employee's reporting manager or an administrator can grant comp-off credits"
+          "Only administrators can grant comp-off for any employee, or managers can grant for their direct reports"
         );
       }
 
@@ -915,15 +929,11 @@ export class LeavesService {
         throw new NotFoundException("User not found for this comp-off");
       }
 
-      const isAuthorized =
-        (targetUser.managerId !== null &&
-          targetUser.managerId !== undefined &&
-          Number(targetUser.managerId) === actor.id) ||
-        this.hasOrgWideCompOffAccess(actor);
+      const isAuthorized = this.canGrantCompOffForUser(actor, targetUser);
 
       if (!isAuthorized) {
         throw new ForbiddenException(
-          "Only the reporting manager or an administrator can revoke this comp-off"
+          "Only administrators can revoke comp-off for any employee, or managers can revoke for their direct reports"
         );
       }
 
@@ -1008,7 +1018,6 @@ export class LeavesService {
       if (!request) {
         throw new NotFoundException("Leave request not found");
       }
-      // console.log("approverID:", approverId);
 
       if (!approverId) {
         throw new ForbiddenException(
@@ -1016,18 +1025,40 @@ export class LeavesService {
         );
       }
 
-      const [userRole] = await tx
-        .select()
-        .from(userRoles)
-        .where(eq(userRoles.userId, approverId))
-        .limit(1);
-      // console.log("user role:", userRole);
-  
-
-       if(userRole.roleId == 3 || (userRole.roleId == 2 && request.managerId != approverId) || (userRole.roleId == 4 && request.userId == approverId)) {
+      // Prevent users from approving/rejecting their own leave requests
+      if (request.userId === approverId) {
         throw new ForbiddenException(
-            "You are not authorized to review this leave request"
+          "You cannot approve or reject your own leave request"
+        );
+      }
+
+      // Get approver's roles
+      const approverRoles = await tx
+        .select({ roleKey: rolesTable.key })
+        .from(userRoles)
+        .innerJoin(rolesTable, eq(userRoles.roleId, rolesTable.id))
+        .where(eq(userRoles.userId, approverId));
+
+      const roleKeys = approverRoles.map((r) => r.roleKey);
+      const isAdmin = roleKeys.includes("admin");
+      const isSuperAdmin = roleKeys.includes("super_admin");
+      const isManager = roleKeys.includes("manager");
+
+      // Admin and super_admin can approve any request (except their own)
+      if (isAdmin || isSuperAdmin) {
+        // Allowed to proceed
+      } else if (isManager) {
+        // Manager can only approve requests from their direct reports
+        if (request.managerId !== approverId) {
+          throw new ForbiddenException(
+            "You can only approve leave requests from your direct reports"
           );
+        }
+      } else {
+        // Regular employees cannot approve leave requests
+        throw new ForbiddenException(
+          "You do not have permission to review leave requests"
+        );
       }
 
 
@@ -1138,20 +1169,24 @@ export class LeavesService {
         );
       }
 
-      const [userRole] = await tx
-        .select()
+      // Get approver's roles
+      const approverRoles = await tx
+        .select({ roleKey: rolesTable.key })
         .from(userRoles)
-        .where(eq(userRoles.userId, approverId))
-        .limit(1);
+        .innerJoin(rolesTable, eq(userRoles.roleId, rolesTable.id))
+        .where(eq(userRoles.userId, approverId));
 
-      if (userRole.roleId == 3) {
+      const roleKeys = approverRoles.map((r) => r.roleKey);
+      const isAdmin = roleKeys.includes("admin");
+      const isSuperAdmin = roleKeys.includes("super_admin");
+      const isManager = roleKeys.includes("manager");
+
+      // Check if user has any authorization role
+      if (!isAdmin && !isSuperAdmin && !isManager) {
         throw new ForbiddenException(
-          "You are not authorized to review these leave requests"
+          "You do not have permission to review leave requests"
         );
       }
-
-      const isAdmin =
-        approver.role === "admin" || approver.role === "super_admin";
 
       const filters = [];
       let evaluatedIds: number[] | undefined;
@@ -1198,23 +1233,25 @@ export class LeavesService {
         );
       }
 
-      const managedCandidates = isAdmin
-        ? candidates
-        : candidates.filter((candidate) => {
-            // For non-admin users, apply role-based checks
-            // roleId 2 = manager: can approve reports only
-            // roleId 4 = employee: cannot approve own requests
-            if (userRole.roleId == 2 && candidate.managerId !== approverId) {
-              return false;
-            }
-            if (userRole.roleId == 1 && candidate.userId === approverId) {
-              return false;
-            }
-            if (userRole.roleId == 4 && candidate.userId === approverId) {
-              return false;
-            }
-            return true;
-          });
+      const managedCandidates = candidates.filter((candidate) => {
+        // Always exclude user's own leave requests
+        if (candidate.userId === approverId) {
+          return false;
+        }
+
+        // Admin and super_admin can approve any request (except their own)
+        if (isAdmin || isSuperAdmin) {
+          return true;
+        }
+
+        // Manager can only approve requests from their direct reports
+        if (isManager && candidate.managerId === approverId) {
+          return true;
+        }
+
+        // Otherwise, not authorized
+        return false;
+      });
 
       if (managedCandidates.length === 0) {
         throw new ForbiddenException(
@@ -1506,6 +1543,25 @@ export class LeavesService {
   private hasOrgWideCompOffAccess(actor: AuthenticatedUser): boolean {
     const privilegedRoles = new Set(["admin", "super_admin", "superadmin"]);
     return (actor.roles ?? []).some((role) => privilegedRoles.has(role));
+  }
+
+  private canGrantCompOffForUser(
+    actor: AuthenticatedUser,
+    targetUser: { managerId: number | null | undefined }
+  ): boolean {
+    // Admin/SuperAdmin can grant for all employees
+    if (this.hasOrgWideCompOffAccess(actor)) {
+      return true;
+    }
+    // Managers can grant only for their mentees (direct reports)
+    if (
+      targetUser.managerId !== null &&
+      targetUser.managerId !== undefined &&
+      Number(targetUser.managerId) === actor.id
+    ) {
+      return true;
+    }
+    return false;
   }
 
   private hasPermission(actor: AuthenticatedUser, permission: string): boolean {
