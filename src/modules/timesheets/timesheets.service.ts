@@ -16,6 +16,7 @@ import {
   SQL,
 } from "drizzle-orm";
 
+import { SalaryCycleUtil } from '../../common/utils/salary-cycle.util';
 import { DatabaseService } from '../../database/database.service';
 import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, notificationsTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
 import { CalendarService } from '../calendar/calendar.service';
@@ -300,6 +301,17 @@ export class TimesheetsService {
       throw new BadRequestException("Cannot create timesheet for future date");
     }
 
+    // Check if workDate is within the current salary cycle
+    const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(now);
+    const normalizedCycleStart = normalizeDate(currentCycle.start);
+    const normalizedCycleEnd = normalizeDate(currentCycle.end);
+    
+    if (workDate < normalizedCycleStart || workDate >= normalizedCycleEnd) {
+      throw new BadRequestException(
+        `Timesheets can only be filled for dates within the current salary cycle (${currentCycle.cycleLabel})`
+      );
+    }
+
     if (await this.calendarService.isHoliday(orgId, workDate)) {
       throw new BadRequestException(
         "Timesheets cannot be logged on holidays or non-working days"
@@ -308,18 +320,15 @@ export class TimesheetsService {
 
     const isBackfill = workDate < today;
     const backfillAllowance = isBackfill
-      ? await this.getBackfillAllowance(orgId, userId, workDate, now)
+      ? await this.getBackfillAllowanceForCycle(orgId, userId, currentCycle, now)
       : { limit: DEFAULT_BACKFILL_PER_MONTH, used: 0, remaining: DEFAULT_BACKFILL_PER_MONTH };
 
-    if (isBackfill && today.getUTCDate() > BACKFILL_CUTOFF_DAY) {
-      throw new BadRequestException(
-        `Backfilling is not allowed after the ${BACKFILL_CUTOFF_DAY}th of the month`
-      );
-    }
+    // Lifelines are available throughout the salary cycle, no cutoff date restriction
+    // The restriction is only within the current salary cycle
 
     if (isBackfill && backfillAllowance.remaining <= 0) {
       throw new BadRequestException(
-        `Backfilling is limited to ${backfillAllowance.limit} days per month`
+        `Backfilling (lifeline) is limited to ${backfillAllowance.limit} days per salary cycle. Lifelines reset on the 26th of each month at 7:01 AM.`
       );
     }
 
@@ -531,9 +540,9 @@ export class TimesheetsService {
         .where(eq(timesheetEntriesTable.timesheetId, timesheetId))
         .orderBy(asc(timesheetEntriesTable.id));
 
-      // If this is a new backfill entry, increment usage counters for the month.
+      // If this is a new backfill entry, increment usage counters for the salary cycle.
       if (isBackfill && isNewTimesheet) {
-        await this.incrementBackfillUsage(tx, orgId, userId, workDate, now);
+        await this.incrementBackfillUsageForCycle(tx, orgId, userId, currentCycle, workDate, now);
       }
 
       return {
@@ -699,10 +708,13 @@ export class TimesheetsService {
       throw new BadRequestException('month must be between 1 and 12');
     }
 
-    const monthStart = new Date(Date.UTC(year, month - 1, 1));
-    const nextMonthStart = new Date(Date.UTC(year, month, 1));
-    const monthEnd = new Date(nextMonthStart);
-    monthEnd.setUTCDate(monthEnd.getUTCDate() - 1);
+    // Use salary cycle instead of calendar month
+    // month parameter now represents the salary cycle starting month
+    const cycleRange = SalaryCycleUtil.getSalaryCycleDateRange(year, month);
+    const monthStart = cycleRange.start; // 26th of the month
+    const monthEnd = cycleRange.end; // 25th of next month
+    const nextMonthStart = new Date(monthEnd);
+    nextMonthStart.setUTCDate(nextMonthStart.getUTCDate() + 1);
 
     const db = this.database.connection;
 
@@ -1099,6 +1111,9 @@ export class TimesheetsService {
       cursor.setUTCDate(cursor.getUTCDate() + 1);
     }
 
+    // Get salary cycle label for display
+    const cycleInfo = SalaryCycleUtil.getSalaryCycleForMonth(year, month);
+
     return {
       user: {
         id: user.id,
@@ -1111,6 +1126,8 @@ export class TimesheetsService {
         month,
         start: this.formatDateKey(monthStart),
         end: this.formatDateKey(monthEnd),
+        cycleLabel: cycleInfo.cycleLabel, // e.g., "26 Jan 2026 - 25 Feb 2026"
+        isSalaryCycle: true,
       },
       totals: {
         timesheetHours: Number(totalTimesheetHours.toFixed(2)),
@@ -1180,6 +1197,36 @@ export class TimesheetsService {
       payload,
       state: 'pending',
     });
+  }
+
+  /**
+   * Get backfill allowance for the current salary cycle
+   * Lifelines reset on 26th at 7:01 AM of each month
+   */
+  private async getBackfillAllowanceForCycle(
+    orgId: number,
+    userId: number,
+    cycle: ReturnType<typeof SalaryCycleUtil.getCurrentSalaryCycle>,
+    now: Date
+  ) {
+    const year = cycle.year;
+    const month = cycle.month;
+
+    let counter = await this.getOrCreateBackfillCounterForCycle(
+      orgId,
+      userId,
+      year,
+      month,
+      cycle,
+      now
+    );
+
+    const remaining = Math.max(counter.limit - counter.used, 0);
+    return {
+      limit: counter.limit,
+      used: counter.used,
+      remaining,
+    };
   }
 
   private async getBackfillAllowance(
@@ -1272,6 +1319,110 @@ export class TimesheetsService {
     };
   }
 
+  /**
+   * Get or create backfill counter for a salary cycle
+   * This replaces the calendar month-based counter
+   */
+  private async getOrCreateBackfillCounterForCycle(
+    orgId: number,
+    userId: number,
+    year: number,
+    month: number,
+    cycle: ReturnType<typeof SalaryCycleUtil.getCurrentSalaryCycle>,
+    now: Date
+  ) {
+    const db = this.database.connection;
+
+    const [existing] = await db
+      .select({
+        id: backfillCountersTable.id,
+        used: backfillCountersTable.used,
+        limit: backfillCountersTable.limit,
+      })
+      .from(backfillCountersTable)
+      .where(
+        and(
+          eq(backfillCountersTable.orgId, orgId),
+          eq(backfillCountersTable.userId, userId),
+          eq(backfillCountersTable.year, year),
+          eq(backfillCountersTable.month, month)
+        )
+      )
+      .limit(1);
+
+    if (existing) {
+      return {
+        id: existing.id,
+        used: Number(existing.used ?? 0),
+        limit: Number(existing.limit ?? DEFAULT_BACKFILL_PER_MONTH),
+      };
+    }
+
+    // Count backfilled days within the salary cycle
+    const computedUsed = await this.countBackfilledDaysForCycle(
+      orgId,
+      userId,
+      cycle,
+      now
+    );
+
+    const [created] = await db
+      .insert(backfillCountersTable)
+      .values({
+        orgId,
+        userId,
+        year,
+        month,
+        used: computedUsed,
+        limit: DEFAULT_BACKFILL_PER_MONTH,
+        lastUsedAt: null,
+      })
+      .returning({
+        id: backfillCountersTable.id,
+        used: backfillCountersTable.used,
+        limit: backfillCountersTable.limit,
+      });
+
+    return {
+      id: created.id,
+      used: Number(created.used ?? computedUsed),
+      limit: Number(created.limit ?? DEFAULT_BACKFILL_PER_MONTH),
+    };
+  }
+
+  /**
+   * Count backfilled days within a salary cycle
+   */
+  private async countBackfilledDaysForCycle(
+    orgId: number,
+    userId: number,
+    cycle: ReturnType<typeof SalaryCycleUtil.getCurrentSalaryCycle>,
+    now: Date
+  ) {
+    const db = this.database.connection;
+
+    const cycleStart = normalizeDate(cycle.start);
+    const cycleEnd = normalizeDate(cycle.end);
+    const today = normalizeDate(now);
+
+    // Only count timesheets created before today within the cycle
+    const upperBound = today < cycleEnd ? today : cycleEnd;
+
+    const [{ value: backfillCount }] = await db
+      .select({ value: count(timesheetsTable.id) })
+      .from(timesheetsTable)
+      .where(
+        and(
+          eq(timesheetsTable.orgId, orgId),
+          eq(timesheetsTable.userId, userId),
+          gte(timesheetsTable.workDate, cycleStart),
+          lt(timesheetsTable.workDate, upperBound)
+        )
+      );
+
+    return Number(backfillCount ?? 0);
+  }
+
   private async incrementBackfillUsage(
     tx: DatabaseService["connection"],
     orgId: number,
@@ -1281,6 +1432,70 @@ export class TimesheetsService {
   ) {
     const year = workDate.getUTCFullYear();
     const month = workDate.getUTCMonth() + 1;
+    const workDateKey = this.formatDateKey(workDate);
+
+    const insertedDate = await tx
+      .insert(backfillDatesTable)
+      .values({
+        orgId,
+        userId,
+        year,
+        month,
+        workDate: workDateKey,
+      })
+      .onConflictDoNothing()
+      .returning({ id: backfillDatesTable.id });
+
+    if (insertedDate.length === 0) {
+      // Already counted
+      return;
+    }
+
+    const updated = await tx
+      .update(backfillCountersTable)
+      .set({
+        used: sql`${backfillCountersTable.used} + 1`,
+        lastUsedAt: now,
+      })
+      .where(
+        and(
+          eq(backfillCountersTable.orgId, orgId),
+          eq(backfillCountersTable.userId, userId),
+          eq(backfillCountersTable.year, year),
+          eq(backfillCountersTable.month, month)
+        )
+      )
+      .returning({ id: backfillCountersTable.id, used: backfillCountersTable.used });
+
+    if (updated.length === 0) {
+      await tx
+        .insert(backfillCountersTable)
+        .values({
+          orgId,
+          userId,
+          year,
+          month,
+          used: 1,
+          limit: DEFAULT_BACKFILL_PER_MONTH,
+          lastUsedAt: now,
+        })
+        .onConflictDoNothing();
+    }
+  }
+
+  /**
+   * Increment backfill usage for salary cycle
+   */
+  private async incrementBackfillUsageForCycle(
+    tx: DatabaseService["connection"],
+    orgId: number,
+    userId: number,
+    cycle: ReturnType<typeof SalaryCycleUtil.getCurrentSalaryCycle>,
+    workDate: Date,
+    now: Date
+  ) {
+    const year = cycle.year;
+    const month = cycle.month;
     const workDateKey = this.formatDateKey(workDate);
 
     const insertedDate = await tx
