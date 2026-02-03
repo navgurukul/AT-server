@@ -14,6 +14,7 @@ import {
   sql,
 } from 'drizzle-orm';
 
+import { SalaryCycleUtil } from '../../common/utils/salary-cycle.util';
 import { DatabaseService } from '../../database/database.service';
 import {
   costRatesTable,
@@ -43,8 +44,10 @@ export class PayrollService {
     const db = this.database.connection;
     const orgId = await this.resolvePrimaryOrgId();
     const now = new Date();
-    const windowStart = new Date(Date.UTC(year, month - 1, 1));
-    const windowEnd = new Date(Date.UTC(year, month, 1));
+    
+    // Use salary cycle instead of calendar month
+    const { start: windowStart, endExclusive: windowEnd } = 
+      SalaryCycleUtil.getSalaryCycleDateRangeForQuery(year, month);
 
     return db.transaction(async (tx) => {
       const [window] = await tx
@@ -132,8 +135,10 @@ export class PayrollService {
 
     const db = this.database.connection;
     const orgId = await this.resolvePrimaryOrgId();
-    const windowStart = new Date(Date.UTC(year, month - 1, 1));
-    const windowEnd = new Date(Date.UTC(year, month, 1));
+    
+    // Use salary cycle instead of calendar month
+    const { start: windowStart, endExclusive: windowEnd } = 
+      SalaryCycleUtil.getSalaryCycleDateRangeForQuery(year, month);
 
     const timesheetSummary = await db.execute(
       sql`
@@ -208,6 +213,8 @@ export class PayrollService {
       { totalHours: 0, totalCostMinor: 0 },
     );
 
+    const cycleInfo = SalaryCycleUtil.getSalaryCycleForMonth(year, month);
+
     return {
       window: {
         orgId,
@@ -215,6 +222,7 @@ export class PayrollService {
         year,
         from: windowStart,
         to: new Date(windowEnd.getTime() - 1),
+        cycleLabel: cycleInfo.cycleLabel,
       },
       totals: {
         people: rows.length,
