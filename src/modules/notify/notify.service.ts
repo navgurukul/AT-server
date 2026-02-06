@@ -28,8 +28,11 @@ export class NotifyService {
   async handleDailyNotificationDispatch() {
     this.logger.log('Running daily notification dispatch at 9:00 AM IST');
     try {
-      const result = await this.dispatchPendingSlack(100);
-      this.logger.log(`Daily dispatch completed: ${result.processed} notifications processed`);
+      const slackResult = await this.dispatchPendingSlack(100);
+      this.logger.log(`Daily Slack dispatch completed: ${slackResult.processed} notifications processed`);
+      
+      const discordResult = await this.dispatchPendingDiscord(100);
+      this.logger.log(`Daily Discord dispatch completed: ${discordResult.processed} notifications processed`);
     } catch (error) {
       this.logger.error(`Daily dispatch failed: ${error}`);
     }
@@ -233,6 +236,208 @@ export class NotifyService {
     return { processed: results.length, results };
   }
 
+  async dispatchPendingDiscord(limit = 50) {
+    const db = this.database.connection;
+    const webhookUrlEnv = this.configService.get<string>("DISCORD_WEBHOOK_URL");
+
+    const pending = await db
+      .select()
+      .from(notificationsTable)
+      .where(
+        and(
+          eq(notificationsTable.channel, "discord"),
+          eq(notificationsTable.state, "pending")
+        )
+      )
+      .orderBy(asc(notificationsTable.createdAt))
+      .limit(limit);
+
+    // Check if we have any pending notifications - if none, return early
+    this.logger.log(`Discord dispatch: Found ${pending.length} pending notifications`);
+    if (pending.length === 0) {
+      this.logger.log('Discord dispatch: No pending notifications to process');
+      return { processed: 0, results: [] };
+    }
+
+    const results: Array<{
+      id: number;
+      status: "sent" | "error";
+      errorText?: string;
+    }> = [];
+
+    // Group notifications by project and channel for daily activity summaries
+    const groupedByProject = new Map<string, Array<typeof pending[0]>>();
+    const otherNotifications: Array<typeof pending[0]> = [];
+
+    for (const notification of pending) {
+      const payload = notification.payload as Record<string, unknown>;
+      const webhookUrl = (notification.toRef as any)?.webhookUrl || webhookUrlEnv;
+      
+      // Group only timesheet_entry notifications by project
+      if (notification.template === "timesheet_entry" && webhookUrl) {
+        const projectName = payload["projectName"] || payload["projectId"] || "Unknown";
+        const key = `${projectName}_${webhookUrl}`;
+        
+        if (!groupedByProject.has(key)) {
+          groupedByProject.set(key, []);
+        }
+        groupedByProject.get(key)!.push(notification);
+      } else {
+        otherNotifications.push(notification);
+      }
+    }
+
+    // Process grouped notifications (multiple members per project)
+    for (const [key, notifications] of groupedByProject.entries()) {
+      const webhookUrl = (notifications[0].toRef as any)?.webhookUrl || webhookUrlEnv;
+      
+      if (!webhookUrl) {
+        for (const notification of notifications) {
+          await db
+            .update(notificationsTable)
+            .set({
+              state: "error",
+              errorText: "Missing webhookUrl in to_ref",
+              attempts: (notification.attempts ?? 0) + 1,
+              updatedAt: new Date(),
+            })
+            .where(eq(notificationsTable.id, notification.id));
+          results.push({ id: notification.id, status: "error", errorText: "Missing webhookUrl" });
+        }
+        continue;
+      }
+
+      // If only one notification for this project, send as single
+      if (notifications.length === 1) {
+        const notification = notifications[0];
+        const text = await this.renderDiscordText(notification.template, (notification.payload as Record<string, unknown>) ?? {});
+        const ok = await this.sendDiscordMessage(webhookUrl, text);
+
+        if (ok) {
+          await db
+            .update(notificationsTable)
+            .set({
+              state: "sent",
+              sentAt: new Date(),
+              updatedAt: new Date(),
+              attempts: (notification.attempts ?? 0) + 1,
+            })
+            .where(eq(notificationsTable.id, notification.id));
+          results.push({ id: notification.id, status: "sent" });
+        } else {
+          await db
+            .update(notificationsTable)
+            .set({
+              state: "error",
+              errorText: "Discord API call failed",
+              attempts: (notification.attempts ?? 0) + 1,
+              updatedAt: new Date(),
+            })
+            .where(eq(notificationsTable.id, notification.id));
+          results.push({ id: notification.id, status: "error", errorText: "Discord API call failed" });
+        }
+      } else {
+        // Multiple members - combine into one message
+        const firstPayload = notifications[0].payload as Record<string, unknown>;
+        const project = firstPayload["projectName"] || firstPayload["projectId"] || "Project";
+        const projectId = firstPayload["projectId"] as number;
+
+        const members = notifications.map(n => {
+          const p = n.payload as Record<string, unknown>;
+          return {
+            name: p["userName"] || p["userId"] || "User",
+            email: p["userEmail"] as string || "",
+            hours: p["hours"] as number || 0,
+            tasks: p["description"] ? [p["description"] as string] : []
+          };
+        });
+
+        const combinedPayload = {
+          project,
+          projectId,
+          members
+        };
+
+        const text = await this.renderDiscordText("daily_activity_summary_multi", combinedPayload);
+        const ok = await this.sendDiscordMessage(webhookUrl, text);
+
+        // Update all notifications in the group
+        for (const notification of notifications) {
+          if (ok) {
+            await db
+              .update(notificationsTable)
+              .set({
+                state: "sent",
+                sentAt: new Date(),
+                updatedAt: new Date(),
+                attempts: (notification.attempts ?? 0) + 1,
+              })
+              .where(eq(notificationsTable.id, notification.id));
+            results.push({ id: notification.id, status: "sent" });
+          } else {
+            await db
+              .update(notificationsTable)
+              .set({
+                state: "error",
+                errorText: "Discord API call failed",
+                attempts: (notification.attempts ?? 0) + 1,
+                updatedAt: new Date(),
+              })
+              .where(eq(notificationsTable.id, notification.id));
+            results.push({ id: notification.id, status: "error", errorText: "Discord API call failed" });
+          }
+        }
+      }
+    }
+
+    // Process other notifications individually
+    for (const notification of otherNotifications) {
+      const webhookUrl = (notification.toRef as any)?.webhookUrl || webhookUrlEnv;
+      if (!webhookUrl) {
+        await db
+          .update(notificationsTable)
+          .set({
+            state: "error",
+            errorText: "Missing webhookUrl in to_ref",
+            attempts: (notification.attempts ?? 0) + 1,
+            updatedAt: new Date(),
+          })
+          .where(eq(notificationsTable.id, notification.id));
+        results.push({ id: notification.id, status: "error", errorText: "Missing webhookUrl" });
+        continue;
+      }
+
+      const text = await this.renderDiscordText(notification.template, (notification.payload as Record<string, unknown>) ?? {});
+      const ok = await this.sendDiscordMessage(webhookUrl, text);
+
+      if (ok) {
+        await db
+          .update(notificationsTable)
+          .set({
+            state: "sent",
+            sentAt: new Date(),
+            updatedAt: new Date(),
+            attempts: (notification.attempts ?? 0) + 1,
+          })
+          .where(eq(notificationsTable.id, notification.id));
+        results.push({ id: notification.id, status: "sent" });
+      } else {
+        await db
+          .update(notificationsTable)
+          .set({
+            state: "error",
+            errorText: "Discord API call failed",
+            attempts: (notification.attempts ?? 0) + 1,
+            updatedAt: new Date(),
+          })
+          .where(eq(notificationsTable.id, notification.id));
+        results.push({ id: notification.id, status: "error", errorText: "Discord API call failed" });
+      }
+    }
+
+    return { processed: results.length, results };
+  }
+
   private async getProjectManagerEmail(projectIdOrName: string | number): Promise<string | null> {
     const db = this.database.connection;
     
@@ -306,6 +511,48 @@ export class NotifyService {
       return null;
     } catch (error) {
       this.logger.error(`Failed to fetch project manager Slack ID: ${error}`);
+      return null;
+    }
+  }
+
+  private async getProjectManagerDiscordId(projectIdOrName: string | number): Promise<string | null> {
+    const db = this.database.connection;
+    
+    try {
+      let project;
+      
+      if (typeof projectIdOrName === 'number') {
+        // Query by project ID
+        project = await db
+          .select({
+            discordId: usersTable.discordId,
+            name: usersTable.name,
+          })
+          .from(projectsTable)
+          .innerJoin(usersTable, eq(projectsTable.projectManagerId, usersTable.id))
+          .where(eq(projectsTable.id, projectIdOrName))
+          .limit(1);
+      } else {
+        // Query by project name
+        project = await db
+          .select({
+            discordId: usersTable.discordId,
+            name: usersTable.name,
+          })
+          .from(projectsTable)
+          .innerJoin(usersTable, eq(projectsTable.projectManagerId, usersTable.id))
+          .where(eq(projectsTable.name, projectIdOrName))
+          .limit(1);
+      }
+      
+      if (project[0]?.discordId) {
+        // Return Discord mention format
+        return `<@${project[0].discordId}>`;
+      }
+      
+      return null;
+    } catch (error) {
+      this.logger.error(`Failed to fetch project manager Discord ID: ${error}`);
       return null;
     }
   }
@@ -450,6 +697,144 @@ export class NotifyService {
     }
   }
 
+  private async renderDiscordText(template: string, payload: Record<string, unknown>): Promise<string> {
+    switch (template) {
+      case "timesheet_entry": {
+        const project = payload["projectName"] || payload["projectId"] || "Project";
+        const projectId = payload["projectId"] as number;
+        const name = payload["userName"] || payload["userId"] || "User";
+        const email = payload["userEmail"] as string || "";
+        const hours = payload["hours"] as number || 0;
+        const tasks = payload["description"] ? [payload["description"] as string] : [];
+        let cc = payload["cc"] as string;
+        
+        // Fetch project manager Discord ID if not provided
+        if (!cc && (projectId || (typeof project === 'string' || typeof project === 'number'))) {
+          const projectIdentifier = projectId || (typeof project === 'string' || typeof project === 'number' ? project : null);
+          if (projectIdentifier) {
+            cc = await this.getProjectManagerDiscordId(projectIdentifier) || "";
+          }
+        }
+
+        let message = `📋 **Project: ${project}**\n\n`;
+        message += `👤 **${name}**`;
+        if (email) {
+          message += ` (${email})`;
+        }
+        message += `\n⏳ Total Hours: ${hours} hrs\n`;
+        message += `📝 Tasks:\n`;
+        
+        if (tasks && tasks.length > 0) {
+          tasks.forEach((task) => {
+            message += `• ${task}\n`;
+          });
+        } else {
+          message += `• No tasks reported\n`;
+        }
+        
+        message += `\n📊 Daily Activity Summary`;
+        
+        if (cc) {
+          message += ` | 👥 CC: ${cc}`;
+        }
+
+        return message;
+      }
+      case "leave_request": {
+        const start = payload["startDate"];
+        const end = payload["endDate"];
+        const durationType = payload["durationType"];
+        return `Leave request: ${durationType} from ${start} to ${end}`;
+      }
+      case "daily_activity_summary_single": {
+        const project = payload["project"] || "Project";
+        const projectId = payload["projectId"] as number;
+        const name = payload["name"] as string;
+        const email = payload["email"] as string;
+        const hours = payload["hours"] as number;
+        const tasks = payload["tasks"] as string[] || [];
+        let cc = payload["cc"] as string;
+        
+        // Fetch project manager Discord ID if not provided
+        if (!cc && (projectId || (typeof project === 'string' || typeof project === 'number'))) {
+          const projectIdentifier = projectId || (typeof project === 'string' || typeof project === 'number' ? project : null);
+          if (projectIdentifier) {
+            cc = await this.getProjectManagerDiscordId(projectIdentifier) || "";
+          }
+        }
+
+        let message = `📋 **Project: ${project}**\n\n`;
+        message += `👤 **${name}** (${email})\n`;
+        message += `⏳ Total Hours: ${hours} hrs\n`;
+        message += `📝 Tasks:\n`;
+        
+        if (tasks && tasks.length > 0) {
+          tasks.forEach((task) => {
+            message += `• ${task}\n`;
+          });
+        } else {
+          message += `• No tasks reported\n`;
+        }
+        
+        message += `\n📊 Daily Activity Summary`;
+        
+        if (cc) {
+          message += ` | 👥 CC: ${cc}`;
+        }
+
+        return message;
+      }
+      case "daily_activity_summary_multi": {
+        const project = payload["project"] || "Project";
+        const projectId = payload["projectId"] as number;
+        const members = payload["members"] as Array<{
+          name: string;
+          email: string;
+          hours: number;
+          tasks: string[];
+        }> || [];
+        let cc = payload["cc"] as string;
+        
+        // Fetch project manager Discord ID if not provided
+        if (!cc && (projectId || (typeof project === 'string' || typeof project === 'number'))) {
+          const projectIdentifier = projectId || (typeof project === 'string' || typeof project === 'number' ? project : null);
+          if (projectIdentifier) {
+            cc = await this.getProjectManagerDiscordId(projectIdentifier) || "";
+          }
+        }
+
+        let message = `📋 **Project: ${project}**\n\n`;
+        
+        members.forEach((member, index) => {
+          message += `👤 **${member.name}** (${member.email})\n`;
+          message += `⏳ Total Hours: ${member.hours} hrs\n`;
+          message += `📝 Tasks:\n`;
+          
+          if (member.tasks && member.tasks.length > 0) {
+            member.tasks.forEach((task) => {
+              message += `• ${task}\n`;
+            });
+          } else {
+            message += `• No tasks reported\n`;
+          }
+          
+          // Add separator line between members (but not after the last one)
+          if (index < members.length - 1) {
+            message += `\n___________________________________\n\n`;
+          }
+        });
+        
+        if (cc) {
+          message += ` | 👥 CC: ${cc}`;
+        }
+
+        return message;
+      }
+      default:
+        return `Notification: ${template}`;
+    }
+  }
+
   private async sendSlackMessage(token: string, channelId: string, text: string): Promise<boolean> {
     try {
       const resp = await fetch("https://slack.com/api/chat.postMessage", {
@@ -470,6 +855,33 @@ export class NotifyService {
       return !!json.ok;
     } catch (err) {
       this.logger.error(`Slack send failed: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+
+  private async sendDiscordMessage(webhookUrl: string, content: string): Promise<boolean> {
+    try {
+      this.logger.debug(`Sending Discord message to webhook (URL length: ${webhookUrl.length}, content length: ${content.length} chars)`);
+      const resp = await fetch(webhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          content,
+        }),
+      });
+      
+      if (!resp.ok) {
+        const responseText = await resp.text();
+        this.logger.warn(`Discord API error: ${resp.status} ${resp.statusText}. Response: ${responseText}`);
+        return false;
+      }
+      
+      this.logger.log('Discord message sent successfully');
+      return true;
+    } catch (err) {
+      this.logger.error(`Discord send failed: ${err instanceof Error ? err.message : err}`);
       return false;
     }
   }

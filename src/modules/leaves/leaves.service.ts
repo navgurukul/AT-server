@@ -1506,6 +1506,7 @@ export class LeavesService {
     const [latest] = await db
       .select({
         slackChannelId: projectsTable.slackChannelId,
+        discordChannelId: projectsTable.discordChannelId,
       })
       .from(timesheetsTable)
       .innerJoin(
@@ -1520,24 +1521,42 @@ export class LeavesService {
         and(
           eq(timesheetsTable.userId, userId),
           eq(timesheetsTable.orgId, orgId),
-          isNotNull(projectsTable.slackChannelId),
+          or(
+            isNotNull(projectsTable.slackChannelId),
+            isNotNull(projectsTable.discordChannelId)
+          ),
         ),
       )
       .orderBy(desc(timesheetsTable.workDate))
       .limit(1);
 
-    if (!latest?.slackChannelId) {
+    if (!latest) {
       return;
     }
 
-    await db.insert(notificationsTable).values({
-      orgId,
-      channel: "slack",
-      toRef: { channelId: latest.slackChannelId },
-      template: "leave_request",
-      payload,
-      state: "pending",
-    });
+    // Send Slack notification if configured
+    if (latest.slackChannelId) {
+      await db.insert(notificationsTable).values({
+        orgId,
+        channel: "slack",
+        toRef: { channelId: latest.slackChannelId },
+        template: "leave_request",
+        payload,
+        state: "pending",
+      });
+    }
+
+    // Send Discord notification if configured
+    if (latest.discordChannelId) {
+      await db.insert(notificationsTable).values({
+        orgId,
+        channel: "discord",
+        toRef: { webhookUrl: latest.discordChannelId },
+        template: "leave_request",
+        payload,
+        state: "pending",
+      });
+    }
   }
 
   private hasOrgWideCompOffAccess(actor: AuthenticatedUser): boolean {

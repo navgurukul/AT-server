@@ -9,6 +9,7 @@ import {
 import { ApiTags } from '@nestjs/swagger';
 
 import { Permissions } from '../../common/decorators/permissions.decorator';
+import { Public } from '../auth/decorators/public.decorator';
 import { PreviewNotificationDto } from './dto/preview.dto';
 import { NotifyService } from './notify.service';
 
@@ -29,5 +30,13 @@ export class NotifyController {
     @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit: number,
   ) {
     return this.notifyService.dispatchPendingSlack(limit);
+  }
+
+  @Post('dispatch-discord')
+  @Public()
+  dispatchDiscord(
+    @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit: number,
+  ) {
+    return this.notifyService.dispatchPendingDiscord(limit);
   }
 }
