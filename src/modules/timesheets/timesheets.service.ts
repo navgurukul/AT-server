@@ -1202,6 +1202,22 @@ export class TimesheetsService {
     });
   }
 
+  private async enqueueDiscordNotification(
+    orgId: number,
+    webhookUrl: string,
+    template: string,
+    payload: Record<string, unknown>
+  ) {
+    await this.database.connection.insert(notificationsTable).values({
+      orgId,
+      channel: 'discord',
+      toRef: { webhookUrl },
+      template,
+      payload,
+      state: 'pending',
+    });
+  }
+
   /**
    * Get backfill allowance for the current salary cycle
    * Lifelines reset on 26th at 7:01 AM of each month
