@@ -65,6 +65,7 @@ const PROJECT_SELECTION = {
   updatedAt: projectsTable.updatedAt,
   description: projectsTable.description,
   slackChannelId: projectsTable.slackChannelId,
+  discordChannelId: projectsTable.discordChannelId,
 };
 
 @Injectable()

@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
   and,
   asc,
@@ -43,6 +43,8 @@ function normalizeDate(date: Date) {
 
 @Injectable()
 export class TimesheetsService {
+  private readonly logger = new Logger(TimesheetsService.name);
+
   constructor(
     private readonly database: DatabaseService,
     private readonly calendarService: CalendarService
@@ -215,19 +217,27 @@ export class TimesheetsService {
         );
       }
 
-      const normalized = {
-        projectId,
-        taskTitle,
-        taskDescription:
-          entry.taskDescription && entry.taskDescription.trim().length > 0
-            ? entry.taskDescription.trim()
-            : null,
-        hours,
-        tags,
-      };
-
       const key = projectId === null ? "__null__" : projectId.toString();
-      normalizedEntriesMap.set(key, normalized);
+      const existing = normalizedEntriesMap.get(key);
+
+      if (existing) {
+        // Accumulate hours for the same project, keep the first entry's other properties
+        existing.hours += hours;
+        // Merge tags
+        existing.tags = Array.from(new Set([...existing.tags, ...tags]));
+      } else {
+        const normalized = {
+          projectId,
+          taskTitle,
+          taskDescription:
+            entry.taskDescription && entry.taskDescription.trim().length > 0
+              ? entry.taskDescription.trim()
+              : null,
+          hours,
+          tags,
+        };
+        normalizedEntriesMap.set(key, normalized);
+      }
     });
 
     const normalizedEntries = Array.from(normalizedEntriesMap.values());
@@ -266,6 +276,7 @@ export class TimesheetsService {
           id: number;
           orgId: number;
           slackChannelId: string | null;
+          discordChannelId: string | null;
           name: string | null;
         }>
       | null = null;
@@ -276,10 +287,16 @@ export class TimesheetsService {
           id: projectsTable.id,
           orgId: projectsTable.orgId,
           slackChannelId: projectsTable.slackChannelId,
+          discordChannelId: projectsTable.discordChannelId,
           name: projectsTable.name,
         })
         .from(projectsTable)
         .where(inArray(projectsTable.id, projectIds));
+
+      this.logger.log(`Fetched ${projectRecords.length} project records for IDs: ${projectIds.join(', ')}`);
+      projectRecords.forEach(p => {
+        this.logger.log(`  Project ${p.id} (${p.name}): slack=${p.slackChannelId ? 'SET' : 'null'}, discord=${p.discordChannelId ? 'SET' : 'null'}`);
+      });
 
       const validProjectIds = new Set(
         projectRecords
@@ -358,44 +375,16 @@ export class TimesheetsService {
     }
 
     if (existing) {
-      const keepConditions = [
-        eq(timesheetEntriesTable.timesheetId, existing.id),
-      ];
-
-      if (nonNullProjectIds.length > 0) {
-        const inProjects = inArray(
-          timesheetEntriesTable.projectId,
-          nonNullProjectIds
-        ) as SQL<unknown>;
-
-        if (!inProjects) {
-          throw new BadRequestException('Invalid project selection');
-        }
-
-        const notInProjects = not(inProjects) as SQL<unknown>;
-        const isNullProject = isNull(
-          timesheetEntriesTable.projectId
-        ) as SQL<unknown>;
-
-        if (includesNullProject) {
-          keepConditions.push(notInProjects);
-          keepConditions.push(not(isNullProject));
-        } else {
-          keepConditions.push(sql`${notInProjects} OR ${isNullProject}`);
-        }
-      } else if (includesNullProject) {
-        keepConditions.push(not(isNull(timesheetEntriesTable.projectId)));
-      }
-
-      const [{ totalHours: remainingHours }] = await db
+      // Get ALL existing hours for this timesheet
+      const [{ totalHours: allExistingHours }] = await db
         .select({
           totalHours: sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
         })
         .from(timesheetEntriesTable)
-        .where(and(...keepConditions));
+        .where(eq(timesheetEntriesTable.timesheetId, existing.id));
 
       const combinedHours =
-        Number(remainingHours ?? 0) + Number(totalHoursForDay ?? 0);
+        Number(allExistingHours ?? 0) + Number(totalHoursForDay ?? 0);
 
       if (combinedHours > MAX_HOURS_PER_DAY) {
         throw new BadRequestException(
@@ -438,7 +427,7 @@ export class TimesheetsService {
 
       let projectChannelMap: Record<
         number,
-        { channel: string | null; name: string | null }
+        { channel: string | null; discordWebhook: string | null; name: string | null }
       > = {};
 
       if (normalizedEntries.length > 0) {
@@ -466,10 +455,11 @@ export class TimesheetsService {
         }
 
         if (projectRecords) {
-          projectChannelMap = projectRecords.reduce<Record<number, { channel: string | null; name: string | null }>>(
+          projectChannelMap = projectRecords.reduce<Record<number, { channel: string | null; discordWebhook: string | null; name: string | null }>>(
             (acc, project) => {
               acc[Number(project.id)] = {
                 channel: project.slackChannelId ?? null,
+                discordWebhook: project.discordChannelId ?? null,
                 name: project.name ?? null,
               };
               return acc;
@@ -581,15 +571,17 @@ export class TimesheetsService {
       return acc;
     }, {});
 
-    // Immediate notifications disabled - use daily aggregation endpoint instead
-    // POST /v1/timesheets/daily-summary to send grouped notifications
-    /* 
+    // Send notifications for each project
+    this.logger.log(`Processing notifications for ${Object.keys(entriesByProject).length} projects`);
     for (const [pidStr, data] of Object.entries(entriesByProject)) {
       const pid = Number(pidStr);
       const projectMeta = result.projectChannelMap?.[pid];
       const channel = projectMeta?.channel ?? null;
-      if (!channel) continue;
-      await this.enqueueSlackNotification(orgId, channel, 'timesheet_entry', {
+      const discordWebhook = projectMeta?.discordWebhook ?? null;
+      
+      this.logger.log(`Project ${pid} (${projectMeta?.name}): Slack=${!!channel}, Discord=${!!discordWebhook}`);
+      
+      const notificationPayload = {
         userId,
         userName: userInfo?.name ?? `User ${userId}`,
         workDate,
@@ -598,9 +590,20 @@ export class TimesheetsService {
         projectName: projectMeta?.name ?? null,
         hours: data.hours,
         description: data.descriptions.join("; "),
-      });
+      };
+
+      // Send Slack notification if configured
+      if (channel) {
+        this.logger.debug(`Enqueueing Slack notification for project ${projectMeta?.name} (ID: ${pid})`);
+        await this.enqueueSlackNotification(orgId, channel, 'timesheet_entry', notificationPayload);
+      }
+
+      // Send Discord notification if configured
+      if (discordWebhook) {
+        this.logger.debug(`Enqueueing Discord notification for project ${projectMeta?.name} (ID: ${pid})`);
+        await this.enqueueDiscordNotification(orgId, discordWebhook, 'timesheet_entry', notificationPayload);
+      }
     }
-    */
 
     return {
       ...result.timesheet,
