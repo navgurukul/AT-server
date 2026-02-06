@@ -74,6 +74,8 @@ async function bootstrap() {
     .setTitle('Activity Tracker API')
     .setDescription('Employee activity tracking service')
     .setVersion('1.0.0')
+    .addServer('/api', 'Production/Amplify Server') // Forces Swagger to use /api prefix
+    .addServer('/', 'Local Environment')
     .addBearerAuth({
       type: 'http',
       scheme: 'bearer',
