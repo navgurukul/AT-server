@@ -146,7 +146,8 @@ export class NotifyService {
             name: p["userName"] || p["userId"] || "User",
             email: p["userEmail"] as string || "",
             hours: p["hours"] as number || 0,
-            tasks: p["description"] ? [p["description"] as string] : []
+            tasks: p["description"] ? [p["description"] as string] : [],
+            date: this.resolveNotificationDate(p)
           };
         });
 
@@ -348,7 +349,8 @@ export class NotifyService {
             name: p["userName"] || p["userId"] || "User",
             email: p["userEmail"] as string || "",
             hours: p["hours"] as number || 0,
-            tasks: p["description"] ? [p["description"] as string] : []
+            tasks: p["description"] ? [p["description"] as string] : [],
+            date: this.resolveNotificationDate(p)
           };
         });
 
@@ -443,8 +445,10 @@ export class NotifyService {
     
     try {
       let project;
+      const normalized = typeof projectIdOrName === "string" ? projectIdOrName.trim() : projectIdOrName;
+      const numericId = typeof normalized === "string" && /^\d+$/.test(normalized) ? Number(normalized) : null;
       
-      if (typeof projectIdOrName === 'number') {
+      if (typeof normalized === 'number' || numericId !== null) {
         // Query by project ID
         project = await db
           .select({
@@ -452,17 +456,18 @@ export class NotifyService {
           })
           .from(projectsTable)
           .innerJoin(usersTable, eq(projectsTable.projectManagerId, usersTable.id))
-          .where(eq(projectsTable.id, projectIdOrName))
+          .where(eq(projectsTable.id, (numericId ?? normalized) as number))
           .limit(1);
       } else {
         // Query by project name
+        const projectName = typeof normalized === "string" ? normalized : String(normalized);
         project = await db
           .select({
             managerEmail: usersTable.email,
           })
           .from(projectsTable)
           .innerJoin(usersTable, eq(projectsTable.projectManagerId, usersTable.id))
-          .where(eq(projectsTable.name, projectIdOrName))
+          .where(eq(projectsTable.name, projectName))
           .limit(1);
       }
       
@@ -478,8 +483,10 @@ export class NotifyService {
     
     try {
       let project;
+      const normalized = typeof projectIdOrName === "string" ? projectIdOrName.trim() : projectIdOrName;
+      const numericId = typeof normalized === "string" && /^\d+$/.test(normalized) ? Number(normalized) : null;
       
-      if (typeof projectIdOrName === 'number') {
+      if (typeof normalized === 'number' || numericId !== null) {
         // Query by project ID
         project = await db
           .select({
@@ -488,10 +495,11 @@ export class NotifyService {
           })
           .from(projectsTable)
           .innerJoin(usersTable, eq(projectsTable.projectManagerId, usersTable.id))
-          .where(eq(projectsTable.id, projectIdOrName))
+          .where(eq(projectsTable.id, (numericId ?? normalized) as number))
           .limit(1);
       } else {
         // Query by project name
+        const projectName = typeof normalized === "string" ? normalized : String(normalized);
         project = await db
           .select({
             slackId: usersTable.slackId,
@@ -499,7 +507,7 @@ export class NotifyService {
           })
           .from(projectsTable)
           .innerJoin(usersTable, eq(projectsTable.projectManagerId, usersTable.id))
-          .where(eq(projectsTable.name, projectIdOrName))
+          .where(eq(projectsTable.name, projectName))
           .limit(1);
       }
       
@@ -520,8 +528,10 @@ export class NotifyService {
     
     try {
       let project;
+      const normalized = typeof projectIdOrName === "string" ? projectIdOrName.trim() : projectIdOrName;
+      const numericId = typeof normalized === "string" && /^\d+$/.test(normalized) ? Number(normalized) : null;
       
-      if (typeof projectIdOrName === 'number') {
+      if (typeof normalized === 'number' || numericId !== null) {
         // Query by project ID
         project = await db
           .select({
@@ -530,10 +540,11 @@ export class NotifyService {
           })
           .from(projectsTable)
           .innerJoin(usersTable, eq(projectsTable.projectManagerId, usersTable.id))
-          .where(eq(projectsTable.id, projectIdOrName))
+          .where(eq(projectsTable.id, (numericId ?? normalized) as number))
           .limit(1);
       } else {
         // Query by project name
+        const projectName = typeof normalized === "string" ? normalized : String(normalized);
         project = await db
           .select({
             discordId: usersTable.discordId,
@@ -541,7 +552,7 @@ export class NotifyService {
           })
           .from(projectsTable)
           .innerJoin(usersTable, eq(projectsTable.projectManagerId, usersTable.id))
-          .where(eq(projectsTable.name, projectIdOrName))
+          .where(eq(projectsTable.name, projectName))
           .limit(1);
       }
       
@@ -566,6 +577,7 @@ export class NotifyService {
         const email = payload["userEmail"] as string || "";
         const hours = payload["hours"] as number || 0;
         const tasks = payload["description"] ? [payload["description"] as string] : [];
+        const date = this.resolveNotificationDate(payload);
         let cc = payload["cc"] as string;
         
         // Fetch project manager Slack ID if not provided
@@ -580,6 +592,9 @@ export class NotifyService {
         message += `👤 *${name}*`;
         if (email) {
           message += ` (${email})`;
+        }
+        if (date) {
+          message += `\n📅 Date: ${date}`;
         }
         message += `\n⏳ Total Hours: ${hours} hrs\n`;
         message += `📝 Tasks:\n`;
@@ -613,6 +628,7 @@ export class NotifyService {
         const email = payload["email"] as string;
         const hours = payload["hours"] as number;
         const tasks = payload["tasks"] as string[] || [];
+        const date = this.resolveNotificationDate(payload);
         let cc = payload["cc"] as string;
         
         // Fetch project manager Slack ID if not provided
@@ -624,7 +640,11 @@ export class NotifyService {
         }
 
         let message = `� *Project: ${project}*\n\n`;
-        message += `👤 *${name}* (${email})\n`;
+        message += `👤 *${name}* (${email})`;
+        if (date) {
+          message += `\n📅 Date: ${date}`;
+        }
+        message += `\n`;
         message += `⏳ Total Hours: ${hours} hrs\n`;
         message += `📝 Tasks:\n`;
         
@@ -652,6 +672,7 @@ export class NotifyService {
           email: string;
           hours: number;
           tasks: string[];
+          date?: string | null;
         }> || [];
         let cc = payload["cc"] as string;
         
@@ -666,7 +687,11 @@ export class NotifyService {
         let message = `� *Project: ${project}*\n\n`;
         
         members.forEach((member, index) => {
-          message += `👤 *${member.name}* (${member.email})\n`;
+          message += `👤 *${member.name}* (${member.email})`;
+          if (member.date) {
+            message += `\n📅 Date: ${member.date}`;
+          }
+          message += `\n`;
           message += `⏳ Total Hours: ${member.hours} hrs\n`;
           message += `📝 Tasks:\n`;
           
@@ -697,6 +722,20 @@ export class NotifyService {
     }
   }
 
+  private resolveNotificationDate(payload: Record<string, unknown>): string | null {
+    const rawDate = payload["workDateFormatted"] ?? payload["workDate"] ?? payload["date"];
+    if (!rawDate) {
+      return null;
+    }
+    if (typeof rawDate === "string") {
+      return rawDate;
+    }
+    if (rawDate instanceof Date) {
+      return rawDate.toISOString().slice(0, 10);
+    }
+    return null;
+  }
+
   private async renderDiscordText(template: string, payload: Record<string, unknown>): Promise<string> {
     switch (template) {
       case "timesheet_entry": {
@@ -706,6 +745,7 @@ export class NotifyService {
         const email = payload["userEmail"] as string || "";
         const hours = payload["hours"] as number || 0;
         const tasks = payload["description"] ? [payload["description"] as string] : [];
+        const date = this.resolveNotificationDate(payload);
         let cc = payload["cc"] as string;
         
         // Fetch project manager Discord ID if not provided
@@ -716,10 +756,15 @@ export class NotifyService {
           }
         }
 
-        let message = `📋 **Project: ${project}**\n\n`;
+        let message = `Hi ${cc || "@ProjectManager"}, these are the entries submitted to **${project}** yesterday.\n`;
+        message += `Please go through these entries and approve them with a 👍 reaction or flag any discrepancies on #help-hrms\n\n`;
+        
         message += `👤 **${name}**`;
         if (email) {
           message += ` (${email})`;
+        }
+        if (date) {
+          message += `\n📅 Date: ${date}`;
         }
         message += `\n⏳ Total Hours: ${hours} hrs\n`;
         message += `📝 Tasks:\n`;
@@ -731,13 +776,7 @@ export class NotifyService {
         } else {
           message += `• No tasks reported\n`;
         }
-        
-        message += `\n📊 Daily Activity Summary`;
-        
-        if (cc) {
-          message += ` | 👥 CC: ${cc}`;
-        }
-
+        message += `\n___________________________________\n\n`;
         return message;
       }
       case "leave_request": {
@@ -753,6 +792,7 @@ export class NotifyService {
         const email = payload["email"] as string;
         const hours = payload["hours"] as number;
         const tasks = payload["tasks"] as string[] || [];
+        const date = this.resolveNotificationDate(payload);
         let cc = payload["cc"] as string;
         
         // Fetch project manager Discord ID if not provided
@@ -764,7 +804,14 @@ export class NotifyService {
         }
 
         let message = `📋 **Project: ${project}**\n\n`;
-        message += `👤 **${name}** (${email})\n`;
+        message += `👤 **${name}**`;
+        if (email) {
+          message += ` (${email})`;
+        }
+        if (date) {
+          message += `\n📅 Date: ${date}`;
+        }
+        message += `\n`;
         message += `⏳ Total Hours: ${hours} hrs\n`;
         message += `📝 Tasks:\n`;
         
@@ -792,6 +839,7 @@ export class NotifyService {
           email: string;
           hours: number;
           tasks: string[];
+          date?: string | null;
         }> || [];
         let cc = payload["cc"] as string;
         
@@ -803,10 +851,18 @@ export class NotifyService {
           }
         }
 
-        let message = `📋 **Project: ${project}**\n\n`;
+        let message = `Hi ${cc || "@ProjectManager"}, these are the entries submitted to **${project}** yesterday.\n`;
+        message += `Please go through these entries and approve them with a 👍 reaction or flag any discrepancies on #help-hrms\n\n`;
         
         members.forEach((member, index) => {
-          message += `👤 **${member.name}** (${member.email})\n`;
+          message += `👤 **${member.name}**`;
+          if (member.email) {
+          message += ` (${member.email})`;
+        }
+          if (member.date) {
+            message += `\n📅 Date: ${member.date}`;
+          }
+          message += `\n`;
           message += `⏳ Total Hours: ${member.hours} hrs\n`;
           message += `📝 Tasks:\n`;
           
@@ -823,11 +879,7 @@ export class NotifyService {
             message += `\n___________________________________\n\n`;
           }
         });
-        
-        if (cc) {
-          message += ` | 👥 CC: ${cc}`;
-        }
-
+        message += `\n___________________________________\n\n`;
         return message;
       }
       default:
@@ -869,6 +921,9 @@ export class NotifyService {
         },
         body: JSON.stringify({
           content,
+          allowed_mentions: {
+            parse: ["users"],
+          },
         }),
       });
       
