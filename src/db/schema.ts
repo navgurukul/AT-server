@@ -34,6 +34,7 @@ export const roleKeyEnum = pgEnum("role_key", [
 export const projectStatusEnum = pgEnum("project_status", [
   "draft",
   "active",
+  "inactive",
   "on_hold",
   "completed",
   "archived",

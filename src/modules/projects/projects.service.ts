@@ -43,6 +43,7 @@ interface ListProjectsParams {
 const ALLOWED_PROJECT_STATUSES = [
   "active",
   "draft",
+  "inactive",
   "on_hold",
   "completed",
   "archived",

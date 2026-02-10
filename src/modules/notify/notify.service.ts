@@ -28,11 +28,8 @@ export class NotifyService {
   async handleDailyNotificationDispatch() {
     this.logger.log('Running daily notification dispatch at 9:00 AM IST');
     try {
-      const slackResult = await this.dispatchPendingSlack(100);
-      this.logger.log(`Daily Slack dispatch completed: ${slackResult.processed} notifications processed`);
-      
-      const discordResult = await this.dispatchPendingDiscord(100);
-      this.logger.log(`Daily Discord dispatch completed: ${discordResult.processed} notifications processed`);
+      const result = await this.dispatchPendingSlack(100);
+      this.logger.log(`Daily dispatch completed: ${result.processed} notifications processed`);
     } catch (error) {
       this.logger.error(`Daily dispatch failed: ${error}`);
     }
@@ -142,12 +139,16 @@ export class NotifyService {
 
         const members = notifications.map(n => {
           const p = n.payload as Record<string, unknown>;
+          const dateResolved = this.resolveNotificationDate(p) || (p["workDateFormatted"] as string);
+          const formattedDate = p["workDateFormatted"] as string || dateResolved;
           return {
             name: p["userName"] || p["userId"] || "User",
+            slackId: p["userSlackId"] as string || undefined,
             email: p["userEmail"] as string || "",
+            entryDate: formattedDate || undefined,
             hours: p["hours"] as number || 0,
             tasks: p["description"] ? [p["description"] as string] : [],
-            date: this.resolveNotificationDate(p)
+            date: dateResolved
           };
         });
 
@@ -345,12 +346,15 @@ export class NotifyService {
 
         const members = notifications.map(n => {
           const p = n.payload as Record<string, unknown>;
+          const dateResolved = this.resolveNotificationDate(p) || (p["workDateFormatted"] as string);
+          const formattedDate = p["workDateFormatted"] as string || dateResolved;
           return {
             name: p["userName"] || p["userId"] || "User",
             email: p["userEmail"] as string || "",
+            entryDate: formattedDate || undefined,
             hours: p["hours"] as number || 0,
             tasks: p["description"] ? [p["description"] as string] : [],
-            date: this.resolveNotificationDate(p)
+            date: dateResolved
           };
         });
 
@@ -588,17 +592,24 @@ export class NotifyService {
           }
         }
 
-        let message = `� *Project: ${project}*\n\n`;
-        message += `👤 *${name}*`;
-        if (email) {
-          message += ` (${email})`;
-        }
-        if (date) {
-          message += `\n📅 Date: ${date}`;
-        }
-        message += `\n⏳ Total Hours: ${hours} hrs\n`;
-        message += `📝 Tasks:\n`;
+        let message = `Hi ${cc || 'Manager'}, these are the entries submitted to *${project}* yesterday. Please go through these entries and approve them with a 👍 reaction or, flag any discrepancies on #help-hrms\n\n`;
         
+        // Tag employee using Slack ID
+        const userSlackId = payload["userSlackId"] as string;
+        const entryDate = payload["workDateFormatted"] as string;
+        const employeeTag = userSlackId ? `<@${userSlackId}>` : name;
+        message += `👤 *${employeeTag}*\n`;
+        
+        // Entry date
+        if (entryDate) {
+          message += `📅 Date: ${entryDate}\n`;
+        }
+        
+        // Hours
+        message += `⏳ Total Hours: ${hours} hrs\n`;
+        
+        // Task description
+        message += `📝 Tasks:\n`;
         if (tasks && tasks.length > 0) {
           tasks.forEach((task) => {
             message += `• ${task}\n`;
@@ -607,11 +618,7 @@ export class NotifyService {
           message += `• No tasks reported\n`;
         }
         
-        message += `\n📊 Daily Activity Summary`;
-        
-        if (cc) {
-          message += ` | 👥 CC: ${cc}`;
-        }
+        message += `\n___________________________________`;
 
         return message;
       }
@@ -639,15 +646,24 @@ export class NotifyService {
           }
         }
 
-        let message = `� *Project: ${project}*\n\n`;
-        message += `👤 *${name}* (${email})`;
-        if (date) {
-          message += `\n📅 Date: ${date}`;
-        }
-        message += `\n`;
-        message += `⏳ Total Hours: ${hours} hrs\n`;
-        message += `📝 Tasks:\n`;
+        let message = `Hi ${cc || 'Manager'}, these are the entries submitted to *${project}* yesterday. Please go through these entries and approve them with a 👍 reaction or, flag any discrepancies on #help-hrms\n\n`;
         
+        // Tag employee using Slack ID
+        const slackId = payload["slackId"] as string;
+        const entryDate = payload["workDateFormatted"] as string;
+        const employeeTag = slackId ? `<@${slackId}>` : name;
+        message += `👤 *${employeeTag}*\n`;
+        
+        // Entry date
+        if (entryDate) {
+          message += `📅 Date: ${entryDate}\n`;
+        }
+        
+        // Hours
+        message += `⏳ Total Hours: ${hours} hrs\n`;
+        
+        // Task description
+        message += `📝 Tasks:\n`;
         if (tasks && tasks.length > 0) {
           tasks.forEach((task) => {
             message += `• ${task}\n`;
@@ -656,11 +672,7 @@ export class NotifyService {
           message += `• No tasks reported\n`;
         }
         
-        message += `\n📊 Daily Activity Summary`;
-        
-        if (cc) {
-          message += ` | 👥 CC: ${cc}`;
-        }
+        message += `\n___________________________________`;
 
         return message;
       }
@@ -669,7 +681,9 @@ export class NotifyService {
         const projectId = payload["projectId"] as number;
         const members = payload["members"] as Array<{
           name: string;
+          slackId?: string;
           email: string;
+          entryDate?: string;
           hours: number;
           tasks: string[];
           date?: string | null;
@@ -684,17 +698,24 @@ export class NotifyService {
           }
         }
 
-        let message = `� *Project: ${project}*\n\n`;
+        let message = `Hi ${cc || 'Manager'}, these are the entries submitted to *${project}* yesterday. Please go through these entries and approve them with a 👍 reaction or, flag any discrepancies on #help-hrms\n\n`;
         
         members.forEach((member, index) => {
-          message += `👤 *${member.name}* (${member.email})`;
-          if (member.date) {
-            message += `\n📅 Date: ${member.date}`;
-          }
-          message += `\n`;
-          message += `⏳ Total Hours: ${member.hours} hrs\n`;
-          message += `📝 Tasks:\n`;
+          // Tag employee using Slack ID
+          const employeeTag = member.slackId ? `<@${member.slackId}>` : member.name;
+          message += `👤 *${employeeTag}*\n`;
           
+          // Entry date (with fallback)
+          const displayDate = member.entryDate || member.date;
+          if (displayDate) {
+            message += `📅 Date: ${displayDate}\n`;
+          }
+          
+          // Hours
+          message += `⏳ Total Hours: ${member.hours} hrs\n`;
+          
+          // Task description
+          message += `📝 Tasks:\n`;
           if (member.tasks && member.tasks.length > 0) {
             member.tasks.forEach((task) => {
               message += `• ${task}\n`;
@@ -703,183 +724,14 @@ export class NotifyService {
             message += `• No tasks reported\n`;
           }
           
-          // Add separator line between members (but not after the last one)
+          // Add separator line after each member
+          message += `\n___________________________________`;
+          
+          // Add extra spacing between members (but not after the last one)
           if (index < members.length - 1) {
-            message += `\n___________________________________\n\n`;
+            message += `\n\n`;
           }
         });
-
-        // message += `\n📊 Daily Activity Summary`;
-        
-        if (cc) {
-          message += ` | 👥 CC: ${cc}`;
-        }
-
-        return message;
-      }
-      default:
-        return `Notification: ${template}`;
-    }
-  }
-
-  private resolveNotificationDate(payload: Record<string, unknown>): string | null {
-    const rawDate = payload["workDateFormatted"] ?? payload["workDate"] ?? payload["date"];
-    if (!rawDate) {
-      return null;
-    }
-    if (typeof rawDate === "string") {
-      return rawDate;
-    }
-    if (rawDate instanceof Date) {
-      return rawDate.toISOString().slice(0, 10);
-    }
-    return null;
-  }
-
-  private async renderDiscordText(template: string, payload: Record<string, unknown>): Promise<string> {
-    switch (template) {
-      case "timesheet_entry": {
-        const project = payload["projectName"] || payload["projectId"] || "Project";
-        const projectId = payload["projectId"] as number;
-        const name = payload["userName"] || payload["userId"] || "User";
-        const email = payload["userEmail"] as string || "";
-        const hours = payload["hours"] as number || 0;
-        const tasks = payload["description"] ? [payload["description"] as string] : [];
-        const date = this.resolveNotificationDate(payload);
-        let cc = payload["cc"] as string;
-        
-        // Fetch project manager Discord ID if not provided
-        if (!cc && (projectId || (typeof project === 'string' || typeof project === 'number'))) {
-          const projectIdentifier = projectId || (typeof project === 'string' || typeof project === 'number' ? project : null);
-          if (projectIdentifier) {
-            cc = await this.getProjectManagerDiscordId(projectIdentifier) || "";
-          }
-        }
-
-        let message = `Hi ${cc || "@ProjectManager"}, these are the entries submitted to **${project}** yesterday.\n`;
-        message += `Please go through these entries and approve them with a 👍 reaction or flag any discrepancies on #help-hrms\n\n`;
-        
-        message += `👤 **${name}**`;
-        if (email) {
-          message += ` (${email})`;
-        }
-        if (date) {
-          message += `\n📅 Date: ${date}`;
-        }
-        message += `\n⏳ Total Hours: ${hours} hrs\n`;
-        message += `📝 Tasks:\n`;
-        
-        if (tasks && tasks.length > 0) {
-          tasks.forEach((task) => {
-            message += `• ${task}\n`;
-          });
-        } else {
-          message += `• No tasks reported\n`;
-        }
-        message += `\n___________________________________\n\n`;
-        return message;
-      }
-      case "leave_request": {
-        const start = payload["startDate"];
-        const end = payload["endDate"];
-        const durationType = payload["durationType"];
-        return `Leave request: ${durationType} from ${start} to ${end}`;
-      }
-      case "daily_activity_summary_single": {
-        const project = payload["project"] || "Project";
-        const projectId = payload["projectId"] as number;
-        const name = payload["name"] as string;
-        const email = payload["email"] as string;
-        const hours = payload["hours"] as number;
-        const tasks = payload["tasks"] as string[] || [];
-        const date = this.resolveNotificationDate(payload);
-        let cc = payload["cc"] as string;
-        
-        // Fetch project manager Discord ID if not provided
-        if (!cc && (projectId || (typeof project === 'string' || typeof project === 'number'))) {
-          const projectIdentifier = projectId || (typeof project === 'string' || typeof project === 'number' ? project : null);
-          if (projectIdentifier) {
-            cc = await this.getProjectManagerDiscordId(projectIdentifier) || "";
-          }
-        }
-
-        let message = `📋 **Project: ${project}**\n\n`;
-        message += `👤 **${name}**`;
-        if (email) {
-          message += ` (${email})`;
-        }
-        if (date) {
-          message += `\n📅 Date: ${date}`;
-        }
-        message += `\n`;
-        message += `⏳ Total Hours: ${hours} hrs\n`;
-        message += `📝 Tasks:\n`;
-        
-        if (tasks && tasks.length > 0) {
-          tasks.forEach((task) => {
-            message += `• ${task}\n`;
-          });
-        } else {
-          message += `• No tasks reported\n`;
-        }
-        
-        message += `\n📊 Daily Activity Summary`;
-        
-        if (cc) {
-          message += ` | 👥 CC: ${cc}`;
-        }
-
-        return message;
-      }
-      case "daily_activity_summary_multi": {
-        const project = payload["project"] || "Project";
-        const projectId = payload["projectId"] as number;
-        const members = payload["members"] as Array<{
-          name: string;
-          email: string;
-          hours: number;
-          tasks: string[];
-          date?: string | null;
-        }> || [];
-        let cc = payload["cc"] as string;
-        
-        // Fetch project manager Discord ID if not provided
-        if (!cc && (projectId || (typeof project === 'string' || typeof project === 'number'))) {
-          const projectIdentifier = projectId || (typeof project === 'string' || typeof project === 'number' ? project : null);
-          if (projectIdentifier) {
-            cc = await this.getProjectManagerDiscordId(projectIdentifier) || "";
-          }
-        }
-
-        let message = `Hi ${cc || "@ProjectManager"}, these are the entries submitted to **${project}** yesterday.\n`;
-        message += `Please go through these entries and approve them with a 👍 reaction or flag any discrepancies on #help-hrms\n\n`;
-        
-        members.forEach((member, index) => {
-          message += `👤 **${member.name}**`;
-          if (member.email) {
-          message += ` (${member.email})`;
-        }
-          if (member.date) {
-            message += `\n📅 Date: ${member.date}`;
-          }
-          message += `\n`;
-          message += `⏳ Total Hours: ${member.hours} hrs\n`;
-          message += `📝 Tasks:\n`;
-          
-          if (member.tasks && member.tasks.length > 0) {
-            member.tasks.forEach((task) => {
-              message += `• ${task}\n`;
-            });
-          } else {
-            message += `• No tasks reported\n`;
-          }
-          
-          // Add separator line between members (but not after the last one)
-          if (index < members.length - 1) {
-            message += `\n___________________________________\n\n`;
-          }
-        });
-        message += `\n___________________________________\n\n`;
         return message;
       }
       default:
@@ -911,33 +763,202 @@ export class NotifyService {
     }
   }
 
-  private async sendDiscordMessage(webhookUrl: string, content: string): Promise<boolean> {
+  private async renderDiscordText(template: string, payload: Record<string, unknown>): Promise<string> {
+    switch (template) {
+      case "timesheet_entry": {
+        const project = payload["projectName"] || payload["projectId"] || "Project";
+        const projectId = payload["projectId"] as number;
+        const name = payload["userName"] || payload["userId"] || "User";
+        const email = payload["userEmail"] as string || "";
+        const hours = payload["hours"] as number || 0;
+        const tasks = payload["description"] ? [payload["description"] as string] : [];
+        const date = this.resolveNotificationDate(payload);
+        let cc = payload["cc"] as string;
+        
+        // Fetch project manager Discord ID if not provided
+        if (!cc && (projectId || (typeof project === 'string' || typeof project === 'number'))) {
+          const projectIdentifier = projectId || (typeof project === 'string' || typeof project === 'number' ? project : null);
+          if (projectIdentifier) {
+            cc = await this.getProjectManagerDiscordId(projectIdentifier) || "";
+          }
+        }
+
+        let message = `Hi ${cc || 'Manager'}, these are the entries submitted to **${project}** yesterday. Please go through these entries and approve them with a 👍 reaction or, flag any discrepancies on #help-hrms\n\n`;
+        
+        // Tag employee using Discord ID
+        const userDiscordId = payload["userDiscordId"] as string;
+        const entryDate = payload["workDateFormatted"] as string;
+        const employeeTag = userDiscordId ? `<@${userDiscordId}>` : name;
+        message += `👤 **${employeeTag}**\n`;
+        
+        // Entry date
+        if (entryDate) {
+          message += `📅 Date: ${entryDate}\n`;
+        }
+        
+        // Hours
+        message += `⏳ Total Hours: ${hours} hrs\n`;
+        
+        // Task description
+        message += `📝 Tasks:\n`;
+        if (tasks && tasks.length > 0) {
+          tasks.forEach((task) => {
+            message += `• ${task}\n`;
+          });
+        } else {
+          message += `• No tasks reported\n`;
+        }
+        
+        message += `\n___________________________________`;
+
+        return message;
+      }
+      case "leave_request": {
+        const start = payload["startDate"];
+        const end = payload["endDate"];
+        const durationType = payload["durationType"];
+        return `Leave request: ${durationType} from ${start} to ${end}`;
+      }
+      case "daily_activity_summary_single": {
+        const project = payload["project"] || "Project";
+        const projectId = payload["projectId"] as number;
+        const name = payload["name"] as string;
+        const email = payload["email"] as string;
+        const hours = payload["hours"] as number;
+        const tasks = payload["tasks"] as string[] || [];
+        const date = this.resolveNotificationDate(payload);
+        let cc = payload["cc"] as string;
+        
+        // Fetch project manager Discord ID if not provided
+        if (!cc && (projectId || (typeof project === 'string' || typeof project === 'number'))) {
+          const projectIdentifier = projectId || (typeof project === 'string' || typeof project === 'number' ? project : null);
+          if (projectIdentifier) {
+            cc = await this.getProjectManagerDiscordId(projectIdentifier) || "";
+          }
+        }
+
+        let message = `Hi ${cc || 'Manager'}, these are the entries submitted to **${project}** yesterday. Please go through these entries and approve them with a 👍 reaction or, flag any discrepancies on #help-hrms\n\n`;
+        
+        // Tag employee using Discord ID
+        const discordId = payload["discordId"] as string;
+        const entryDate = payload["workDateFormatted"] as string;
+        const employeeTag = discordId ? `<@${discordId}>` : name;
+        message += `👤 **${employeeTag}**\n`;
+        
+        // Entry date
+        if (entryDate) {
+          message += `📅 Date: ${entryDate}\n`;
+        }
+        
+        // Hours
+        message += `⏳ Total Hours: ${hours} hrs\n`;
+        
+        // Task description
+        message += `📝 Tasks:\n`;
+        if (tasks && tasks.length > 0) {
+          tasks.forEach((task) => {
+            message += `• ${task}\n`;
+          });
+        } else {
+          message += `• No tasks reported\n`;
+        }
+        
+        message += `\n___________________________________`;
+
+        return message;
+      }
+      case "daily_activity_summary_multi": {
+        const project = payload["project"] || "Project";
+        const projectId = payload["projectId"] as number;
+        const members = payload["members"] as Array<{
+          name: string;
+          discordId?: string;
+          email: string;
+          entryDate?: string;
+          hours: number;
+          tasks: string[];
+          date?: string | null;
+        }> || [];
+        let cc = payload["cc"] as string;
+        
+        // Fetch project manager Discord ID if not provided
+        if (!cc && (projectId || (typeof project === 'string' || typeof project === 'number'))) {
+          const projectIdentifier = projectId || (typeof project === 'string' || typeof project === 'number' ? project : null);
+          if (projectIdentifier) {
+            cc = await this.getProjectManagerDiscordId(projectIdentifier) || "";
+          }
+        }
+
+        let message = `Hi ${cc || 'Manager'}, these are the entries submitted to **${project}** yesterday. Please go through these entries and approve them with a 👍 reaction or, flag any discrepancies on #help-hrms\n\n`;
+        
+        members.forEach((member, index) => {
+          // Tag employee using Discord ID
+          const employeeTag = member.discordId ? `<@${member.discordId}>` : member.name;
+          message += `👤 **${employeeTag}**\n`;
+          
+          // Entry date (with fallback)
+          const displayDate = member.entryDate || member.date;
+          if (displayDate) {
+            message += `📅 Date: ${displayDate}\n`;
+          }
+          
+          // Hours
+          message += `⏳ Total Hours: ${member.hours} hrs\n`;
+          
+          // Task description
+          message += `📝 Tasks:\n`;
+          if (member.tasks && member.tasks.length > 0) {
+            member.tasks.forEach((task) => {
+              message += `• ${task}\n`;
+            });
+          } else {
+            message += `• No tasks reported\n`;
+          }
+          
+          // Add separator line after each member
+          message += `\n___________________________________`;
+          
+          // Add extra spacing between members (but not after the last one)
+          if (index < members.length - 1) {
+            message += `\n\n`;
+          }
+        });
+        return message;
+      }
+      default:
+        return `Notification: ${template}`;
+    }
+  }
+
+  private async sendDiscordMessage(webhookUrl: string, text: string): Promise<boolean> {
     try {
-      this.logger.debug(`Sending Discord message to webhook (URL length: ${webhookUrl.length}, content length: ${content.length} chars)`);
       const resp = await fetch(webhookUrl, {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
+          "Content-Type": "application/json; charset=utf-8",
         },
         body: JSON.stringify({
-          content,
-          allowed_mentions: {
-            parse: ["users"],
-          },
+          content: text,
         }),
       });
-      
       if (!resp.ok) {
-        const responseText = await resp.text();
-        this.logger.warn(`Discord API error: ${resp.status} ${resp.statusText}. Response: ${responseText}`);
-        return false;
+        this.logger.warn(`Discord API error: ${resp.statusText}`);
       }
-      
-      this.logger.log('Discord message sent successfully');
-      return true;
+      return resp.ok;
     } catch (err) {
       this.logger.error(`Discord send failed: ${err instanceof Error ? err.message : err}`);
       return false;
     }
+  }
+
+  private resolveNotificationDate(payload: Record<string, unknown>): string | null {
+    const date = payload["date"] || payload["workDate"] || payload["entryDate"];
+    if (date instanceof Date) {
+      return date.toISOString().split('T')[0];
+    }
+    if (typeof date === 'string') {
+      return date;
+    }
+    return null;
   }
 }
