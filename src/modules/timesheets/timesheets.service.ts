@@ -167,7 +167,11 @@ export class TimesheetsService {
     const now = new Date();
 
     const [userInfo] = await db
-      .select({ name: usersTable.name })
+      .select({ 
+        name: usersTable.name,
+        email: usersTable.email,
+        slackId: usersTable.slackId,
+      })
       .from(usersTable)
       .where(eq(usersTable.id, userId))
       .limit(1);
@@ -584,6 +588,8 @@ export class TimesheetsService {
       const notificationPayload = {
         userId,
         userName: userInfo?.name ?? `User ${userId}`,
+        userEmail: userInfo?.email ?? null,
+        userSlackId: userInfo?.slackId ?? null,
         workDate,
         workDateFormatted: this.formatDateDDMMYYYY(workDate),
         projectId: pid,
@@ -1148,38 +1154,19 @@ export class TimesheetsService {
   ) {
     const db = this.database.connection;
 
-    const startOfMonth = normalizeDate(
-      new Date(
-        Date.UTC(
-          referenceDate.getUTCFullYear(),
-          referenceDate.getUTCMonth(),
-          1
-        )
-      )
-    );
-    const startOfNextMonth = normalizeDate(
-      new Date(
-        Date.UTC(
-          referenceDate.getUTCFullYear(),
-          referenceDate.getUTCMonth() + 1,
-          1
-        )
-      )
-    );
+    const year = referenceDate.getUTCFullYear();
+    const month = referenceDate.getUTCMonth() + 1;
 
-    const today = normalizeDate(now);
-    const upperBound =
-      today < startOfNextMonth ? today : startOfNextMonth;
-
+    // Count actual backfill entries from the backfill_dates table
     const [{ value: backfillCount }] = await db
-      .select({ value: count(timesheetsTable.id) })
-      .from(timesheetsTable)
+      .select({ value: count(backfillDatesTable.id) })
+      .from(backfillDatesTable)
       .where(
         and(
-          eq(timesheetsTable.orgId, orgId),
-          eq(timesheetsTable.userId, userId),
-          lt(timesheetsTable.workDate, upperBound),
-          gte(timesheetsTable.workDate, startOfMonth)
+          eq(backfillDatesTable.orgId, orgId),
+          eq(backfillDatesTable.userId, userId),
+          eq(backfillDatesTable.year, year),
+          eq(backfillDatesTable.month, month)
         )
       );
 
@@ -1352,6 +1339,14 @@ export class TimesheetsService {
   ) {
     const db = this.database.connection;
 
+    // Always recalculate from backfill_dates table (source of truth)
+    const computedUsed = await this.countBackfilledDaysForCycle(
+      orgId,
+      userId,
+      cycle,
+      now
+    );
+
     const [existing] = await db
       .select({
         id: backfillCountersTable.id,
@@ -1370,20 +1365,13 @@ export class TimesheetsService {
       .limit(1);
 
     if (existing) {
+      // Return the computed used count from backfill_dates, not the stored value
       return {
         id: existing.id,
-        used: Number(existing.used ?? 0),
+        used: computedUsed,
         limit: Number(existing.limit ?? DEFAULT_BACKFILL_PER_MONTH),
       };
     }
-
-    // Count backfilled days within the salary cycle
-    const computedUsed = await this.countBackfilledDaysForCycle(
-      orgId,
-      userId,
-      cycle,
-      now
-    );
 
     const [created] = await db
       .insert(backfillCountersTable)
@@ -1404,7 +1392,7 @@ export class TimesheetsService {
 
     return {
       id: created.id,
-      used: Number(created.used ?? computedUsed),
+      used: computedUsed,
       limit: Number(created.limit ?? DEFAULT_BACKFILL_PER_MONTH),
     };
   }
@@ -1420,22 +1408,19 @@ export class TimesheetsService {
   ) {
     const db = this.database.connection;
 
-    const cycleStart = normalizeDate(cycle.start);
-    const cycleEnd = normalizeDate(cycle.end);
-    const today = normalizeDate(now);
+    const year = cycle.year;
+    const month = cycle.month;
 
-    // Only count timesheets created before today within the cycle
-    const upperBound = today < cycleEnd ? today : cycleEnd;
-
+    // Count actual backfill entries from the backfill_dates table for this cycle
     const [{ value: backfillCount }] = await db
-      .select({ value: count(timesheetsTable.id) })
-      .from(timesheetsTable)
+      .select({ value: count(backfillDatesTable.id) })
+      .from(backfillDatesTable)
       .where(
         and(
-          eq(timesheetsTable.orgId, orgId),
-          eq(timesheetsTable.userId, userId),
-          gte(timesheetsTable.workDate, cycleStart),
-          lt(timesheetsTable.workDate, upperBound)
+          eq(backfillDatesTable.orgId, orgId),
+          eq(backfillDatesTable.userId, userId),
+          eq(backfillDatesTable.year, year),
+          eq(backfillDatesTable.month, month)
         )
       );
 
