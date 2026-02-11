@@ -64,4 +64,10 @@ export class CreateProjectDto {
   @IsString()
   @MaxLength(200)
   slackChannelId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  discordChannelId?: string;
 }
