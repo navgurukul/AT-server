@@ -837,21 +837,18 @@ export class NotifyService {
           }
         }
 
-        let message = `Hi ${cc || 'Manager'}, these are the entries submitted to **${project}** yesterday. Please go through these entries and approve them with a 👍 reaction or, flag any discrepancies on #help-hrms\n\n`;
-        
-        // Tag employee using Discord ID
-        const discordId = payload["discordId"] as string;
-        const entryDate = payload["workDateFormatted"] as string;
-        const employeeTag = discordId ? `<@${discordId}>` : name;
-        message += `👤 **${employeeTag}**\n`;
-        
-        // Entry date
-        if (entryDate) {
-          message += `📅 Date: ${entryDate}\n`;
+        let message = `Hi ${cc || "@ProjectManager"}, these are the entries submitted to **${project}** yesterday.\n`;
+        message += `Please go through these entries and approve them with a 👍 reaction or flag any discrepancies on #help-hrms\n\n`;
+
+        message += `👤 **${name}**`;
+        if (email) {
+          message += ` (${email})`;
         }
-        
-        // Hours
-        message += `⏳ Total Hours: ${hours} hrs\n`;
+        if (date) {
+          message += `\n📅 Date: ${date}`;
+        }
+        message += `\n⏳ Total Hours: ${hours} hrs\n`;
+        message += `📝 Tasks:\n`;
         
         // Task description
         message += `📝 Tasks:\n`;
@@ -862,9 +859,7 @@ export class NotifyService {
         } else {
           message += `• No tasks reported\n`;
         }
-        
-        message += `\n___________________________________`;
-
+        message += `\n___________________________________\n\n`;
         return message;
       }
       case "daily_activity_summary_multi": {

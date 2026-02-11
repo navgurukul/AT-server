@@ -381,8 +381,6 @@ export class LeavesService {
         );
       }
 
-      await this.assertNoHolidays(orgId, startDate, endDate);
-
       const { workingDays, totalHours } = await this.calculateWorkingHours(
         orgId,
         startDate,
@@ -1490,6 +1488,15 @@ export class LeavesService {
 
   private async isNonWorkingDay(orgId: number, date: Date): Promise<boolean> {
     if (this.isFixedHoliday(date)) {
+      return true;
+    }
+
+    const dayOfWeek = date.getUTCDay();
+    if (dayOfWeek === 0) {
+      return true;
+    }
+
+    if (dayOfWeek === 6 && this.isSecondOrFourthSaturday(date)) {
       return true;
     }
 

@@ -156,6 +156,10 @@ export class ProjectsService {
           payload.slackChannelId && payload.slackChannelId.trim().length > 0
             ? payload.slackChannelId.trim()
             : null,
+        discordChannelId:
+          payload.discordChannelId && payload.discordChannelId.trim().length > 0
+            ? payload.discordChannelId.trim()
+            : null,
       })
       .returning(PROJECT_SELECTION);
 
@@ -338,6 +342,12 @@ export class ProjectsService {
       updateValues.slackChannelId =
         payload.slackChannelId && payload.slackChannelId.trim().length > 0
           ? payload.slackChannelId.trim()
+          : null;
+    }
+    if (payload.discordChannelId !== undefined) {
+      updateValues.discordChannelId =
+        payload.discordChannelId && payload.discordChannelId.trim().length > 0
+          ? payload.discordChannelId.trim()
           : null;
     }
 
