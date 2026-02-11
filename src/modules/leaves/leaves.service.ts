@@ -411,10 +411,7 @@ export class LeavesService {
           break;
         case "full_day":
           requestedDurationType = "full_day";
-          requestedHours =
-            payload.hours !== undefined && payload.hours > 0
-              ? payload.hours
-              : totalHours;
+          requestedHours = totalHours;
           break;
         case "custom":
           if (payload.hours === undefined) {
@@ -431,10 +428,7 @@ export class LeavesService {
             requestedHours = payload.hours;
           } else {
             requestedDurationType = "full_day";
-            requestedHours =
-              payload.hours !== undefined && payload.hours > 0
-                ? payload.hours
-                : totalHours;
+            requestedHours = totalHours;
           }
       }
 
