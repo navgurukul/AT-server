@@ -15,6 +15,7 @@ import {
   userRolesTable,
   usersTable,
   backfillCountersTable,
+  backfillDatesTable,
   timesheetsTable,
 } from '../../db/schema';
 import { LoginDto } from './dto/login.dto';
@@ -351,8 +352,11 @@ export class AuthService {
 
   private async getBackfillQuota(userId: number, orgId: number) {
     const now = new Date();
-    const year = now.getUTCFullYear();
-    const month = now.getUTCMonth() + 1;
+    const { SalaryCycleUtil } = await import('../../common/utils/salary-cycle.util');
+    const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(now);
+    
+    const year = currentCycle.year;
+    const month = currentCycle.month;
 
     const [counter] = await this.databaseService.connection
       .select({
@@ -373,21 +377,45 @@ export class AuthService {
     const usage =
       counter && counter.used !== null && counter.used !== undefined
         ? Number(counter.used)
-        : await this.countBackfilledDaysForMonth(userId, now, now, orgId);
+        : await this.countBackfilledDaysForCycle(userId, currentCycle, now, orgId);
 
     const limit =
       counter && counter.limit !== null && counter.limit !== undefined
         ? Number(counter.limit)
         : AuthService.MAX_BACKFILL_PER_MONTH;
 
-    const remaining =
-      now.getUTCDate() > 25
-        ? 0
-        : Math.max(limit - usage, 0);
+    const remaining = Math.max(limit - usage, 0);
     return {
       limit,
       remaining,
     };
+  }
+
+  private async countBackfilledDaysForCycle(
+    userId: number,
+    cycle: { year: number; month: number },
+    now: Date,
+    orgId?: number,
+  ) {
+    const db = this.databaseService.connection;
+
+    const year = cycle.year;
+    const month = cycle.month;
+    // console.log('yyyyyy', month,year)
+    // Count actual backfill entries from the backfill_dates table for this cycle
+    const conditions = [
+      eq(backfillDatesTable.userId, userId),
+      orgId ? eq(backfillDatesTable.orgId, orgId) : undefined,
+      eq(backfillDatesTable.year, year),
+      eq(backfillDatesTable.month, month),
+    ].filter((c): c is NonNullable<typeof c> => Boolean(c));
+
+    const [{ value: backfillCount }] = await db
+      .select({ value: count(backfillDatesTable.id) })
+      .from(backfillDatesTable)
+      .where(and(...conditions));
+
+    return Number(backfillCount ?? 0);
   }
 
   private async countBackfilledDaysForMonth(
