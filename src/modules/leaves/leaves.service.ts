@@ -1609,7 +1609,7 @@ export class LeavesService {
       }
       
       // Skip Learning Saturday project
-      if (project.projectName && project.projectName.toLowerCase().includes('learning saturday')) {
+      if (project.projectName && project.projectName.toLowerCase().includes('Learning Saturdays')) {
         return false;
       }
       
