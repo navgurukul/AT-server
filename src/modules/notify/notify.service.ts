@@ -9,10 +9,17 @@ import { notificationsTable, projectsTable, usersTable } from "../../db/schema";
 @Injectable()
 export class NotifyService {
   private readonly logger = new Logger(NotifyService.name);
+  private leavesService: any; // Will be set via setter to avoid circular dependency
+  
   constructor(
     private readonly database: DatabaseService,
     private readonly configService: ConfigService
   ) {}
+
+  // Setter for LeavesService to avoid circular dependency
+  setLeavesService(leavesService: any) {
+    this.leavesService = leavesService;
+  }
 
   async previewTemplate(template: string, payload: Record<string, unknown>) {
     return {
@@ -21,8 +28,26 @@ export class NotifyService {
     };
   }
 
-  // Cron job runs at 9:00 AM IST (3:30 AM UTC) every day
-  @Cron('30 3 * * *', {
+  // Cron job runs at 8:30 AM IST to queue leave notifications
+  @Cron('30 8 * * *', {
+    timeZone: 'Asia/Kolkata',
+  })
+  async handleDailyLeaveNotificationQueue() {
+    this.logger.log('Running daily leave notification queue at 8:30 AM IST');
+    try {
+      if (!this.leavesService) {
+        this.logger.error('LeavesService not injected, skipping leave notification queue');
+        return;
+      }
+      const result = await this.leavesService.queueDailyLeaveNotifications();
+      this.logger.log(`Daily leave notification queue completed: ${result.processed} leaves processed`);
+    } catch (error) {
+      this.logger.error(`Daily leave notification queue failed: ${error}`);
+    }
+  }
+
+  // Cron job runs at 9:00 AM IST every day
+  @Cron('0 9 * * *', {
     timeZone: 'Asia/Kolkata',
   })
   async handleDailyNotificationDispatch() {
@@ -623,10 +648,53 @@ export class NotifyService {
         return message;
       }
       case "leave_request": {
-        const start = payload["startDate"];
-        const end = payload["endDate"];
+        const startDate = payload["startDate"] as string;
+        const endDate = payload["endDate"] as string;
         const durationType = payload["durationType"];
-        return `Leave request: ${durationType} from ${start} to ${end}`;
+        const halfDaySegment = payload["halfDaySegment"];
+        const leaveTypeName = payload["leaveTypeName"] || "Leave";
+        const userName = payload["userName"] || "Employee";
+        const userSlackId = payload["userSlackId"] as string;
+        const reason = payload["reason"] as string;
+        const projectManagerName = payload["projectManagerName"] as string;
+        const projectManagerSlackId = payload["projectManagerSlackId"] as string;
+        const isPastLeave = payload["isPastLeave"] as boolean;
+
+        this.logger.debug(`Slack leave notification - userName: ${userName}, leaveType: ${leaveTypeName}, projectManagerName: ${projectManagerName}, userSlackId: ${userSlackId}, projectManagerSlackId: ${projectManagerSlackId}, isPastLeave: ${isPastLeave}`);
+
+        // Format dates for display
+        const formattedStartDate = this.formatDateForDisplay(startDate);
+        const formattedEndDate = this.formatDateForDisplay(endDate);
+
+        // Format project manager tag
+        const managerTag = projectManagerSlackId 
+          ? `<@${projectManagerSlackId}>` 
+          : (projectManagerName || "Manager");
+
+        // Format employee name with Slack mention if available
+        const employeeTag = userSlackId ? `<@${userSlackId}>` : userName;
+
+        // Determine tense: past or present
+        const tense = isPastLeave ? "was on" : "is on";
+
+        // Build message
+        let message = `Hi ${managerTag},\n`;
+        message += `${employeeTag} ${tense} *${leaveTypeName}* on the following dates:\n`;
+        message += `📅 ${formattedStartDate} to ${formattedEndDate}`;
+        
+        // Add half-day segment if applicable
+        if (durationType === "half_day" && halfDaySegment) {
+          const segmentText = halfDaySegment === "first_half" ? "First Half" : "Second Half";
+          message += ` (${segmentText})`;
+        }
+        message += `\n`;
+        
+        // Add reason if provided
+        if (reason) {
+          message += `\n📝 Reason: ${reason}`;
+        }
+
+        return message;
       }
       case "daily_activity_summary_single": {
         const project = payload["project"] || "Project";
@@ -814,10 +882,51 @@ export class NotifyService {
         return message;
       }
       case "leave_request": {
-        const start = payload["startDate"];
-        const end = payload["endDate"];
+        const startDate = payload["startDate"] as string;
+        const endDate = payload["endDate"] as string;
         const durationType = payload["durationType"];
-        return `Leave request: ${durationType} from ${start} to ${end}`;
+        const halfDaySegment = payload["halfDaySegment"];
+        const leaveTypeName = payload["leaveTypeName"] || "Leave";
+        const userName = payload["userName"] || "Employee";
+        const userDiscordId = payload["userDiscordId"] as string;
+        const reason = payload["reason"] as string;
+        const projectManagerName = payload["projectManagerName"] as string;
+        const projectManagerDiscordId = payload["projectManagerDiscordId"] as string;
+        const isPastLeave = payload["isPastLeave"] as boolean;
+
+        // Format dates for display
+        const formattedStartDate = this.formatDateForDisplay(startDate);
+        const formattedEndDate = this.formatDateForDisplay(endDate);
+
+        // Format project manager tag
+        const managerTag = projectManagerDiscordId 
+          ? `<@${projectManagerDiscordId}>` 
+          : (projectManagerName || "Manager");
+
+        // Format employee name in bold (not tagged for Discord)
+        const employeeTag = `**${userName}**`;
+
+        // Determine tense: past or present
+        const tense = isPastLeave ? "was on" : "is on";
+
+        // Build message
+        let message = `Hi ${managerTag},\n`;
+        message += `${employeeTag} ${tense} **${leaveTypeName}** on the following dates:\n`;
+        message += `📅 ${formattedStartDate} to ${formattedEndDate}`;
+        
+        // Add half-day segment if applicable
+        if (durationType === "half_day" && halfDaySegment) {
+          const segmentText = halfDaySegment === "first_half" ? "First Half" : "Second Half";
+          message += ` (${segmentText})`;
+        }
+        message += `\n`;
+        
+        // Add reason if provided
+        if (reason) {
+          message += `\n📝 Reason: ${reason}`;
+        }
+
+        return message;
       }
       case "daily_activity_summary_single": {
         const project = payload["project"] || "Project";
@@ -955,5 +1064,20 @@ export class NotifyService {
       return date;
     }
     return null;
+  }
+
+  private formatDateForDisplay(dateStr: string | Date): string {
+    try {
+      const date = typeof dateStr === 'string' ? new Date(dateStr) : dateStr;
+      // Format as DD MMM YYYY (e.g., 11 Feb 2026)
+      const day = date.getDate();
+      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const month = monthNames[date.getMonth()];
+      const year = date.getFullYear();
+      return `${day} ${month} ${year}`;
+    } catch (err) {
+      // Fallback to original string if parsing fails
+      return typeof dateStr === 'string' ? dateStr.split('T')[0] : dateStr.toISOString().split('T')[0];
+    }
   }
 }
