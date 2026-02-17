@@ -17,6 +17,7 @@ import {
   sql,
   isNotNull,
 } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 
 import { DatabaseService } from "../../database/database.service";
 import {
@@ -33,6 +34,7 @@ import {
   timesheetsTable,
   userRoles,
   usersTable,
+  users,
 } from "../../db/schema";
 import { CalendarService } from "../calendar/calendar.service";
 import { CreateLeaveRequestDto } from "./dto/create-leave-request.dto";
@@ -206,6 +208,8 @@ export class LeavesService {
     // Additional guard: never show non-working-day requests in this listing logic
     // (handled at creation time), so existing data is trusted here.
 
+    const decidedByUser = alias(users, "decidedByUser");
+
     const baseQuery = db
       .select({
         id: leaveRequestsTable.id,
@@ -226,12 +230,17 @@ export class LeavesService {
         requesterName: usersTable.name,
         requesterEmail: usersTable.email,
         managerId: usersTable.managerId,
+        decidedByUserName: decidedByUser.name,
       })
       .from(leaveRequestsTable)
       .innerJoin(usersTable, eq(usersTable.id, leaveRequestsTable.userId))
       .innerJoin(
         leaveTypesTable,
         eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id),
+      )
+      .leftJoin(
+        decidedByUser,
+        eq(leaveRequestsTable.decidedByUserId, decidedByUser.id),
       );
 
     const query = filters.length > 0 ? baseQuery.where(and(...filters)) : baseQuery;
@@ -261,6 +270,7 @@ export class LeavesService {
       requestedAt: row.requestedAt,
       updatedAt: row.updatedAt,
       decidedByUserId: row.decidedByUserId ?? null,
+      decidedByUserName: row.decidedByUserName ?? null,
     }));
   }
 
