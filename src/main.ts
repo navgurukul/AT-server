@@ -57,7 +57,7 @@ async function bootstrap() {
   globalState.__nestApp__ = app;
 
   app.enableShutdownHooks();
-  app.setGlobalPrefix('v1');
+  app.setGlobalPrefix('api/v1');;
 
   app.useGlobalPipes(
     new ValidationPipe({
@@ -74,8 +74,8 @@ async function bootstrap() {
     .setTitle('Activity Tracker API')
     .setDescription('Employee activity tracking service')
     .setVersion('1.0.0')
-    .addServer('/api', 'Production/Amplify Server') // Forces Swagger to use /api prefix
-    .addServer('/', 'Local Environment')
+    .addServer('/', 'Local Environment') // Swapped to top so it's the default
+    .addServer('/api', 'Production/Amplify Server')
     .addBearerAuth({
       type: 'http',
       scheme: 'bearer',
