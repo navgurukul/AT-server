@@ -56,8 +56,17 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   globalState.__nestApp__ = app;
 
+  // --- FIX 1: Enable CORS for your frontend ---
+  app.enableCors({
+    origin: true, // 'true' allows all origins temporarily. For production, replace with your frontend URL like 'https://yourfrontend.com'
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
+    credentials: true, 
+  });
+
   app.enableShutdownHooks();
-  app.setGlobalPrefix('api/v1');;
+  
+  // --- FIX 2: Cleaned up the extra semicolon ---
+  app.setGlobalPrefix('api/v1');
 
   app.useGlobalPipes(
     new ValidationPipe({
@@ -70,12 +79,12 @@ async function bootstrap() {
     }),
   );
 
+  // --- FIX 3: Fixed Swagger Servers to prevent /api/api duplication ---
   const swaggerConfig = new DocumentBuilder()
     .setTitle('Activity Tracker API')
     .setDescription('Employee activity tracking service')
     .setVersion('1.0.0')
-    .addServer('/', 'Local Environment') // Swapped to top so it's the default
-    .addServer('/api', 'Production/Amplify Server')
+    .addServer('/', 'Default Server') // Since global prefix has 'api/v1', we just use '/'
     .addBearerAuth({
       type: 'http',
       scheme: 'bearer',
