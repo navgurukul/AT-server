@@ -365,6 +365,9 @@ export const leaveBalances = pgTable("leave_balances", {
   bookedHours: numeric("booked_hours", { precision: 6, scale: 2 })
     .notNull()
     .default("0"),
+  allocatedHours: numeric("allocated_hours", { precision: 6, scale: 2 })
+    .notNull()
+    .default("0"),
   asOfDate: date("as_of_date").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
