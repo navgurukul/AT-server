@@ -108,6 +108,7 @@ export class LeavesService {
         balanceHours: leaveBalancesTable.balanceHours,
         pendingHours: leaveBalancesTable.pendingHours,
         bookedHours: leaveBalancesTable.bookedHours,
+        allocatedHours: leaveBalancesTable.allocatedHours,
         asOfDate: leaveBalancesTable.asOfDate,
         leaveType: {
           id: leaveTypesTable.id,
@@ -130,6 +131,7 @@ export class LeavesService {
       balanceHours: this.normalizeHours(Number(row.balanceHours ?? 0)),
       pendingHours: this.normalizeHours(Number(row.pendingHours ?? 0)),
       bookedHours: this.normalizeHours(Number(row.bookedHours ?? 0)),
+      allocatedHours: this.normalizeHours(Number(row.allocatedHours ?? 0)),
       asOfDate: row.asOfDate,
       leaveType: row.leaveType,
     }));
@@ -462,7 +464,13 @@ export class LeavesService {
       }
 
       const overlappingRequests = await tx
-        .select({ value: count(leaveRequestsTable.id) })
+        .select({ 
+          id: leaveRequestsTable.id,
+          durationType: leaveRequestsTable.durationType,
+          halfDaySegment: leaveRequestsTable.halfDaySegment,
+          startDate: leaveRequestsTable.startDate,
+          endDate: leaveRequestsTable.endDate,
+        })
         .from(leaveRequestsTable)
         .where(
           and(
@@ -485,7 +493,23 @@ export class LeavesService {
           )
         );
 
-      if (Number(overlappingRequests[0]?.value ?? 0) > 0) {
+      // Check for actual conflicts
+      for (const existing of overlappingRequests) {
+        // If current request is half-day and existing is also half-day on the same single date
+        if (
+          requestedDurationType === "half_day" &&
+          existing.durationType === "half_day" &&
+          this.isSameDate(startDate, endDate) &&
+          this.isSameDate(existing.startDate, existing.endDate) &&
+          this.isSameDate(startDate, existing.startDate)
+        ) {
+          // Allow if segments are different (first_half vs second_half)
+          if (requestedHalfDaySegment !== existing.halfDaySegment) {
+            continue; // Not a conflict - different halves of the same day
+          }
+        }
+        
+        // Any other overlap is a conflict
         throw new BadRequestException(
           "Overlapping leave request exists for the selected period"
         );
