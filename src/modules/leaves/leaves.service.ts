@@ -43,6 +43,7 @@ import { ReviewLeaveRequestDto } from "./dto/review-leave-request.dto";
 import { GrantCompOffDto } from "./dto/grant-comp-off.dto";
 import { RevokeCompOffDto } from "./dto/revoke-comp-off.dto";
 import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
+import { SalaryCycleUtil } from "../../common/utils/salary-cycle.util";
 
 interface ListLeaveRequestsParams {
   actor?: AuthenticatedUser;
@@ -356,6 +357,27 @@ export class LeavesService {
 
     if (endDate < startDate) {
       throw new BadRequestException("End date cannot be before start date");
+    }
+
+    const today = this.normalizeDateUTC(new Date());
+    const normalizedStartDate = this.normalizeDateUTC(startDate);
+    const normalizedEndDate = this.normalizeDateUTC(endDate);
+    if (normalizedStartDate < today || normalizedEndDate < today) {
+      const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(new Date());
+      const cycleStart = this.normalizeDateUTC(currentCycle.start);
+      const cycleEnd = this.normalizeDateUTC(currentCycle.end);
+
+      if (normalizedStartDate < cycleStart || normalizedEndDate < cycleStart) {
+        throw new BadRequestException(
+          `Leave requests for past dates are only allowed within the current salary cycle (${currentCycle.cycleLabel})`
+        );
+      }
+
+      if (normalizedStartDate >= cycleEnd || normalizedEndDate >= cycleEnd) {
+        throw new BadRequestException(
+          `Leave requests for past dates are only allowed within the current salary cycle (${currentCycle.cycleLabel})`
+        );
+      }
     }
 
     const request = await db.transaction(async (tx) => {
