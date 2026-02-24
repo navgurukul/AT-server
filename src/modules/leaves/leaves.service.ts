@@ -1065,7 +1065,6 @@ export class LeavesService {
     approverId: number
   ) {
     const db = this.database.connection;
-// console.log("approver id:", approverId);
     return await db.transaction(async (tx) => {
       const [request] = await tx
         .select({
@@ -2218,7 +2217,6 @@ export class LeavesService {
           .limit(50); // Get enough projects to filter through weekends/holidays
 
         if (projects.length === 0) {
-          console.log(`No recent project entries found for user ${leave.userName} (ID: ${leave.userId})`);
           continue;
         }
 
@@ -2241,7 +2239,6 @@ export class LeavesService {
             }
           } catch (error) {
             // If calendar check fails, continue with this date
-            console.warn(`Could not check holiday status for date ${workDate}: ${error}`);
           }
           
           // Found the last valid working date
@@ -2250,7 +2247,6 @@ export class LeavesService {
         }
 
         if (!lastValidWorkDate) {
-          console.log(`No valid working date found for user ${leave.userName} (ID: ${leave.userId})`);
           continue;
         }
 
@@ -2272,7 +2268,6 @@ export class LeavesService {
         });
 
         if (validProjects.length === 0) {
-          console.log(`No valid projects found for user ${leave.userName} (ID: ${leave.userId}) after filtering`);
           continue;
         }
 
@@ -2330,9 +2325,7 @@ export class LeavesService {
           }
         }
 
-        console.log(`Queued leave notifications for ${leave.userName} to ${uniqueProjects.length} project(s): ${uniqueProjects.map(p => p.projectName).join(', ')}`);
       } catch (error) {
-        console.error(`Error queuing notification for leave ${leave.leaveId}:`, error);
       }
     }
 

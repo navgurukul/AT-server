@@ -19,23 +19,18 @@ async function runMigration() {
   });
 
   try {
-    console.log('Connecting to database...');
     const client = await pool.connect();
     
     try {
-      console.log('Reading migration file...');
       const migrationPath = join(__dirname, '../drizzle/0022_add_inactive_project_status.sql');
       const sql = await readFile(migrationPath, 'utf-8');
       
-      console.log('Executing migration:', sql);
       await client.query(sql);
       
-      console.log('✓ Migration completed successfully!');
     } finally {
       client.release();
     }
   } catch (error) {
-    console.error('Migration failed:', error);
     process.exit(1);
   } finally {
     await pool.end();
