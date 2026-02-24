@@ -527,7 +527,7 @@ export class LeavesService {
         ) {
           // Allow if segments are different (first_half vs second_half)
           if (requestedHalfDaySegment !== existing.halfDaySegment) {
-            continue; // Not a conflict - different halves of the same day
+            continue; 
           }
         }
         
@@ -2292,7 +2292,7 @@ export class LeavesService {
             durationType: leave.durationType,
             halfDaySegment: leave.halfDaySegment,
             reason: leave.reason,
-            isPastLeave, // To use past tense in message
+            isPastLeave, 
             projectId: project.projectId,
             projectName: project.projectName,
             projectManagerName: project.projectManagerName,
