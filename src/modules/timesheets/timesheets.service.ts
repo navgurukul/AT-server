@@ -31,7 +31,7 @@ interface ListTimesheetParams {
 
 const DEFAULT_BACKFILL_PER_MONTH = 3;
 const BACKFILL_CUTOFF_DAY = 25;
-const MAX_HOURS_PER_DAY = 15;
+const MAX_HOURS_PER_DAY = 12;
 const HOURS_PER_WORKING_DAY = 8;
 const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 
