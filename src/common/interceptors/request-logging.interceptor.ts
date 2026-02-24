@@ -17,7 +17,6 @@ export class RequestLoggingInterceptor implements NestInterceptor {
     return next.handle().pipe(
       tap(() => {
         const duration = Date.now() - startedAt;
-        console.log(`[${request.method}] ${request.url} handled in ${duration}ms`);
       }),
     );
   }

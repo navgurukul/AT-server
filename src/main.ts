@@ -21,11 +21,9 @@ async function closeExistingApp(signal?: string) {
 
   try {
     if (signal) {
-      console.log(`${signal} received. Closing Nest app...`);
     }
     await existingApp.close();
   } catch (error) {
-    console.error('Error while closing Nest app', error);
   } finally {
     globalState.__nestApp__ = undefined;
   }
@@ -111,7 +109,6 @@ async function bootstrap() {
 
 if (require.main === module) {
   bootstrap().catch((error) => {
-    console.error('Failed to bootstrap Nest app', error);
     process.exit(1);
   });
 }

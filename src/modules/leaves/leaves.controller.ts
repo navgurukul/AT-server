@@ -71,7 +71,6 @@ export class LeavesController {
     @Body() payload: CreateLeaveRequestDto,
     @CurrentUser() user: AuthenticatedUser | undefined
   ) {
-    console.log("Requesting leave with payload:", payload);
     if (!user) {
       return null;
     }
@@ -144,7 +143,6 @@ export class LeavesController {
     @Body() payload: ReviewLeaveRequestDto,
     @CurrentUser() user: AuthenticatedUser | undefined
   ) {
-    console.log("user approving request:", user);
     return this.leavesService.reviewLeaveRequest(
       requestId,
       "approve",

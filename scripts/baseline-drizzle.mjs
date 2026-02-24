@@ -83,10 +83,8 @@ async function main() {
   }
 
   await client.end();
-  console.log('Drizzle migrations baseline has been recorded.');
 }
 
 main().catch((error) => {
-  console.error('Failed to baseline migrations:', error);
   process.exitCode = 1;
 });

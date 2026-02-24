@@ -333,11 +333,8 @@ export class TimesheetsService {
       );
     }
 
-    if (await this.calendarService.isHoliday(orgId, workDate)) {
-      throw new BadRequestException(
-        "Timesheets cannot be logged on holidays or non-working days"
-      );
-    }
+    // Allow logging activities on non-working days (weekends, holidays) for comp-off generation
+    // Removed validation that blocked timesheets on non-working days
 
     const isBackfill = workDate < today;
     const backfillAllowance = isBackfill
