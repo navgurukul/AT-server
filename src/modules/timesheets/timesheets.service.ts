@@ -717,8 +717,8 @@ export class TimesheetsService {
     // Use salary cycle instead of calendar month
     // month parameter now represents the salary cycle starting month
     const cycleRange = SalaryCycleUtil.getSalaryCycleDateRange(year, month);
-    const monthStart = cycleRange.start; // 26th of the month
-    const monthEnd = cycleRange.end; // 25th of next month
+    const monthStart = cycleRange.start; // 25th of the month
+    const monthEnd = cycleRange.end; // 25th of next month (payable day period)
     const nextMonthStart = new Date(monthEnd);
     nextMonthStart.setUTCDate(nextMonthStart.getUTCDate() + 1);
 
@@ -1143,6 +1143,239 @@ export class TimesheetsService {
     };
   }
 
+  async getSalarySummary(params: {
+    userId: number;
+    orgId: number;
+    year: number;
+    month: number;
+  }) {
+    const { userId, orgId, year, month } = params;
+
+    if (!year || !month) {
+      throw new BadRequestException('year and month are required');
+    }
+    if (month < 1 || month > 12) {
+      throw new BadRequestException('month must be between 1 and 12');
+    }
+
+    // Use salary cycle instead of calendar month
+    const cycleRange = SalaryCycleUtil.getSalaryCycleDateRange(year, month);
+    const monthStart = cycleRange.start; // 25th of the month
+    const monthEnd = cycleRange.end; // 25th of next month (payable day calculation period)
+    const nextMonthStart = new Date(monthEnd);
+    nextMonthStart.setUTCDate(nextMonthStart.getUTCDate() + 1);
+    const cycleInfo = SalaryCycleUtil.getSalaryCycleForMonth(year, month);
+
+    const db = this.database.connection;
+
+    // Get user info
+    const [user] = await db
+      .select({
+        id: usersTable.id,
+        orgId: usersTable.orgId,
+        name: usersTable.name,
+        email: usersTable.email,
+        employmentType: usersTable.employmentType,
+        employmentStatus: usersTable.employmentStatus,
+        employeeDepartmentId: usersTable.employeeDepartmentId,
+      })
+      .from(usersTable)
+      .where(eq(usersTable.id, userId))
+      .limit(1);
+
+    if (!user || Number(user.orgId) !== orgId) {
+      throw new NotFoundException('User not found for this organisation');
+    }
+
+    // Get employee department name for teamName
+    let teamName = 'Not specified';
+    if (user.employeeDepartmentId) {
+      const [dept] = await db
+        .select({ name: departmentsTable.name })
+        .from(departmentsTable)
+        .where(eq(departmentsTable.id, user.employeeDepartmentId))
+        .limit(1);
+      if (dept) {
+        teamName = dept.name;
+      }
+    }
+
+    // Get timesheets for the cycle
+    const timesheets = await db
+      .select({
+        id: timesheetsTable.id,
+        workDate: timesheetsTable.workDate,
+        totalHours: timesheetsTable.totalHours,
+        state: timesheetsTable.state,
+      })
+      .from(timesheetsTable)
+      .where(
+        and(
+          eq(timesheetsTable.userId, userId),
+          eq(timesheetsTable.orgId, orgId),
+          gte(timesheetsTable.workDate, monthStart),
+          lt(timesheetsTable.workDate, nextMonthStart),
+          inArray(timesheetsTable.state, ['submitted', 'approved', 'locked'] as const),
+        ),
+      )
+      .orderBy(asc(timesheetsTable.workDate));
+
+    // Get leave requests for the cycle
+    const leaveRequests = await db
+      .select({
+        id: leaveRequestsTable.id,
+        startDate: leaveRequestsTable.startDate,
+        endDate: leaveRequestsTable.endDate,
+        hours: leaveRequestsTable.hours,
+        state: leaveRequestsTable.state,
+        durationType: leaveRequestsTable.durationType,
+        leaveTypeCode: leaveTypesTable.code,
+        leaveTypeName: leaveTypesTable.name,
+      })
+      .from(leaveRequestsTable)
+      .innerJoin(
+        leaveTypesTable,
+        eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id),
+      )
+      .where(
+        and(
+          eq(leaveRequestsTable.userId, userId),
+          eq(leaveRequestsTable.state, 'approved'),
+          lte(leaveRequestsTable.startDate, nextMonthStart),
+          gte(leaveRequestsTable.endDate, monthStart),
+        ),
+      );
+
+    // Get working day info for the cycle
+    const workingDayInfo = await this.getWorkingDayInfo(orgId, monthStart, monthEnd);
+
+    // Calculate metrics
+    let totalHours = 0;
+    let totalWorkingDays = 0;
+    let paidLeaves = 0;
+    let totalCompOffLeaveTaken = 0;
+    let weekOffDays = 0;
+    let numOfWorkOnWeekendDays = 0;
+    let lwpDays = 0;
+
+    const timesheetDates = new Set<string>();
+
+    // Process timesheets
+    for (const timesheet of timesheets) {
+      const workDate = this.normalizeDateUTC(new Date(timesheet.workDate));
+      const key = this.formatDateKey(workDate);
+      const hours = timesheet.totalHours ? Number(timesheet.totalHours) : 0;
+      
+      timesheetDates.add(key);
+      totalHours += hours;
+
+      const info = workingDayInfo.get(key);
+      if (info?.isWorkingDay) {
+        totalWorkingDays += 1;
+      } else if (info?.isWeekend || info?.isHoliday) {
+        // Work on weekend/holiday
+        numOfWorkOnWeekendDays += 1;
+      }
+    }
+
+    // Process leave requests
+    const leaveDates = new Map<string, { isLWP: boolean; isCompOff: boolean; isPaid: boolean }>();
+    
+    for (const request of leaveRequests) {
+      const requestStart = this.normalizeDateUTC(new Date(request.startDate));
+      const requestEnd = this.normalizeDateUTC(new Date(request.endDate));
+      const requestHours = request.hours ? Number(request.hours) : 0;
+
+      const windowStart = requestStart > monthStart ? requestStart : monthStart;
+      const windowEnd = requestEnd < monthEnd ? requestEnd : monthEnd;
+
+      if (windowEnd < windowStart) {
+        continue;
+      }
+
+      // Collect working days in this leave request
+      const dayKeys: string[] = [];
+      const cursor = new Date(windowStart);
+      while (cursor <= windowEnd) {
+        const key = this.formatDateKey(cursor);
+        const info = workingDayInfo.get(key);
+        if (info?.isWorkingDay && !timesheetDates.has(key)) {
+          dayKeys.push(key);
+        }
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+
+      if (dayKeys.length === 0) {
+        continue;
+      }
+
+      // Determine leave type
+      const isLWP = request.leaveTypeCode === 'lwp' || 
+                    request.leaveTypeName?.toLowerCase().includes('without pay');
+      const isCompOff = request.leaveTypeCode === 'comp_off' || 
+                       request.leaveTypeName?.toLowerCase().includes('comp off');
+      const isPaidLeave = !isLWP && !isCompOff;
+
+      // Count leave days (one day per working day covered)
+      const leaveDaysCount = dayKeys.length;
+
+      if (isLWP) {
+        lwpDays += leaveDaysCount;
+      } else if (isCompOff) {
+        totalCompOffLeaveTaken += leaveDaysCount;
+      } else if (isPaidLeave) {
+        paidLeaves += leaveDaysCount;
+      }
+
+      // Mark these dates as leave
+      for (const key of dayKeys) {
+        leaveDates.set(key, { isLWP, isCompOff, isPaid: isPaidLeave });
+      }
+    }
+
+    // Count week-off days in the cycle (weekends and holidays that are not working days)
+    const cursor = new Date(monthStart);
+    while (cursor <= monthEnd) {
+      const key = this.formatDateKey(cursor);
+      const info = workingDayInfo.get(key);
+      
+      // Count non-working days (weekends/holidays) that don't have timesheet entries
+      if (!info?.isWorkingDay && !timesheetDates.has(key)) {
+        weekOffDays += 1;
+      }
+      
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+
+    // Calculate total payable days progressively
+    // Start with week-off days, then add working days and paid leaves, subtract LWP
+    const totalPayableDays = weekOffDays + totalWorkingDays + paidLeaves + totalCompOffLeaveTaken - lwpDays;
+
+    // Calculate LWP (Leave Without Pay) - days not paid
+    const LWP = lwpDays;
+
+    return {
+      email: user.email,
+      name: user.name,
+      employmentType: user.employmentType || 'Not specified',
+      status: user.employmentStatus || 'not specified',
+      teamName,
+
+      cycleStartDate: cycleInfo.start.toISOString(),
+      cycleEndDate: cycleInfo.end.toISOString(),
+
+      totalHours,
+      totalWorkingDays,
+      paidLeaves,
+      totalCompOffLeaveTaken,
+      weekOffDays,
+      numOfWorkOnWeekendDays,
+
+      totalPayableDays,
+      LWP,
+    };
+  }
+
   private async countBackfilledDaysForMonth(
     orgId: number,
     userId: number,
@@ -1204,7 +1437,7 @@ export class TimesheetsService {
 
   /**
    * Get backfill allowance for the current salary cycle
-   * Lifelines reset on 26th at 7:01 AM of each month
+   * Lifelines reset on 25th at 7:00 AM of each month
    */
   private async getBackfillAllowanceForCycle(
     orgId: number,
