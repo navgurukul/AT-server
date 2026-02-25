@@ -167,15 +167,14 @@ export const userRoles = pgTable(
   {
     userId: integer("user_id")
       .notNull()
+      .primaryKey()
+      .unique()
       .references(() => users.id, { onDelete: "cascade" }),
     roleId: integer("role_id")
       .notNull()
       .references(() => roles.id, { onDelete: "cascade" }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
-  },
-  (table) => ({
-    pk: primaryKey({ columns: [table.userId, table.roleId] }),
-  })
+  }
 );
 
 export const permissions = pgTable("permissions", {
