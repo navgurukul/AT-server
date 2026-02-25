@@ -91,6 +91,9 @@ export class AuthService {
         .where(eq(usersTable.id, user.id));
     }
 
+    // Assign employee role if user doesn't have any roles
+    await this.assignEmployeeRoleIfNeeded(Number(user.id));
+
     let employeeDepartment:
       | {
           id: number;
@@ -276,6 +279,45 @@ export class AuthService {
     }
 
     return roleKeys;
+  }
+
+  private async assignEmployeeRoleIfNeeded(userId: number): Promise<void> {
+    const db = this.databaseService.connection;
+
+    // Check if user already has any roles
+    const existingRoles = await db
+      .select({ roleId: userRolesTable.roleId })
+      .from(userRolesTable)
+      .where(eq(userRolesTable.userId, userId));
+
+    if (existingRoles.length > 0) {
+      // User already has roles, no need to assign employee role
+      return;
+    }
+
+    // Get the employee role ID
+    const [employeeRole] = await db
+      .select({ id: rolesTable.id })
+      .from(rolesTable)
+      .where(eq(rolesTable.key, 'employee'));
+
+    if (!employeeRole) {
+      this.logger.warn('Employee role not found in database');
+      return;
+    }
+
+    // Assign employee role to user
+    try {
+      await db.insert(userRolesTable).values({
+        userId,
+        roleId: employeeRole.id,
+      });
+      this.logger.log(`Assigned employee role to user ${userId}`);
+    } catch (error) {
+      // If the assignment fails (e.g., duplicate key), just log and continue
+      // The user will still get 'employee' as a default role from getUserRoles
+      this.logger.warn(`Failed to assign employee role to user ${userId}: ${error instanceof Error ? error.message : error}`);
+    }
   }
 
   private async getUserPermissions(userId: number): Promise<string[]> {
