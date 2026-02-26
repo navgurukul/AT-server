@@ -276,8 +276,6 @@ async function importLeaveHistory(csvFilePath, limit = null, batchSize = 100) {
             }
           });
           
-          // Print available leave types for debugging
-          
           let totalSuccessCount = 0;
           let totalErrorCount = 0;
           const allErrors = [];
@@ -335,8 +333,9 @@ async function importLeaveHistory(csvFilePath, limit = null, batchSize = 100) {
   });
 }
 
-// Run the import with optional limit and batch size from command line arguments
+// Run the import with CSV file path and optional limit and batch size from command line arguments
 // Usage: node import-leave-history.mjs <csvFilePath> [limit] [batchSize]
+// Example: node import-leave-history.mjs leaveHistory1janto23feb.csv
 // Example: node import-leave-history.mjs leaveHistory1janto23feb.csv 10 5      (process only first 10 rows, 5 rows per batch)
 // Example: node import-leave-history.mjs Leave-Request-History.csv null 500    (process all rows, 500 rows per batch)
 // Example: node import-leave-history.mjs leaveHistory1janto23feb.csv 30        (process 30 rows, default 100 rows per batch)
