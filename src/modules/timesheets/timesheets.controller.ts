@@ -5,7 +5,9 @@ import {
   Get,
   Post,
   Query,
+  Res,
 } from '@nestjs/common';
+import { Response } from 'express';
 import { ApiQuery, ApiTags } from '@nestjs/swagger';
 
 import { Permissions } from '../../common/decorators/permissions.decorator';
@@ -80,42 +82,28 @@ export class TimesheetsController {
   }
 
   @Get('salary-summary')
-  @ApiQuery({ name: 'year', required: true })
-  @ApiQuery({ name: 'month', required: true })
-  @ApiQuery({ name: 'userId', required: false })
-  getSalarySummary(
-    @Query('year') year: string,
-    @Query('month') month: string,
-    @Query('userId') userId: string | undefined,
+  @ApiQuery({ name: 'startDate', required: false, description: 'Start date in ISO format (YYYY-MM-DD). If not provided, uses current salary cycle start (26th)' })
+  @ApiQuery({ name: 'endDate', required: false, description: 'End date in ISO format (YYYY-MM-DD). If not provided, uses current salary cycle end (25th)' })
+  @Permissions('timesheet:view')
+  async getSalarySummary(
+    @Query('startDate') startDate: string | undefined,
+    @Query('endDate') endDate: string | undefined,
     @CurrentUser() user: AuthenticatedUser | undefined,
+    @Res({ passthrough: true }) res: Response,
   ) {
     if (!user) {
       return null;
     }
 
-    const parsedYear = Number.parseInt(year, 10);
-    const parsedMonth = Number.parseInt(month, 10);
-    const parsedUserId = userId ? Number.parseInt(userId, 10) : user.id;
-
-    const targetUserId = Number.isNaN(parsedUserId) ? user.id : parsedUserId;
-
-    const canViewAll = user.permissions.includes('timesheet:view');
-    const canViewSelf = user.permissions.includes('timesheet:view:self');
-
-    if (targetUserId !== user.id && !canViewAll) {
-      throw new ForbiddenException('Missing required permission: timesheet:view');
-    }
-
-    if (targetUserId === user.id && !(canViewAll || canViewSelf)) {
-      throw new ForbiddenException('Missing required permission: timesheet:view');
-    }
-
-    return this.timesheetsService.getSalarySummary({
-      userId: targetUserId,
+    const result = await this.timesheetsService.getAllUsersSalarySummaryCSV({
       orgId: user.orgId,
-      year: parsedYear,
-      month: parsedMonth,
+      startDate,
+      endDate,
     });
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="salary-summary-${result.startDate}-to-${result.endDate}.csv"`);
+    return result.csv;
   }
 
   @Post()
