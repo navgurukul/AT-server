@@ -1,22 +1,24 @@
 /**
  * Salary Cycle Utility
  * 
- * Salary cycle runs from 26th of a month at 7:00 AM to 27th of the next month at 7:00 AM.
- * Payable day calculation: 26th to 25th (27th is only submission cutoff, not a working day).
+ * Salary cycle runs from 26th of a month at 7:00 AM to 25th of the next month at 7:00 AM.
+ * Payable day calculation: 26th to 25th of every month.
  */
 
 export interface SalaryCycleRange {
-  start: Date; // 25th at 7:00 AM
-  end: Date;   // 26th of next month at 7:00 AM
+  start: Date; // 26th at 7:00 AM
+  end: Date;   // 25th of next month at 7:00 AM
   year: number;
   month: number; // The month in which the cycle starts
-  cycleLabel: string; // e.g., "25 Jan 2026 - 25 Feb 2026"
+  cycleLabel: string; // e.g., "26 Jan 2026 - 25 Feb 2026"
 }
 
 export class SalaryCycleUtil {
   
-// Salary cycle day of month (26th)
-  private static readonly CYCLE_DAY = 26;
+// Salary cycle start day of month (26th)
+  private static readonly CYCLE_START_DAY = 26;
+  // Salary cycle end day of month (25th)
+  private static readonly CYCLE_END_DAY = 25;
 
   
 // Cycle start time: 7:00 AM
@@ -24,10 +26,9 @@ export class SalaryCycleUtil {
   private static readonly CYCLE_START_MINUTE = 0;
 
  
-// Cycle end time: 7:00 AM (on 27th of next month)
+// Cycle end time: 7:00 AM (on 25th of next month)
   private static readonly CYCLE_END_HOUR = 7;
   private static readonly CYCLE_END_MINUTE = 0;
-  private static readonly CYCLE_END_DAY = 27;
 
   /**
    * Get the current active salary cycle based on the given date
@@ -45,7 +46,7 @@ export class SalaryCycleUtil {
     let cycleStartMonth = month;
 
     // If we're before 26th at 7:00 AM, we're still in the previous cycle
-    if (day < this.CYCLE_DAY || (day === this.CYCLE_DAY && hour < this.CYCLE_START_HOUR)) {
+    if (day < this.CYCLE_START_DAY || (day === this.CYCLE_START_DAY && hour < this.CYCLE_START_HOUR)) {
       // Go back one month
       if (cycleStartMonth === 0) {
         cycleStartMonth = 11;
@@ -56,9 +57,9 @@ export class SalaryCycleUtil {
     }
 
     // Start: 26th at 7:00 AM of cycleStartMonth
-    const start = new Date(cycleStartYear, cycleStartMonth, this.CYCLE_DAY, this.CYCLE_START_HOUR, this.CYCLE_START_MINUTE, 0, 0);
+    const start = new Date(cycleStartYear, cycleStartMonth, this.CYCLE_START_DAY, this.CYCLE_START_HOUR, this.CYCLE_START_MINUTE, 0, 0);
 
-    // End: 27th at 7:00 AM of next month (submission cutoff)
+    // End: 25th at 7:00 AM of next month
     let cycleEndYear = cycleStartYear;
     let cycleEndMonth = cycleStartMonth + 1;
     if (cycleEndMonth > 11) {
@@ -89,9 +90,9 @@ export class SalaryCycleUtil {
     const cycleStartMonth = month - 1; // Convert to 0-indexed
 
     // Start: 26th at 7:00 AM
-    const start = new Date(year, cycleStartMonth, this.CYCLE_DAY, this.CYCLE_START_HOUR, this.CYCLE_START_MINUTE, 0, 0);
+    const start = new Date(year, cycleStartMonth, this.CYCLE_START_DAY, this.CYCLE_START_HOUR, this.CYCLE_START_MINUTE, 0, 0);
 
-    // End: 27th at 7:00 AM of next month (submission cutoff)
+    // End: 25th at 7:00 AM of next month
     let cycleEndYear = year;
     let cycleEndMonth = cycleStartMonth + 1;
     if (cycleEndMonth > 11) {
@@ -142,13 +143,12 @@ export class SalaryCycleUtil {
     
     // Normalize to UTC dates for database queries
     // Start: 26th of the cycle start month (inclusive)
-    const start = new Date(Date.UTC(cycle.start.getFullYear(), cycle.start.getMonth(), this.CYCLE_DAY));
+    const start = new Date(Date.UTC(cycle.start.getFullYear(), cycle.start.getMonth(), this.CYCLE_START_DAY));
     
-    // End: 25th of the next month (inclusive) - payable day calculation period
-    // Note: 27th is only submission cutoff, NOT a working/payable day
+    // End: 25th of the next month (inclusive)
     const endYear = cycle.end.getFullYear();
     const endMonth = cycle.end.getMonth();
-    const end = new Date(Date.UTC(endYear, endMonth, 25));
+    const end = new Date(Date.UTC(endYear, endMonth, this.CYCLE_END_DAY));
 
     return { start, end };
   }
@@ -168,23 +168,21 @@ export class SalaryCycleUtil {
   /**
    * Format cycle label for display
    * @param start - Cycle start date
-   * @param end - Cycle end date (we'll show day before)
+   * @param end - Cycle end date
    * @returns Formatted string like "26 Jan 2026 - 25 Feb 2026"
    */
   private static formatCycleLabel(start: Date, end: Date): string {
     const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     
+    // Start display is 26th
     const startDay = start.getDate();
     const startMonth = monthNames[start.getMonth()];
     const startYear = start.getFullYear();
 
-    // End display is 25th (payable days period), not 27th (which is only submission cutoff)
-    const displayEnd = new Date(end);
-    displayEnd.setDate(25); // Always show 25th as the last day
-    
-    const endDay = displayEnd.getDate();
-    const endMonth = monthNames[displayEnd.getMonth()];
-    const endYear = displayEnd.getFullYear();
+    // End display is 25th
+    const endDay = end.getDate();
+    const endMonth = monthNames[end.getMonth()];
+    const endYear = end.getFullYear();
 
     return `${startDay} ${startMonth} ${startYear} - ${endDay} ${endMonth} ${endYear}`;
   }
@@ -198,7 +196,7 @@ export class SalaryCycleUtil {
     const hour = now.getHours();
 
     // Check if we're exactly at or past 26th 7:00 AM
-    return day === this.CYCLE_DAY && hour >= this.CYCLE_START_HOUR;
+    return day === this.CYCLE_START_DAY && hour >= this.CYCLE_START_HOUR;
   }
 
   /**
