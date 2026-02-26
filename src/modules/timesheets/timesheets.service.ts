@@ -717,7 +717,7 @@ export class TimesheetsService {
     // Use salary cycle instead of calendar month
     // month parameter now represents the salary cycle starting month
     const cycleRange = SalaryCycleUtil.getSalaryCycleDateRange(year, month);
-    const monthStart = cycleRange.start; // 25th of the month
+    const monthStart = cycleRange.start; // 26th of the month
     const monthEnd = cycleRange.end; // 25th of next month (payable day period)
     const nextMonthStart = new Date(monthEnd);
     nextMonthStart.setUTCDate(nextMonthStart.getUTCDate() + 1);
@@ -944,7 +944,10 @@ export class TimesheetsService {
 
     let totalLeaveHours = 0;
 
-    for (const request of leaveRequests) {
+    // Only process approved leave requests for leave hours calculation
+    const approvedLeavesForHours = leaveRequests.filter(lr => lr.state === 'approved');
+
+    for (const request of approvedLeavesForHours) {
       const requestStart = this.normalizeDateUTC(new Date(request.startDate));
       const requestEnd = this.normalizeDateUTC(new Date(request.endDate));
 
@@ -1043,6 +1046,126 @@ export class TimesheetsService {
       return acc + hours;
     }, 0);
 
+    // Calculate payable metrics
+    let totalWorkingDays = 0;
+    let paidLeaves = 0;
+    let totalCompOffLeaveTaken = 0;
+    let weekOffDays = 0;
+    let numOfWorkOnWeekendDays = 0;
+    let lwpDays = 0;
+
+    const timesheetDates = new Set<string>();
+
+    // Process all timesheets for payable calculations (no status filter)
+    for (const timesheet of timesheets) {
+      const key = this.formatDateKey(timesheet.workDate);
+      timesheetDates.add(key);
+      
+      const info = workingDayInfo.get(key);
+      const hours = timesheet.totalHours ? Number(timesheet.totalHours) : 0;
+      
+      // Calculate payable days based on hours worked
+      let payableDays = 0;
+      if (hours < 3) {
+        payableDays = 0; // Less than 3 hours: not counted
+      } else if (hours >= 3 && hours < 6) {
+        payableDays = 0.5; // 3-5.99 hours: half day
+      } else if (hours >= 6) {
+        payableDays = 1; // 6+ hours: full day
+      }
+      
+      if (info?.isWorkingDay) {
+        totalWorkingDays += payableDays;
+      } else {
+        // Working on non-working day (weekend/holiday) for comp-off
+        numOfWorkOnWeekendDays += payableDays;
+      }
+    }
+
+    // Process leave requests for payable calculations (only approved leaves)
+    const leaveDatesPayable = new Map<string, { isLWP: boolean; isCompOff: boolean; isPaid: boolean; hours: number }>();
+    
+    const approvedLeaves = leaveRequests.filter(lr => lr.state === 'approved');
+
+    
+    for (const request of approvedLeaves) {
+      
+      const requestStart = new Date(request.startDate);
+      const requestEnd = new Date(request.endDate);
+      const windowStart = requestStart > monthStart ? requestStart : monthStart;
+      const windowEnd = requestEnd < nextMonthStart ? requestEnd : new Date(monthEnd);
+
+      const cursor = new Date(windowStart);
+      while (cursor <= windowEnd) {
+        const key = this.formatDateKey(cursor);
+        
+        const leaveTypeCode = request.leaveTypeCode?.toLowerCase() || '';
+        const isLWP = leaveTypeCode === 'lwp';
+        const isCompOff = leaveTypeCode === 'comp_off';
+        const isPaid = !isLWP && !isCompOff;
+
+        // Calculate hours for this specific day
+        let hoursForDay = HOURS_PER_WORKING_DAY;
+        if (request.durationType === 'half_day') {
+          hoursForDay = HALF_DAY_HOURS;
+        } else if (request.durationType === 'custom') {
+          const totalDays = Math.ceil(
+            (requestEnd.getTime() - requestStart.getTime()) / (1000 * 60 * 60 * 24)
+          ) + 1;
+          const requestHours = request.hours ? Number(request.hours) : HOURS_PER_WORKING_DAY;
+          hoursForDay = requestHours / totalDays;
+        }
+
+        if (!leaveDatesPayable.has(key)) {
+          leaveDatesPayable.set(key, { isLWP, isCompOff, isPaid, hours: hoursForDay });
+        }
+        
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+    }
+
+    // Count leave days (convert hours to days: 8 hours = 1 day, 4 hours = 0.5 day)
+    
+    for (const [dateKey, leaveType] of leaveDatesPayable.entries()) {
+      const info = workingDayInfo.get(dateKey);
+      
+      // Convert hours to days: 8 hours = 1 day, 4 hours = 0.5 day
+      let leaveDays = 0;
+      if (leaveType.hours >= 8) {
+        leaveDays = 1; // 8+ hours: full day
+      } else if (leaveType.hours >= 4) {
+        leaveDays = 0.5; // 4-7.99 hours: half day
+      } else {
+        leaveDays = 0; // Less than 4 hours: not counted
+      }
+      
+      if (leaveType.isLWP && info?.isWorkingDay) {
+        lwpDays += leaveDays;
+      } else if (leaveType.isCompOff) {
+        totalCompOffLeaveTaken += leaveDays;
+      } else if (leaveType.isPaid && info?.isWorkingDay) {
+        paidLeaves += leaveDays;
+      } else {
+      }
+    }
+
+    // Count week-off days (non-working days without timesheets or leaves)
+    const cursorWeekOff = new Date(monthStart);
+    while (cursorWeekOff <= monthEnd) {
+      const key = this.formatDateKey(cursorWeekOff);
+      const info = workingDayInfo.get(key);
+      
+      // Count non-working days that don't have timesheet entries or leaves
+      if (!info?.isWorkingDay && !timesheetDates.has(key) && !leaveDatesPayable.has(key)) {
+        weekOffDays++;
+      }
+      
+      cursorWeekOff.setUTCDate(cursorWeekOff.getUTCDate() + 1);
+    }
+
+    // Calculate total payable days
+    const totalPayableDays = weekOffDays + totalWorkingDays + paidLeaves + totalCompOffLeaveTaken - lwpDays;
+
     const days: Array<{
       date: string;
       isWorkingDay: boolean;
@@ -1136,6 +1259,13 @@ export class TimesheetsService {
         isSalaryCycle: true,
       },
       totals: {
+        totalHours: Number(totalTimesheetHours.toFixed(2)),
+        totalWorkingDays,
+        paidLeaves: Number(paidLeaves.toFixed(2)),
+        totalCompOffLeaveTaken: Number(totalCompOffLeaveTaken.toFixed(2)),
+        weekOffDays,
+        totalPayableDays: Number(totalPayableDays.toFixed(2)),
+        LWP: Number(lwpDays.toFixed(2)),
         timesheetHours: Number(totalTimesheetHours.toFixed(2)),
         leaveHours: Number(totalLeaveHours.toFixed(2)),
       },
@@ -1160,7 +1290,7 @@ export class TimesheetsService {
 
     // Use salary cycle instead of calendar month
     const cycleRange = SalaryCycleUtil.getSalaryCycleDateRange(year, month);
-    const monthStart = cycleRange.start; // 25th of the month
+    const monthStart = cycleRange.start; // 26th of the month
     const monthEnd = cycleRange.end; // 25th of next month (payable day calculation period)
     const nextMonthStart = new Date(monthEnd);
     nextMonthStart.setUTCDate(nextMonthStart.getUTCDate() + 1);
@@ -1437,7 +1567,7 @@ export class TimesheetsService {
 
   /**
    * Get backfill allowance for the current salary cycle
-   * Lifelines reset on 25th at 7:00 AM of each month
+   * Lifelines reset on 26th at 7:00 AM of each month
    */
   private async getBackfillAllowanceForCycle(
     orgId: number,
