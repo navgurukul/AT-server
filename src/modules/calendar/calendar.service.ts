@@ -49,6 +49,7 @@ export class CalendarService {
       .select({
         date: orgHolidaysTable.date,
         isWorkingDay: orgHolidaysTable.isWorkingDay,
+        name: orgHolidaysTable.name,
       })
       .from(orgHolidaysTable)
       .where(
@@ -59,11 +60,11 @@ export class CalendarService {
         )
       );
 
-    const map = new Map<string, { isWorkingDay: boolean }>();
+    const map = new Map<string, { isWorkingDay: boolean; name: string | null }>();
     for (const row of rows) {
       const date = new Date(row.date as unknown as string | Date);
       const key = this.formatDateKey(date);
-      map.set(key, { isWorkingDay: !!row.isWorkingDay });
+      map.set(key, { isWorkingDay: !!row.isWorkingDay, name: row.name ?? null });
     }
 
     return map;

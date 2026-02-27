@@ -1141,6 +1141,7 @@ export class TimesheetsService {
       isWorkingDay: boolean;
       isWeekend: boolean;
       isHoliday: boolean;
+      holidayName: string | null;
       timesheet:
         | ({
             id: number;
@@ -1198,6 +1199,7 @@ export class TimesheetsService {
         isWorkingDay: info?.isWorkingDay ?? false,
         isWeekend: info?.isWeekend ?? false,
         isHoliday: info?.isHoliday ?? false,
+        holidayName: info?.holidayName ?? null,
         timesheet,
         leaves: leaveInfo
           ? {
@@ -2119,7 +2121,7 @@ export class TimesheetsService {
   ): Promise<
     Map<
       string,
-      { isWorkingDay: boolean; isHoliday: boolean; isWeekend: boolean }
+      { isWorkingDay: boolean; isHoliday: boolean; isWeekend: boolean; holidayName: string | null }
     >
   > {
     const normalizedStart = this.normalizeDateUTC(start);
@@ -2137,7 +2139,7 @@ export class TimesheetsService {
 
     const info = new Map<
       string,
-      { isWorkingDay: boolean; isHoliday: boolean; isWeekend: boolean }
+      { isWorkingDay: boolean; isHoliday: boolean; isWeekend: boolean; holidayName: string | null }
     >();
 
     const cursor = new Date(normalizedStart);
@@ -2152,11 +2154,13 @@ export class TimesheetsService {
       const defaultWorking = !(isSunday || isSecondFourthSaturday);
       const isWorkingDay = override ? override.isWorkingDay : defaultWorking;
       const isHoliday = override ? !override.isWorkingDay : false;
+      const holidayName = override && !override.isWorkingDay ? override.name : null;
 
       info.set(key, {
         isWorkingDay,
         isHoliday,
         isWeekend: isSunday || isSaturday,
+        holidayName,
       });
 
       cursor.setUTCDate(cursor.getUTCDate() + 1);
