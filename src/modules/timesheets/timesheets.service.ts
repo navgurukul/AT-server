@@ -1191,10 +1191,8 @@ export class TimesheetsService {
     while (cursor <= monthEnd) {
       const key = this.formatDateKey(cursor);
       const info = workingDayInfo.get(key);
-      console.log("11111111", info);
       const timesheet = timesheetMap.get(key) ?? null;
       const leaveInfo = leaveDaily.get(key) ?? null;
-      console.log("33333333", leaveInfo);
 
       days.push({
         date: key,
