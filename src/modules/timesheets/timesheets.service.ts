@@ -954,10 +954,9 @@ export class TimesheetsService {
     const timesheetDates = new Set<string>();
     const leaveDates = new Map<string, { isLWP: boolean; isCompOff: boolean; isPaid: boolean }>();
 
-    // Only process approved leave requests for leave hours calculation
-    const approvedLeavesForHours = leaveRequests.filter(lr => lr.state === 'approved');
-
-    for (const request of approvedLeavesForHours) {
+    // Process all leave requests to include them in the response
+    // But only count approved leaves towards payable days
+    for (const request of leaveRequests) {
       const requestStart = this.normalizeDateUTC(new Date(request.startDate));
       const requestEnd = this.normalizeDateUTC(new Date(request.endDate));
 
@@ -1003,6 +1002,7 @@ export class TimesheetsService {
       const isApproved = request.state === 'approved';
       const leaveDaysCount = requestHours / HOURS_PER_WORKING_DAY;
 
+      // Only count approved leaves towards payable days
       if (isApproved) {
         if (isLWP) {
           lwpDays += leaveDaysCount;
@@ -1037,8 +1037,10 @@ export class TimesheetsService {
           totalLeaveHours += hoursForDay;
         }
 
-        // Mark these dates as leave
-        leaveDates.set(key, { isLWP, isCompOff, isPaid: isPaidLeave });
+        // Mark these dates as leave (only for approved leaves)
+        if (isApproved) {
+          leaveDates.set(key, { isLWP, isCompOff, isPaid: isPaidLeave });
+        }
 
         const bucket =
           leaveDaily.get(key) ??
@@ -1061,7 +1063,12 @@ export class TimesheetsService {
             }>;
           });
 
-        bucket.totalHours += hoursForDay;
+        // Only add hours to bucket total for approved leaves
+        if (isApproved) {
+          bucket.totalHours += hoursForDay;
+        }
+        
+        // Always add the entry to show in response (including pending/rejected)
         bucket.entries.push({
           requestId: request.id,
           state: request.state,
