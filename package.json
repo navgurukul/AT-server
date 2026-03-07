@@ -24,6 +24,7 @@
     "@nestjs/swagger": "^7.3.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
+    "csv-parse": "^6.1.0",
     "dotenv": "^17.2.3",
     "drizzle-orm": "^0.44.6",
     "google-auth-library": "^9.14.1",
