@@ -26,17 +26,13 @@ export class NotifyController {
 
   @Post('dispatch')
   @Permissions('notifications:preview')
-  dispatch(
-    @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit: number,
-  ) {
-    return this.notifyService.dispatchPendingSlack(limit);
+  dispatch() {
+    return this.notifyService.dispatchPendingSlack();
   }
 
   @Post('dispatch-discord')
   @Public()
-  dispatchDiscord(
-    @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit: number,
-  ) {
-    return this.notifyService.dispatchPendingDiscord(limit);
+  dispatchDiscord() {
+    return this.notifyService.dispatchPendingDiscord();
   }
 }

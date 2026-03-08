@@ -53,14 +53,15 @@ export class NotifyService {
   async handleDailyNotificationDispatch() {
     this.logger.log('Running daily notification dispatch at 9:00 AM IST');
     try {
-      const result = await this.dispatchPendingSlack(100);
-      this.logger.log(`Daily dispatch completed: ${result.processed} notifications processed`);
+      const slackResult = await this.dispatchPendingSlack();
+      const discordResult = await this.dispatchPendingDiscord();
+      this.logger.log(`Daily dispatch completed: ${slackResult.processed} Slack + ${discordResult.processed} Discord notifications processed`);
     } catch (error) {
       this.logger.error(`Daily dispatch failed: ${error}`);
     }
   }
 
-  async dispatchPendingSlack(limit = 50) {
+  async dispatchPendingSlack() {
     const db = this.database.connection;
     const token = this.configService.get<string>("SLACK_BOT_TOKEN");
     if (!token) {
@@ -76,8 +77,7 @@ export class NotifyService {
           eq(notificationsTable.state, "pending")
         )
       )
-      .orderBy(asc(notificationsTable.createdAt))
-      .limit(limit);
+      .orderBy(asc(notificationsTable.createdAt));
 
     const results: Array<{
       id: number;
@@ -263,7 +263,7 @@ export class NotifyService {
     return { processed: results.length, results };
   }
 
-  async dispatchPendingDiscord(limit = 50) {
+  async dispatchPendingDiscord() {
     const db = this.database.connection;
     const webhookUrlEnv = this.configService.get<string>("DISCORD_WEBHOOK_URL");
 
@@ -276,8 +276,7 @@ export class NotifyService {
           eq(notificationsTable.state, "pending")
         )
       )
-      .orderBy(asc(notificationsTable.createdAt))
-      .limit(limit);
+      .orderBy(asc(notificationsTable.createdAt));
 
     // Check if we have any pending notifications - if none, return early
     this.logger.log(`Discord dispatch: Found ${pending.length} pending notifications`);
