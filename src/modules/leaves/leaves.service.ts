@@ -657,6 +657,7 @@ export class LeavesService {
 
     const notificationPayload = {
       type: "leave_request",
+      leaveId: request.id,
       startDate,
       endDate,
       durationType: requestedDurationType,
@@ -2078,254 +2079,106 @@ export class LeavesService {
    */
   async queueDailyLeaveNotifications() {
     const db = this.database.connection;
-    const today = this.normalizeDateUTC(new Date());
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
-    // Special leave types that should only notify once (on start date)
-    const singleNotificationLeaveTypes = ['MATERNITY', 'PARENTAL', 'PATERNITY'];
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
 
-    // 1. Find leaves active TODAY (startDate <= today AND endDate >= today AND state = approved)
+    // Today's leaves
     const todaysLeaves = await db
-      .select({
-        leaveId: leaveRequestsTable.id,
-        userId: leaveRequestsTable.userId,
-        orgId: leaveRequestsTable.orgId,
-        leaveTypeCode: leaveTypesTable.code,
-        leaveTypeName: leaveTypesTable.name,
-        userName: usersTable.name,
-        userSlackId: usersTable.slackId,
-        userDiscordId: usersTable.discordId,
-        startDate: leaveRequestsTable.startDate,
-        endDate: leaveRequestsTable.endDate,
-        durationType: leaveRequestsTable.durationType,
-        halfDaySegment: leaveRequestsTable.halfDaySegment,
-        reason: leaveRequestsTable.reason,
-        createdAt: leaveRequestsTable.createdAt,
-        updatedAt: leaveRequestsTable.updatedAt,
-      })
+      .select()
       .from(leaveRequestsTable)
-      .innerJoin(usersTable, eq(leaveRequestsTable.userId, usersTable.id))
-      .innerJoin(leaveTypesTable, eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id))
       .where(
         and(
-          eq(leaveRequestsTable.state, 'approved'),
           lte(leaveRequestsTable.startDate, today),
-          gte(leaveRequestsTable.endDate, today)
+          gte(leaveRequestsTable.endDate, today),
+          eq(leaveRequestsTable.state, 'approved')
         )
       );
 
-    // 2. Find leaves approved in last 24 hours that ENDED before today (for late applications)
+    // Recently approved past leaves
     const recentlyApprovedPastLeaves = await db
-      .select({
-        leaveId: leaveRequestsTable.id,
-        userId: leaveRequestsTable.userId,
-        orgId: leaveRequestsTable.orgId,
-        leaveTypeCode: leaveTypesTable.code,
-        leaveTypeName: leaveTypesTable.name,
-        userName: usersTable.name,
-        userSlackId: usersTable.slackId,
-        userDiscordId: usersTable.discordId,
-        startDate: leaveRequestsTable.startDate,
-        endDate: leaveRequestsTable.endDate,
-        durationType: leaveRequestsTable.durationType,
-        halfDaySegment: leaveRequestsTable.halfDaySegment,
-        reason: leaveRequestsTable.reason,
-        createdAt: leaveRequestsTable.createdAt,
-        updatedAt: leaveRequestsTable.updatedAt,
-      })
+      .select()
       .from(leaveRequestsTable)
-      .innerJoin(usersTable, eq(leaveRequestsTable.userId, usersTable.id))
-      .innerJoin(leaveTypesTable, eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id))
       .where(
         and(
+          lt(leaveRequestsTable.startDate, today),
           eq(leaveRequestsTable.state, 'approved'),
-          gte(leaveRequestsTable.updatedAt, yesterday),
-          lt(leaveRequestsTable.endDate, today)
+          gte(leaveRequestsTable.updatedAt, fiveMinutesAgo)
         )
       );
 
-    const allLeaves = [...todaysLeaves, ...recentlyApprovedPastLeaves];
+    // Remove duplicates by id
+    const allLeaves = Array.from(
+      new Map(
+        [...todaysLeaves, ...recentlyApprovedPastLeaves].map(l => [l.id, l])
+      ).values()
+    );
 
     for (const leave of allLeaves) {
-      try {
-        // Check if this is a special leave type that should only notify once
-        const isSpecialLeave = singleNotificationLeaveTypes.includes(leave.leaveTypeCode.toUpperCase());
-        const isStartDate = this.isSameDate(leave.startDate, today);
-        const isRecentlyApproved = (leave.updatedAt ?? leave.createdAt ?? new Date(0)) >= yesterday;
-        const isPastLeave = leave.endDate < today;
+      const payload = {
+        leaveId: leave.id,
+        userId: leave.userId,
+        leaveTypeId: leave.leaveTypeId,
+        startDate: leave.startDate,
+        endDate: leave.endDate,
+        reason: leave.reason
+      };
 
-        // For special leaves, only notify on start date OR if recently approved (catch-up)
-        if (isSpecialLeave && !isStartDate && !isRecentlyApproved) {
-          continue;
-        }
-
-        // Check if notification already sent today for this leave
-        const existingNotification = await db
-          .select()
-          .from(notificationsTable)
-          .where(
-            and(
-              eq(notificationsTable.template, 'leave_request'),
-              sql`${notificationsTable.payload}->>'leaveId' = ${leave.leaveId.toString()}`,
-              gte(notificationsTable.createdAt, today)
-            )
+      // check slack notification
+      const slackExists = await db
+        .select()
+        .from(notificationsTable)
+        .where(
+          and(
+            eq(notificationsTable.template, 'leave_request'),
+            eq(notificationsTable.channel, 'slack'),
+            sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
+            gte(notificationsTable.createdAt, today)
           )
-          .limit(1);
+        )
+        .limit(1);
 
-        if (existingNotification.length > 0) {
-          continue; // Already notified today
-        }
-
-        // Find last valid working DATE BEFORE leave start date
-        const projects = await db
-          .select({
-            projectId: projectsTable.id,
-            projectName: projectsTable.name,
-            workDate: timesheetsTable.workDate,
-            slackChannelId: projectsTable.slackChannelId,
-            discordChannelId: projectsTable.discordChannelId,
-            projectManagerName: usersTable.name,
-            projectManagerSlackId: usersTable.slackId,
-            projectManagerDiscordId: usersTable.discordId,
-          })
-          .from(timesheetsTable)
-          .innerJoin(
-            timesheetEntriesTable,
-            eq(timesheetsTable.id, timesheetEntriesTable.timesheetId)
+      // check discord notification
+      const discordExists = await db
+        .select()
+        .from(notificationsTable)
+        .where(
+          and(
+            eq(notificationsTable.template, 'leave_request'),
+            eq(notificationsTable.channel, 'discord'),
+            sql`${notificationsTable.payload}->>'leaveId' = ${leave.id.toString()}`,
+            gte(notificationsTable.createdAt, today)
           )
-          .innerJoin(
-            projectsTable,
-            eq(timesheetEntriesTable.projectId, projectsTable.id)
-          )
-          .innerJoin(
-            usersTable,
-            eq(projectsTable.projectManagerId, usersTable.id)
-          )
-          .where(
-            and(
-              eq(timesheetsTable.userId, leave.userId),
-              eq(timesheetsTable.orgId, leave.orgId),
-              lt(timesheetsTable.workDate, leave.startDate),
-              or(
-                isNotNull(projectsTable.slackChannelId),
-                isNotNull(projectsTable.discordChannelId)
-              )
-            )
-          )
-          .orderBy(desc(timesheetsTable.workDate))
-          .limit(50); // Get enough projects to filter through weekends/holidays
+        )
+        .limit(1);
 
-        if (projects.length === 0) {
-          continue;
-        }
+      const notificationsToInsert = [];
 
-        // Find the last valid working DATE (skip weekends, holidays)
-        let lastValidWorkDate: Date | null = null;
-        for (const project of projects) {
-          const workDate = new Date(project.workDate);
-          const dayOfWeek = workDate.getUTCDay(); // 0 = Sunday, 6 = Saturday
-          
-          // Skip Saturday (6) and Sunday (0)
-          if (dayOfWeek === 0 || dayOfWeek === 6) {
-            continue;
-          }
-          
-          // Check if it's a holiday or festival leave day
-          try {
-            const dayInfo = await this.calendarService.getDayInfo(leave.orgId, workDate);
-            if (dayInfo.isHoliday) {
-              continue; // Skip festival/holiday days
-            }
-          } catch (error) {
-            // If calendar check fails, continue with this date
-          }
-          
-          // Found the last valid working date
-          lastValidWorkDate = workDate;
-          break;
-        }
-
-        if (!lastValidWorkDate) {
-          continue;
-        }
-
-        // Get ALL projects from that last valid working date (excluding filtered projects)
-        const validProjects = projects.filter(project => {
-          const workDate = new Date(project.workDate);
-          
-          // Must be from the last valid working date
-          if (workDate.getTime() !== lastValidWorkDate.getTime()) {
-            return false;
-          }
-          
-          // Skip Learning Saturday project
-          if (project.projectName && project.projectName.toLowerCase().includes('learning saturday')) {
-            return false;
-          }
-          
-          return true;
+      if (slackExists.length === 0) {
+        notificationsToInsert.push({
+          orgId: leave.orgId,
+          channel: 'slack' as const,
+          toRef: {},
+          template: 'leave_request' as const,
+          payload,
+          state: 'pending' as const
         });
+      }
 
-        if (validProjects.length === 0) {
-          continue;
-        }
+      if (discordExists.length === 0) {
+        notificationsToInsert.push({
+          orgId: leave.orgId,
+          channel: 'discord' as const,
+          toRef: {},
+          template: 'leave_request' as const,
+          payload,
+          state: 'pending' as const
+        });
+      }
 
-        // Deduplicate by projectId
-        const uniqueProjects = Array.from(
-          new Map(validProjects.map(p => [p.projectId, p])).values()
-        );
-
-        // Queue notifications for ALL projects from the last valid working day
-        for (const project of uniqueProjects) {
-          // Prepare notification payload
-          const notificationPayload = {
-            type: 'leave_request',
-            leaveId: leave.leaveId,
-            userId: leave.userId,
-            userName: leave.userName,
-            userSlackId: leave.userSlackId,
-            userDiscordId: leave.userDiscordId,
-            leaveTypeName: leave.leaveTypeName,
-            startDate: leave.startDate,
-            endDate: leave.endDate,
-            durationType: leave.durationType,
-            halfDaySegment: leave.halfDaySegment,
-            reason: leave.reason,
-            isPastLeave, 
-            projectId: project.projectId,
-            projectName: project.projectName,
-            projectManagerName: project.projectManagerName,
-            projectManagerSlackId: project.projectManagerSlackId,
-            projectManagerDiscordId: project.projectManagerDiscordId,
-          };
-
-          // Queue Slack notification
-          if (project.slackChannelId) {
-            await db.insert(notificationsTable).values({
-              orgId: leave.orgId,
-              channel: 'slack',
-              toRef: { channelId: project.slackChannelId },
-              template: 'leave_request',
-              payload: notificationPayload,
-              state: 'pending',
-            });
-          }
-
-          // Queue Discord notification
-          if (project.discordChannelId) {
-            await db.insert(notificationsTable).values({
-              orgId: leave.orgId,
-              channel: 'discord',
-              toRef: { webhookUrl: project.discordChannelId },
-              template: 'leave_request',
-              payload: notificationPayload,
-              state: 'pending',
-            });
-          }
-        }
-
-      } catch (error) {
+      if (notificationsToInsert.length > 0) {
+        await db.insert(notificationsTable).values(notificationsToInsert);
       }
     }
 
