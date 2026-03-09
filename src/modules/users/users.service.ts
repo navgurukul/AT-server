@@ -39,6 +39,41 @@ export interface ManagerRoleSyncResult {
 export class UsersService {
   constructor(private readonly database: DatabaseService) {}
 
+  async findUserByEmailInOrg(params: { email: string; orgId: number }) {
+    const email = params.email.trim().toLowerCase();
+
+    if (!email) {
+      throw new BadRequestException('email is required');
+    }
+
+    const [user] = await this.database.connection
+      .select({
+        id: usersTable.id,
+        orgId: usersTable.orgId,
+        email: usersTable.email,
+        managerId: usersTable.managerId,
+      })
+      .from(usersTable)
+      .where(
+        and(
+          eq(usersTable.orgId, params.orgId),
+          ilike(usersTable.email, email),
+        ),
+      )
+      .limit(1);
+
+    if (!user) {
+      throw new NotFoundException('Employee not found for this organisation');
+    }
+
+    return {
+      id: Number(user.id),
+      orgId: Number(user.orgId),
+      email: user.email,
+      managerId: user.managerId !== null && user.managerId !== undefined ? Number(user.managerId) : null,
+    };
+  }
+
   async searchUsers(params: SearchUsersParams) {
     const db = this.database.connection;
     const limit = params.limit && params.limit > 0 ? params.limit : 25;
@@ -978,5 +1013,63 @@ export class UsersService {
 
   private generatePlaceholderPassword(seed: string): string {
     return createHash('sha256').update(`navtrack:${seed}`).digest('hex');
+  }
+
+  async updateUserRole(
+    userId: number,
+    role: 'super_admin' | 'admin' | 'employee',
+  ) {
+    const db = this.database.connection;
+
+    // Check if user exists
+    const [user] = await db
+      .select({ id: usersTable.id, name: usersTable.name, email: usersTable.email })
+      .from(usersTable)
+      .where(eq(usersTable.id, userId))
+      .limit(1);
+
+    if (!user) {
+      throw new NotFoundException(`User with id ${userId} not found`);
+    }
+
+    // Check if role exists
+    const [roleRecord] = await db
+      .select({ id: rolesTable.id, key: rolesTable.key, name: rolesTable.name })
+      .from(rolesTable)
+      .where(eq(rolesTable.key, role))
+      .limit(1);
+
+    if (!roleRecord) {
+      throw new NotFoundException(`Role '${role}' not found`);
+    }
+
+    // Update the primary role in users table
+    await db
+      .update(usersTable)
+      .set({ rolePrimary: role, updatedAt: new Date() })
+      .where(eq(usersTable.id, userId));
+
+    // Delete existing user roles
+    await db.delete(userRolesTable).where(eq(userRolesTable.userId, userId));
+
+    // Assign new role in user_roles table
+    await db.insert(userRolesTable).values({
+      userId,
+      roleId: roleRecord.id,
+    });
+
+    return {
+      success: true,
+      message: `User role updated successfully`,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+      },
+      role: {
+        key: roleRecord.key,
+        name: roleRecord.name,
+      },
+    };
   }
 }
