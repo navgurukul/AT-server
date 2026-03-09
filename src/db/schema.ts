@@ -311,6 +311,7 @@ export const timesheetEntries = pgTable("timesheet_entries", {
   taskDescription: text("task_description"),
   hoursDecimal: numeric("hours_decimal", { precision: 5, scale: 2 }).notNull(),
   tags: jsonb("tags").$type<string[]>().notNull().default([]),
+  status: varchar("status", { length: 50 }).notNull().default("approved"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });

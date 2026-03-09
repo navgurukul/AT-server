@@ -429,18 +429,14 @@ export class LeavesService {
 
       switch (payload.durationType) {
         case "half_day":
-          if (workingDays !== 1) {
-            throw new BadRequestException(
-              "Half-day requests must span a single working day"
-            );
-          }
           if (!payload.halfDaySegment) {
             throw new BadRequestException(
               "Half-day requests must specify whether it is the first or second half"
             );
           }
           requestedDurationType = "half_day";
-          requestedHours = HALF_DAY_HOURS;
+          // Apply half-day hours to each working day in the range
+          requestedHours = workingDays * HALF_DAY_HOURS;
           requestedHalfDaySegment = payload.halfDaySegment;
           break;
         case "full_day":
@@ -517,18 +513,14 @@ export class LeavesService {
 
       // Check for actual conflicts
       for (const existing of overlappingRequests) {
-        // If current request is half-day and existing is also half-day on the same single date
+        // If both current and existing requests are half-day with different segments, they can coexist
         if (
           requestedDurationType === "half_day" &&
           existing.durationType === "half_day" &&
-          this.isSameDate(startDate, endDate) &&
-          this.isSameDate(existing.startDate, existing.endDate) &&
-          this.isSameDate(startDate, existing.startDate)
+          requestedHalfDaySegment !== existing.halfDaySegment
         ) {
-          // Allow if segments are different (first_half vs second_half)
-          if (requestedHalfDaySegment !== existing.halfDaySegment) {
-            continue; 
-          }
+          // No conflict - different half-day segments can coexist
+          continue; 
         }
         
         // Any other overlap is a conflict

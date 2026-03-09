@@ -134,7 +134,12 @@ export class TimesheetsService {
               updatedAt: timesheetEntriesTable.updatedAt,
             })
             .from(timesheetEntriesTable)
-            .where(inArray(timesheetEntriesTable.timesheetId, timesheetIds))
+            .where(
+              and(
+                inArray(timesheetEntriesTable.timesheetId, timesheetIds),
+                eq(timesheetEntriesTable.status, 'approved'),
+              ),
+            )
             .orderBy(asc(timesheetEntriesTable.id));
 
     const entriesByTimesheet = entries.reduce<Record<number, typeof entries>>(
@@ -376,13 +381,18 @@ export class TimesheetsService {
     }
 
     if (existing) {
-      // Get ALL existing hours for this timesheet
+      // Get ALL existing hours for this timesheet (only approved entries)
       const [{ totalHours: allExistingHours }] = await db
         .select({
           totalHours: sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
         })
         .from(timesheetEntriesTable)
-        .where(eq(timesheetEntriesTable.timesheetId, existing.id));
+        .where(
+          and(
+            eq(timesheetEntriesTable.timesheetId, existing.id),
+            eq(timesheetEntriesTable.status, 'approved'),
+          ),
+        );
 
       const combinedHours =
         Number(allExistingHours ?? 0) + Number(totalHoursForDay ?? 0);
@@ -478,6 +488,7 @@ export class TimesheetsService {
             taskDescription: entry.taskDescription ?? null,
             hoursDecimal: entry.hours.toString(),
             tags: entry.tags ?? [],
+            status: 'approved',
             createdAt: now,
             updatedAt: now,
           })),
@@ -489,7 +500,12 @@ export class TimesheetsService {
           totalHours: sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
         })
         .from(timesheetEntriesTable)
-        .where(eq(timesheetEntriesTable.timesheetId, timesheetId));
+        .where(
+          and(
+            eq(timesheetEntriesTable.timesheetId, timesheetId),
+            eq(timesheetEntriesTable.status, 'approved'),
+          ),
+        );
 
       const [storedTimesheet] = await tx
         .update(timesheetsTable)
@@ -528,7 +544,12 @@ export class TimesheetsService {
           updatedAt: timesheetEntriesTable.updatedAt,
         })
         .from(timesheetEntriesTable)
-        .where(eq(timesheetEntriesTable.timesheetId, timesheetId))
+        .where(
+          and(
+            eq(timesheetEntriesTable.timesheetId, timesheetId),
+            eq(timesheetEntriesTable.status, 'approved'),
+          ),
+        )
         .orderBy(asc(timesheetEntriesTable.id));
 
       // If this is a new backfill entry, increment usage counters for the salary cycle.
@@ -774,6 +795,7 @@ export class TimesheetsService {
               id: timesheetEntriesTable.id,
               timesheetId: timesheetEntriesTable.timesheetId,
               projectId: timesheetEntriesTable.projectId,
+              status: timesheetEntriesTable.status,
               projectName: projectsTable.name,
               departmentId: departmentsTable.id,
               departmentName: departmentsTable.name,
@@ -793,7 +815,15 @@ export class TimesheetsService {
               departmentsTable,
               eq(departmentsTable.id, projectsTable.departmentId),
             )
-            .where(inArray(timesheetEntriesTable.timesheetId, timesheetIds))
+            .where(
+              and(
+                inArray(timesheetEntriesTable.timesheetId, timesheetIds),
+                or(
+                  eq(timesheetEntriesTable.status, 'approved'),
+                  isNull(timesheetEntriesTable.status),
+                ),
+              ),
+            )
             .orderBy(asc(timesheetEntriesTable.id));
 
     const entriesByTimesheet = new Map<
@@ -814,6 +844,10 @@ export class TimesheetsService {
     >();
 
     for (const entry of entryRows) {
+      if (entry.status === 'rejected') {
+        continue;
+      }
+
       const bucket =
         entriesByTimesheet.get(entry.timesheetId) ??
         ([] as Array<{
@@ -879,10 +913,11 @@ export class TimesheetsService {
     for (const row of timesheets) {
       const workDate = new Date(row.workDate);
       const key = this.formatDateKey(workDate);
+      const approvedEntries = entriesByTimesheet.get(row.id) ?? [];
       timesheetMap.set(key, {
         id: row.id,
         state: row.state,
-        totalHours: row.totalHours ? Number(row.totalHours) : 0,
+        totalHours: approvedEntries.reduce((sum, item) => sum + (item.hours ?? 0), 0),
         notes: row.notes ?? null,
         submittedAt: row.submittedAt ? new Date(row.submittedAt) : null,
         approvedAt: row.approvedAt ? new Date(row.approvedAt) : null,
@@ -890,7 +925,7 @@ export class TimesheetsService {
         lockedAt: row.lockedAt ? new Date(row.lockedAt) : null,
         createdAt: row.createdAt ? new Date(row.createdAt) : null,
         updatedAt: row.updatedAt ? new Date(row.updatedAt) : null,
-        entries: entriesByTimesheet.get(row.id) ?? [],
+        entries: approvedEntries,
       });
     }
 
@@ -983,12 +1018,13 @@ export class TimesheetsService {
       }
 
       const requestHours = request.hours ? Number(request.hours) : 0;
-      const perDayHours =
-        request.durationType === 'half_day' || dayKeys.length === 0
-          ? 0
-          : requestHours / dayKeys.length;
-
-      let halfDayAssigned = false;
+      const totalRequestHours =
+        requestHours > 0
+          ? requestHours
+          : request.durationType === 'half_day'
+            ? dayKeys.length * HALF_DAY_HOURS
+            : dayKeys.length * HOURS_PER_WORKING_DAY;
+      const perDayHours = dayKeys.length === 0 ? 0 : totalRequestHours / dayKeys.length;
 
       // Determine leave type for day counting
       const isLWP = request.leaveTypeCode === 'lwp' || 
@@ -1000,7 +1036,12 @@ export class TimesheetsService {
       // Count leave days based on actual hours, not just day count
       // Full day = 8 hours, Half day = 4 hours
       const isApproved = request.state === 'approved';
-      const leaveDaysCount = requestHours / HOURS_PER_WORKING_DAY;
+      const leaveDaysCount =
+        requestHours > 0
+          ? requestHours / HOURS_PER_WORKING_DAY
+          : request.durationType === 'half_day'
+            ? dayKeys.length * 0.5
+            : dayKeys.length;
 
       // Only count approved leaves towards payable days
       if (isApproved) {
@@ -1014,19 +1055,7 @@ export class TimesheetsService {
       }
 
       for (const key of dayKeys) {
-        let hoursForDay: number;
-
-        if (request.durationType === 'half_day') {
-          if (halfDayAssigned) {
-            continue;
-          }
-          const halfDayHours =
-            requestHours > 0 ? requestHours : HALF_DAY_HOURS;
-          hoursForDay = halfDayHours;
-          halfDayAssigned = true;
-        } else {
-          hoursForDay = perDayHours;
-        }
+        const hoursForDay = perDayHours;
 
         if (hoursForDay <= 0) {
           continue;
@@ -1458,7 +1487,7 @@ export class TimesheetsService {
       if (requestHours > 0) {
         leaveDaysCount = requestHours / HOURS_PER_WORKING_DAY;
       } else if (request.durationType === 'half_day') {
-        leaveDaysCount = 0.5;
+        leaveDaysCount = dayKeys.length * 0.5;
       } else {
         leaveDaysCount = dayKeys.length;
       }
@@ -1475,7 +1504,7 @@ export class TimesheetsService {
       if (requestHours > 0) {
         totalLeaveHours += requestHours;
       } else if (request.durationType === 'half_day') {
-        totalLeaveHours += HALF_DAY_HOURS;
+        totalLeaveHours += dayKeys.length * HALF_DAY_HOURS;
       } else {
         totalLeaveHours += dayKeys.length * HOURS_PER_WORKING_DAY;
       }
@@ -2179,6 +2208,255 @@ export class TimesheetsService {
   private isSecondOrFourthSaturday(date: Date): boolean {
     const occurrence = Math.ceil(date.getUTCDate() / 7);
     return occurrence === 2 || occurrence === 4;
+  }
+
+  async updateTimesheetEntry(
+    entryId: number,
+    targetUserId: number,
+    updateData: {
+      projectId?: number;
+      date?: string;
+      hours?: number;
+      activities?: string;
+    },
+    orgId: number,
+  ) {
+    const db = this.database.connection;
+    const now = new Date();
+
+    // Check if the entry exists and belongs to the specified user
+    const [existingEntry] = await db
+      .select({
+        id: timesheetEntriesTable.id,
+        timesheetId: timesheetEntriesTable.timesheetId,
+        projectId: timesheetEntriesTable.projectId,
+        hoursDecimal: timesheetEntriesTable.hoursDecimal,
+      })
+      .from(timesheetEntriesTable)
+      .innerJoin(
+        timesheetsTable,
+        eq(timesheetEntriesTable.timesheetId, timesheetsTable.id),
+      )
+      .where(
+        and(
+          eq(timesheetEntriesTable.id, entryId),
+          eq(timesheetEntriesTable.orgId, orgId),
+          eq(timesheetsTable.userId, targetUserId),
+        ),
+      );
+
+    if (!existingEntry) {
+      throw new NotFoundException(
+        `Timesheet entry with ID ${entryId} for user ${targetUserId} not found`,
+      );
+    }
+
+    const updatePayload: any = {
+      updatedAt: now,
+    };
+
+    if (updateData.projectId !== undefined) {
+      updatePayload.projectId = updateData.projectId;
+    }
+
+    if (updateData.hours !== undefined) {
+      if (updateData.hours <= 0 || updateData.hours > MAX_HOURS_PER_DAY) {
+        throw new BadRequestException(
+          `Hours must be between 0 and ${MAX_HOURS_PER_DAY}`,
+        );
+      }
+      updatePayload.hoursDecimal = updateData.hours.toString();
+    }
+
+    if (updateData.activities !== undefined) {
+      updatePayload.taskDescription = updateData.activities;
+    }
+
+    // Check if project is "Ad-hoc tasks" and enforce 2-hour limit
+    const projectIdToCheck = updateData.projectId ?? existingEntry.projectId;
+    if (projectIdToCheck) {
+      const [project] = await db
+        .select({
+          name: projectsTable.name,
+        })
+        .from(projectsTable)
+        .where(eq(projectsTable.id, projectIdToCheck))
+        .limit(1);
+
+      if (project && project.name === 'Ad-hoc tasks') {
+        const hoursToSet = updateData.hours ?? Number(existingEntry.hoursDecimal ?? 0);
+        if (hoursToSet > 2) {
+          throw new BadRequestException(
+            `Ad-hoc tasks project cannot have more than 2 hours`,
+          );
+        }
+      }
+    }
+
+    // If date is being updated, we need to check if the target timesheet exists or create it
+    let targetTimesheetId = existingEntry.timesheetId;
+    if (updateData.date) {
+      const workDate = normalizeDate(new Date(updateData.date));
+
+      // Find or create the target timesheet for the user
+      const [targetTimesheet] = await db
+        .select()
+        .from(timesheetsTable)
+        .where(
+          and(
+            eq(timesheetsTable.userId, targetUserId),
+            eq(timesheetsTable.workDate, workDate),
+            eq(timesheetsTable.orgId, orgId),
+          ),
+        );
+
+      if (!targetTimesheet) {
+        // Create new timesheet for the target date
+        const [newTimesheet] = await db
+          .insert(timesheetsTable)
+          .values({
+            orgId,
+            userId: targetUserId,
+            workDate,
+            state: 'draft',
+            totalHours: '0',
+            submittedAt: now,
+          })
+          .returning({ id: timesheetsTable.id });
+        targetTimesheetId = newTimesheet.id;
+      } else {
+        targetTimesheetId = targetTimesheet.id;
+      }
+
+      updatePayload.timesheetId = targetTimesheetId;
+    }
+
+    const updatedEntryHours =
+      updateData.hours !== undefined
+        ? Number(updateData.hours)
+        : Number(existingEntry.hoursDecimal ?? 0);
+
+    const [{ totalHoursExcludingCurrent }] = await db
+      .select({
+        totalHoursExcludingCurrent:
+          sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
+      })
+      .from(timesheetEntriesTable)
+      .where(
+        and(
+          eq(timesheetEntriesTable.timesheetId, targetTimesheetId),
+          not(eq(timesheetEntriesTable.id, entryId)),
+        ),
+      );
+
+    const totalHoursForDayAfterUpdate =
+      Number(totalHoursExcludingCurrent ?? 0) + updatedEntryHours;
+
+    if (totalHoursForDayAfterUpdate > MAX_HOURS_PER_DAY) {
+      throw new BadRequestException(
+        `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day`,
+      );
+    }
+
+    // Update the entry
+    const [updatedEntry] = await db
+      .update(timesheetEntriesTable)
+      .set(updatePayload)
+      .where(eq(timesheetEntriesTable.id, entryId))
+      .returning();
+
+    // Recalculate total hours for affected timesheets (only approved entries)
+    const timesheetIds = new Set<number>([existingEntry.timesheetId]);
+    if (updatePayload.timesheetId) {
+      timesheetIds.add(updatePayload.timesheetId);
+    }
+
+    for (const timesheetId of timesheetIds) {
+      const [{ totalHours }] = await db
+        .select({
+          totalHours: sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
+        })
+        .from(timesheetEntriesTable)
+        .where(
+          and(
+            eq(timesheetEntriesTable.timesheetId, timesheetId),
+            eq(timesheetEntriesTable.status, 'approved'),
+          ),
+        );
+
+      await db
+        .update(timesheetsTable)
+        .set({
+          totalHours: String(totalHours ?? 0),
+          updatedAt: now,
+        })
+        .where(eq(timesheetsTable.id, timesheetId));
+    }
+
+    return updatedEntry;
+  }
+
+  async deleteTimesheetEntry(entryId: number, targetUserId: number, orgId: number) {
+    const db = this.database.connection;
+
+    // Check if the entry exists and belongs to the specified user
+    const [existingEntry] = await db
+      .select({
+        id: timesheetEntriesTable.id,
+        timesheetId: timesheetEntriesTable.timesheetId,
+      })
+      .from(timesheetEntriesTable)
+      .innerJoin(
+        timesheetsTable,
+        eq(timesheetEntriesTable.timesheetId, timesheetsTable.id),
+      )
+      .where(
+        and(
+          eq(timesheetEntriesTable.id, entryId),
+          eq(timesheetEntriesTable.orgId, orgId),
+          eq(timesheetsTable.userId, targetUserId),
+        ),
+      );
+
+    if (!existingEntry) {
+      throw new NotFoundException(
+        `Timesheet entry with ID ${entryId} for user ${targetUserId} not found`,
+      );
+    }
+
+    const timesheetId = existingEntry.timesheetId;
+
+    // Soft delete: update status to 'rejected' instead of permanent deletion
+    await db
+      .update(timesheetEntriesTable)
+      .set({
+        status: 'rejected',
+        updatedAt: new Date(),
+      })
+      .where(eq(timesheetEntriesTable.id, entryId));
+
+    // Recalculate total hours for the affected timesheet (excluding rejected entries)
+    const [{ totalHours }] = await db
+      .select({
+        totalHours: sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
+      })
+      .from(timesheetEntriesTable)
+      .where(
+        and(
+          eq(timesheetEntriesTable.timesheetId, timesheetId),
+          eq(timesheetEntriesTable.status, 'approved'),
+        ),
+      );
+
+    await db
+      .update(timesheetsTable)
+      .set({
+        totalHours: String(totalHours ?? 0),
+        updatedAt: new Date(),
+      })
+      .where(eq(timesheetsTable.id, timesheetId));
+
+    return { success: true, message: 'Timesheet entry deleted successfully' };
   }
 }
 

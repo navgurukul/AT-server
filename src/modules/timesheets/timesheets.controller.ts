@@ -1,20 +1,27 @@
 import {
   Body,
   Controller,
+  Delete,
   ForbiddenException,
   Get,
+  Patch,
+  Param,
   Post,
   Query,
   Res,
+  UseGuards,
 } from '@nestjs/common';
 import { Response } from 'express';
 import { ApiQuery, ApiTags } from '@nestjs/swagger';
 
 import { Permissions } from '../../common/decorators/permissions.decorator';
+import { Roles } from '../../common/decorators/roles.decorator';
+import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 import { UpdateBackfillLimitDto } from './dto/update-backfill-limit.dto';
+import { UpdateTimesheetEntryDto } from './dto/update-timesheet-entry.dto';
 import { TimesheetsService } from './timesheets.service';
 
 @ApiTags('timesheets')
@@ -135,4 +142,80 @@ export class TimesheetsController {
       limit: payload.limit,
     });
   }
+
+  @Patch('actor/:actorId/user/:targetUserId/entries/:entryId')
+  @UseGuards(RolesGuard)
+  @Roles('super_admin', 'admin')
+  updateTimesheetEntry(
+    @Param('actorId') actorId: string,
+    @Param('targetUserId') targetUserId: string,
+    @Param('entryId') entryId: string,
+    @Body() payload: UpdateTimesheetEntryDto,
+    @CurrentUser() actor: AuthenticatedUser | undefined,
+  ) {
+    if (!actor) {
+      return null;
+    }
+
+    const parsedActorId = Number.parseInt(actorId, 10);
+    const parsedTargetUserId = Number.parseInt(targetUserId, 10);
+    const parsedEntryId = Number.parseInt(entryId, 10);
+
+    if (
+      Number.isNaN(parsedActorId) ||
+      Number.isNaN(parsedTargetUserId) ||
+      Number.isNaN(parsedEntryId)
+    ) {
+      throw new ForbiddenException('Invalid actor ID, user ID, or entry ID');
+    }
+
+    if (parsedActorId !== actor.id) {
+      throw new ForbiddenException('Actor ID does not match authenticated user');
+    }
+
+    return this.timesheetsService.updateTimesheetEntry(
+      parsedEntryId,
+      parsedTargetUserId,
+      {
+        projectId: payload.projectId,
+        date: payload.date,
+        hours: payload.hours,
+        activities: payload.activities,
+      },
+      actor.orgId,
+    );
+  }
+
+  @Delete('role/:roleId/user/:targetUserId/entries/:entryId')
+  @UseGuards(RolesGuard)
+  @Roles('super_admin', 'admin')
+  deleteTimesheetEntry(
+    @Param('roleId') roleId: string,
+    @Param('targetUserId') targetUserId: string,
+    @Param('entryId') entryId: string,
+    @CurrentUser() actor: AuthenticatedUser | undefined,
+  ) {
+    if (!actor) {
+      return null;
+    }
+
+    const parsedRoleId = Number.parseInt(roleId, 10);
+    const parsedTargetUserId = Number.parseInt(targetUserId, 10);
+    const parsedEntryId = Number.parseInt(entryId, 10);
+
+    if (
+      Number.isNaN(parsedRoleId) ||
+      Number.isNaN(parsedTargetUserId) ||
+      Number.isNaN(parsedEntryId)
+    ) {
+      throw new ForbiddenException('Invalid role ID, user ID, or entry ID');
+    }
+
+    return this.timesheetsService.deleteTimesheetEntry(
+      parsedEntryId,
+      parsedTargetUserId,
+      actor.orgId,
+    );
+  }
+
 }
