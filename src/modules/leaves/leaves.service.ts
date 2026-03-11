@@ -2071,8 +2071,7 @@ export class LeavesService {
    */
   async queueDailyLeaveNotifications() {
     const db = this.database.connection;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = this.normalizeDateUTC(new Date());
 
     const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
 

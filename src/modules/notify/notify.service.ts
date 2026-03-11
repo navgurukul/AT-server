@@ -679,7 +679,13 @@ export class NotifyService {
         // Build message
         let message = `Hi ${managerTag},\n`;
         message += `${employeeTag} ${tense} *${leaveTypeName}* on the following dates:\n`;
-        message += `📅 ${formattedStartDate} to ${formattedEndDate}`;
+        
+        // Show single date or date range
+        if (formattedStartDate === formattedEndDate) {
+          message += `📅 ${formattedStartDate}`;
+        } else {
+          message += `📅 ${formattedStartDate} to ${formattedEndDate}`;
+        }
         
         // Add half-day segment if applicable
         if (durationType === "half_day" && halfDaySegment) {
@@ -690,7 +696,7 @@ export class NotifyService {
         
         // Add reason if provided
         if (reason) {
-          message += `\n📝 Reason: ${reason}`;
+          message += `📝 Reason: ${reason}`;
         }
 
         return message;
@@ -911,7 +917,13 @@ export class NotifyService {
         // Build message
         let message = `Hi ${managerTag},\n`;
         message += `${employeeTag} ${tense} **${leaveTypeName}** on the following dates:\n`;
-        message += `📅 ${formattedStartDate} to ${formattedEndDate}`;
+        
+        // Show single date or date range
+        if (formattedStartDate === formattedEndDate) {
+          message += `📅 ${formattedStartDate}`;
+        } else {
+          message += `📅 ${formattedStartDate} to ${formattedEndDate}`;
+        }
         
         // Add half-day segment if applicable
         if (durationType === "half_day" && halfDaySegment) {
@@ -922,7 +934,7 @@ export class NotifyService {
         
         // Add reason if provided
         if (reason) {
-          message += `\n📝 Reason: ${reason}`;
+          message += `📝 Reason: ${reason}`;
         }
 
         return message;

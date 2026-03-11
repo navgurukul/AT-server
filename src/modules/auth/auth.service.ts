@@ -60,7 +60,7 @@ export class AuthService {
       .where(eq(usersTable.email, tokenEmail));
 
     if (!user) {
-      throw new UnauthorizedException('User not found');
+      throw new UnauthorizedException('Please login using your Team ID. Your email was not found in the PnC sheet. Please contact the PnC Team for assistance.');
     }
 
     if (user.status === 'suspended') {
