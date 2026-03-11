@@ -20,6 +20,7 @@ import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
+import { CreateTimesheetAdminDto } from './dto/create-timesheet-admin.dto';
 import { UpdateBackfillLimitDto } from './dto/update-backfill-limit.dto';
 import { UpdateTimesheetEntryDto } from './dto/update-timesheet-entry.dto';
 import { TimesheetsService } from './timesheets.service';
@@ -123,6 +124,19 @@ export class TimesheetsController {
       return null;
     }
     return this.timesheetsService.createOrUpsert(payload, user.id, user.orgId);
+  }
+
+  @Post('admin/create')
+  @UseGuards(RolesGuard)
+  @Roles('super_admin', 'admin')
+  createOrUpsertByAdmin(
+    @Body() payload: CreateTimesheetAdminDto,
+    @CurrentUser() user: AuthenticatedUser | undefined,
+  ) {
+    if (!user) {
+      return null;
+    }
+    return this.timesheetsService.createOrUpsertByAdmin(payload, user.id, user.orgId);
   }
 
   @Post('backfill/limit')
