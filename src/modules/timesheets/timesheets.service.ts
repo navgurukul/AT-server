@@ -21,6 +21,7 @@ import { DatabaseService } from '../../database/database.service';
 import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, notificationsTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
 import { CalendarService } from '../calendar/calendar.service';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
+import { CreateTimesheetAdminDto } from './dto/create-timesheet-admin.dto';
 
 interface ListTimesheetParams {
   userId?: number;
@@ -165,11 +166,15 @@ export class TimesheetsService {
   async createOrUpsert(
     payload: CreateTimesheetDto,
     userId: number,
-    orgId: number
+    orgId: number,
+    options?: {
+      skipBackfillDeduction?: boolean;
+    }
   ) {
     const db = this.database.connection;
     const workDate = normalizeDate(new Date(payload.workDate));
     const now = new Date();
+    const skipBackfillDeduction = options?.skipBackfillDeduction ?? false;
 
     const [userInfo] = await db
       .select({ 
@@ -349,7 +354,11 @@ export class TimesheetsService {
     // Lifelines are available throughout the salary cycle, no cutoff date restriction
     // The restriction is only within the current salary cycle
 
-    if (isBackfill && backfillAllowance.remaining <= 0) {
+    if (
+      isBackfill &&
+      !skipBackfillDeduction &&
+      backfillAllowance.remaining <= 0
+    ) {
       throw new BadRequestException(
         `Backfilling (lifeline) is limited to ${backfillAllowance.limit} days per salary cycle. Lifelines reset on the 26th of each month at 7:01 AM.`
       );
@@ -553,7 +562,7 @@ export class TimesheetsService {
         .orderBy(asc(timesheetEntriesTable.id));
 
       // If this is a new backfill entry, increment usage counters for the salary cycle.
-      if (isBackfill && isNewTimesheet) {
+      if (isBackfill && isNewTimesheet && !skipBackfillDeduction) {
         await this.incrementBackfillUsageForCycle(tx, orgId, userId, currentCycle, workDate, now);
       }
 
@@ -565,7 +574,9 @@ export class TimesheetsService {
     });
 
     const backfillRemaining = isBackfill
-      ? Math.max(backfillAllowance.remaining - (existing ? 0 : 1), 0)
+      ? skipBackfillDeduction
+        ? backfillAllowance.remaining
+        : Math.max(backfillAllowance.remaining - (existing ? 0 : 1), 0)
       : backfillAllowance.remaining;
 
     // Send Slack notifications per project channel
@@ -635,6 +646,49 @@ export class TimesheetsService {
       backfillLimit: backfillAllowance.limit,
       backfillRemaining,
     };
+  }
+
+  async createOrUpsertByAdmin(
+    payload: CreateTimesheetAdminDto,
+    adminId: number,
+    orgId: number
+  ) {
+    const db = this.database.connection;
+
+    // Verify that the target user exists and belongs to the same organization
+    const [targetUser] = await db
+      .select({
+        id: usersTable.id,
+        orgId: usersTable.orgId,
+        status: usersTable.status,
+        name: usersTable.name,
+      })
+      .from(usersTable)
+      .where(
+        and(
+          eq(usersTable.id, payload.userId),
+          eq(usersTable.orgId, orgId)
+        )
+      )
+      .limit(1);
+
+    if (!targetUser) {
+      throw new NotFoundException(
+        `User with ID ${payload.userId} not found in your organization`
+      );
+    }
+
+    // Convert admin DTO to standard DTO by creating it without the userId
+    const timesheetDto: CreateTimesheetDto = {
+      workDate: payload.workDate,
+      notes: payload.notes,
+      entries: payload.entries,
+    };
+
+    // Call the existing createOrUpsert method with the target user ID
+    return this.createOrUpsert(timesheetDto, payload.userId, orgId, {
+      skipBackfillDeduction: true,
+    });
   }
 
   async updateBackfillLimit(payload: {
@@ -717,6 +771,50 @@ export class TimesheetsService {
       used,
       limit,
       remaining: Math.max(limit - used, 0),
+    };
+  }
+
+  async getCurrentCycleBackfill(params: { orgId: number; userId: number }) {
+    const { orgId, userId } = params;
+    const now = new Date();
+    const cycle = SalaryCycleUtil.getCurrentSalaryCycle(now);
+    const { year, month } = cycle;
+    const db = this.database.connection;
+
+    const [counter] = await db
+      .select({
+        used: backfillCountersTable.used,
+        limit: backfillCountersTable.limit,
+      })
+      .from(backfillCountersTable)
+      .where(
+        and(
+          eq(backfillCountersTable.orgId, orgId),
+          eq(backfillCountersTable.userId, userId),
+          eq(backfillCountersTable.year, year),
+          eq(backfillCountersTable.month, month),
+        ),
+      )
+      .limit(1);
+
+    const usage =
+      counter && counter.used !== null && counter.used !== undefined
+        ? Number(counter.used)
+        : await this.countBackfilledDaysForCycle(
+            orgId,
+            userId,
+            cycle,
+            now,
+          );
+
+    const limit =
+      counter && counter.limit !== null && counter.limit !== undefined
+        ? Number(counter.limit)
+        : DEFAULT_BACKFILL_PER_MONTH;
+
+    return {
+      limit,
+      remaining: Math.max(limit - usage, 0),
     };
   }
 

@@ -38,6 +38,7 @@ import {
 } from "../../db/schema";
 import { CalendarService } from "../calendar/calendar.service";
 import { CreateLeaveRequestDto } from "./dto/create-leave-request.dto";
+import { CreateLeaveForUserDto } from "./dto/create-leave-for-user.dto";
 import { BulkReviewLeaveIdsDto } from "./dto/bulk-review-leave-ids.dto";
 import { ReviewLeaveRequestDto } from "./dto/review-leave-request.dto";
 import { GrantCompOffDto } from "./dto/grant-comp-off.dto";
@@ -665,6 +666,36 @@ export class LeavesService {
     await this.notifyLatestProjectSlackChannel(userId, orgId, notificationPayload);
 
     return request;
+  }
+
+  async createLeaveRequestForUser(
+    actor: AuthenticatedUser,
+    payload: CreateLeaveForUserDto
+  ) {
+    const db = this.database.connection;
+
+    // Verify the target user exists and belongs to the same organization
+    const [targetUser] = await db
+      .select({
+        id: usersTable.id,
+        orgId: usersTable.orgId,
+      })
+      .from(usersTable)
+      .where(eq(usersTable.id, payload.userId))
+      .limit(1);
+
+    if (!targetUser) {
+      throw new NotFoundException("User not found");
+    }
+
+    if (targetUser.orgId !== actor.orgId) {
+      throw new ForbiddenException(
+        "Cannot apply leave for users in a different organization"
+      );
+    }
+
+    // Create leave request for the target user
+    return this.createLeaveRequest(payload.userId, targetUser.orgId, payload);
   }
 
   async grantCompOffCredit(

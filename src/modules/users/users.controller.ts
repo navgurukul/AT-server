@@ -66,12 +66,23 @@ export class UsersController {
       }
     }
 
-    return this.timesheetsService.getMonthlyDashboard({
-      userId: targetUser.id,
-      orgId: actor.orgId,
-      year: currentCycle.year,
-      month: currentCycle.month,
-    });
+    const [dashboard, backfill] = await Promise.all([
+      this.timesheetsService.getMonthlyDashboard({
+        userId: targetUser.id,
+        orgId: actor.orgId,
+        year: currentCycle.year,
+        month: currentCycle.month,
+      }),
+      this.timesheetsService.getCurrentCycleBackfill({
+        userId: targetUser.id,
+        orgId: actor.orgId,
+      }),
+    ]);
+
+    return {
+      ...dashboard,
+      backfill,
+    };
   }
 
   @Get('managers')

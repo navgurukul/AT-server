@@ -14,6 +14,7 @@ import { Permissions } from "../../common/decorators/permissions.decorator";
 import { CurrentUser } from "../../common/decorators/current-user.decorator";
 import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
 import { CreateLeaveRequestDto } from "./dto/create-leave-request.dto";
+import { CreateLeaveForUserDto } from "./dto/create-leave-for-user.dto";
 import { ReviewLeaveRequestDto } from "./dto/review-leave-request.dto";
 import { BulkReviewLeaveIdsDto } from "./dto/bulk-review-leave-ids.dto";
 import { GrantCompOffDto } from "./dto/grant-comp-off.dto";
@@ -222,4 +223,16 @@ export class LeavesController {
   //     user?.id ?? 0
   //   );
   // }
+
+  @Post("admin/apply")
+  @Permissions("leave:create:any")
+  applyLeaveForUser(
+    @Body() payload: CreateLeaveForUserDto,
+    @CurrentUser() actor: AuthenticatedUser | undefined
+  ) {
+    if (!actor) {
+      return null;
+    }
+    return this.leavesService.createLeaveRequestForUser(actor, payload);
+  }
 }
