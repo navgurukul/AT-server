@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { JWT } from 'google-auth-library';
 import { createHash } from 'crypto';
 import { and, count, eq, ilike, inArray, isNotNull, or } from 'drizzle-orm';
@@ -20,6 +20,11 @@ interface SearchUsersParams {
   query?: string;
   page?: number;
   limit?: number;
+}
+
+interface UsersDirectoryParams {
+  query?: string;
+  page?: number;
 }
 
 export interface SheetSyncResult {
@@ -243,6 +248,119 @@ export class UsersService {
       page,
       limit,
       total,
+    };
+  }
+
+  async listUsersDirectory(params: UsersDirectoryParams) {
+    const db = this.database.connection;
+    const limit = 10;
+    const page = params.page && params.page > 0 ? params.page : 1;
+    const offset = (page - 1) * limit;
+
+    const filters = [];
+    if (params.query) {
+      const q = `%${params.query.toLowerCase()}%`;
+      filters.push(or(ilike(usersTable.name, q), ilike(usersTable.email, q)));
+    }
+
+    const whereClause = filters.length > 0 ? and(...(filters as any)) : undefined;
+
+    const baseUsersQuery = db
+      .select({
+        id: usersTable.id,
+        name: usersTable.name,
+        email: usersTable.email,
+        employeeDepartmentId: usersTable.employeeDepartmentId,
+      })
+      .from(usersTable);
+
+    const usersQuery = whereClause
+      ? baseUsersQuery.where(whereClause)
+      : baseUsersQuery;
+
+    const users = await usersQuery.limit(limit).offset(offset);
+
+    const totalResultQuery = db
+      .select({ value: count(usersTable.id) })
+      .from(usersTable);
+    const totalResult = await (
+      whereClause
+        ? totalResultQuery.where(whereClause)
+        : totalResultQuery
+    );
+
+    const userIds = users.map((user) => user.id);
+    const roleAssignments =
+      userIds.length === 0
+        ? []
+        : await db
+            .select({
+              userId: userRolesTable.userId,
+              roleKey: rolesTable.key,
+            })
+            .from(userRolesTable)
+            .innerJoin(rolesTable, eq(userRolesTable.roleId, rolesTable.id))
+            .where(inArray(userRolesTable.userId, userIds));
+
+    const rolesByUser = roleAssignments.reduce<Record<number, string[]>>(
+      (acc, curr) => {
+        acc[curr.userId] = acc[curr.userId] ?? [];
+        acc[curr.userId].push(curr.roleKey);
+        return acc;
+      },
+      {},
+    );
+
+    const employeeDepartmentIds = Array.from(
+      new Set(
+        users
+          .map((user) => user.employeeDepartmentId)
+          .filter((id): id is number => id !== null && id !== undefined),
+      ),
+    );
+
+    const employeeDepartments =
+      employeeDepartmentIds.length === 0
+        ? []
+        : await db
+            .select({
+              id: employeeDepartmentsTable.id,
+              name: employeeDepartmentsTable.name,
+            })
+            .from(employeeDepartmentsTable)
+            .where(inArray(employeeDepartmentsTable.id, employeeDepartmentIds));
+
+    const departmentsById = employeeDepartments.reduce<Record<number, string>>(
+      (acc, curr) => {
+        acc[curr.id] = curr.name;
+        return acc;
+      },
+      {},
+    );
+
+    const data = users.map((user) => {
+      const assignedRoles = rolesByUser[user.id] ?? [];
+      const role = assignedRoles[0] ?? null;
+
+      return {
+        name: user.name,
+        email: user.email,
+        department:
+          user.employeeDepartmentId !== null && user.employeeDepartmentId !== undefined
+            ? departmentsById[user.employeeDepartmentId] ?? null
+            : null,
+        role,
+      };
+    });
+
+    const total = Number(totalResult[0]?.value ?? 0);
+
+    return {
+      data,
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
     };
   }
 
@@ -1016,12 +1134,21 @@ export class UsersService {
   }
 
   async updateUserRole(
+    actor: { id: number; roles: string[] },
     userId: number,
     role: 'super_admin' | 'admin' | 'employee',
   ) {
+    const isSuperAdmin = actor.roles.includes('super_admin');
+    const isAdmin = actor.roles.includes('admin');
+
+    // Self-role protection: no user can modify their own role
+    if (actor.id === userId) {
+      throw new ForbiddenException('You cannot modify your own role');
+    }
+
     const db = this.database.connection;
 
-    // Check if user exists
+    // Fetch target user
     const [user] = await db
       .select({ id: usersTable.id, name: usersTable.name, email: usersTable.email })
       .from(usersTable)
@@ -1032,7 +1159,33 @@ export class UsersService {
       throw new NotFoundException(`User with id ${userId} not found`);
     }
 
-    // Check if role exists
+    // Fetch target user's current role
+    const [currentRoleRow] = await db
+      .select({ roleKey: rolesTable.key })
+      .from(userRolesTable)
+      .innerJoin(rolesTable, eq(userRolesTable.roleId, rolesTable.id))
+      .where(eq(userRolesTable.userId, userId))
+      .limit(1);
+
+    const currentRole = currentRoleRow?.roleKey ?? null;
+
+    // Admin-specific restrictions (admins cannot act on or assign privileged roles)
+    if (isAdmin && !isSuperAdmin) {
+      // Admin cannot modify a super_admin or another admin
+      if (currentRole === 'super_admin' || currentRole === 'admin') {
+        throw new ForbiddenException(
+          'Admins can only modify users with the Employee role',
+        );
+      }
+      // Admin can only assign the employee role
+      if (role !== 'employee') {
+        throw new ForbiddenException(
+          'Admins can only assign the Employee role',
+        );
+      }
+    }
+
+    // Fetch the role record
     const [roleRecord] = await db
       .select({ id: rolesTable.id, key: rolesTable.key, name: rolesTable.name })
       .from(rolesTable)
@@ -1049,14 +1202,9 @@ export class UsersService {
       .set({ rolePrimary: role, updatedAt: new Date() })
       .where(eq(usersTable.id, userId));
 
-    // Delete existing user roles
+    // Replace user_roles entry
     await db.delete(userRolesTable).where(eq(userRolesTable.userId, userId));
-
-    // Assign new role in user_roles table
-    await db.insert(userRolesTable).values({
-      userId,
-      roleId: roleRecord.id,
-    });
+    await db.insert(userRolesTable).values({ userId, roleId: roleRecord.id });
 
     return {
       success: true,
