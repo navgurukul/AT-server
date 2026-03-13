@@ -200,11 +200,11 @@ export class TimesheetsController {
     );
   }
 
-  @Delete('role/:roleId/user/:targetUserId/entries/:entryId')
+  @Delete('actor/:actorId/user/:targetUserId/entries/:entryId')
   @UseGuards(RolesGuard)
   @Roles('super_admin', 'admin')
   deleteTimesheetEntry(
-    @Param('roleId') roleId: string,
+    @Param('actorId') actorId: string,
     @Param('targetUserId') targetUserId: string,
     @Param('entryId') entryId: string,
     @CurrentUser() actor: AuthenticatedUser | undefined,
@@ -213,16 +213,16 @@ export class TimesheetsController {
       return null;
     }
 
-    const parsedRoleId = Number.parseInt(roleId, 10);
+    const parsedActorId = Number.parseInt(actorId, 10);
     const parsedTargetUserId = Number.parseInt(targetUserId, 10);
     const parsedEntryId = Number.parseInt(entryId, 10);
 
     if (
-      Number.isNaN(parsedRoleId) ||
+      Number.isNaN(parsedActorId) ||
       Number.isNaN(parsedTargetUserId) ||
       Number.isNaN(parsedEntryId)
     ) {
-      throw new ForbiddenException('Invalid role ID, user ID, or entry ID');
+      throw new ForbiddenException('Invalid actor ID, user ID, or entry ID');
     }
 
     return this.timesheetsService.deleteTimesheetEntry(

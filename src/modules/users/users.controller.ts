@@ -102,6 +102,22 @@ export class UsersController {
     });
   }
 
+  @Get('role')
+  @ApiQuery({ name: 'search', required: false })
+  @ApiQuery({ name: 'q', required: false })
+  @ApiQuery({ name: 'page', required: false })
+  @Permissions('users:view')
+  listUsersDirectory(
+    @Query('search') search?: string,
+    @Query('q') q?: string,
+    @Query('page') page?: string,
+  ) {
+    return this.usersService.listUsersDirectory({
+      query: search ?? q ?? undefined,
+      page: page ? Number.parseInt(page, 10) : undefined,
+    });
+  }
+
   @Get()
   @ApiQuery({ name: 'managerId', required: false })
   @ApiQuery({ name: 'role', required: false })
