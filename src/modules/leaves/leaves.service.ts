@@ -55,7 +55,7 @@ interface ListLeaveRequestsParams {
 
 interface ListCompOffParams {
   userId?: number;
-  status?: "granted" | "expired" | "revoked";
+  status?: "pending" | "granted" | "expired" | "revoked";
 }
 
 const HOURS_PER_WORKING_DAY = 8;
@@ -70,6 +70,7 @@ type LeaveBalanceDelta = Partial<{
   balanceHours: number;
   pendingHours: number;
   bookedHours: number;
+  allocatedHours: number;
 }>;
 
 interface LeaveBalanceSnapshot {
@@ -77,6 +78,7 @@ interface LeaveBalanceSnapshot {
   balanceHours: number;
   pendingHours: number;
   bookedHours: number;
+  allocatedHours: number;
 }
 
 @Injectable()
@@ -706,20 +708,10 @@ export class LeavesService {
     const workDate = this.normalizeDateUTC(new Date(payload.workDate));
     const workDateKey = this.formatDateKey(workDate);
     const today = this.normalizeDateUTC(new Date());
-
-    if (workDate > today) {
-      throw new BadRequestException(
-        "Comp-off credits can only be granted for past or current dates"
-      );
-    }
-
-    const creditHours =
-      payload.duration === "half_day"
-        ? COMP_OFF_HALF_DAY_HOURS
-        : COMP_OFF_FULL_DAY_HOURS;
     const now = new Date();
 
     return db.transaction(async (tx) => {
+      // Validate user exists and actor has permission
       const [targetUser] = await tx
         .select({
           id: usersTable.id,
@@ -738,28 +730,51 @@ export class LeavesService {
         targetUser.managerId !== null && targetUser.managerId !== undefined
           ? Number(targetUser.managerId)
           : null;
-      const isDirectManager = directManagerId === actor.id;
-      const isPrivileged = this.hasOrgWideCompOffAccess(actor);
 
-      // Admin/SuperAdmin can grant comp-off for all employees
-      // Managers can grant comp-off only for their mentees (direct reports)
+      // Admin/SuperAdmin can raise for all employees; managers only for direct reports
       if (!this.canGrantCompOffForUser(actor, targetUser)) {
         throw new ForbiddenException(
-          "Only administrators can grant comp-off for any employee, or managers can grant for their direct reports"
+          "Only administrators or the direct manager can authorize off-day work for an employee"
         );
       }
 
-      const dayInfo = await this.calendarService.getDayInfo(
-        actor.orgId,
-        workDate
-      );
-
+      // Must be a non-working day (weekend, holiday)
+      const dayInfo = await this.calendarService.getDayInfo(actor.orgId, workDate);
       if (dayInfo.isWorkingDay) {
         throw new BadRequestException(
-          "Comp-off credits can only be granted for non-working days"
+          "Off-day work requests can only be raised for non-working days (weekends, holidays)"
         );
       }
 
+      await this.expireStalePendingCompOffRequests(
+        tx,
+        actor.orgId,
+        payload.userId,
+        now
+      );
+
+      // Prevent duplicate pending request for the same user/date.
+      // Multiple granted credits on the same date are allowed while eligibility remains.
+      const [existingRequest] = await tx
+        .select({ id: compOffCreditsTable.id })
+        .from(compOffCreditsTable)
+        .where(
+          and(
+            eq(compOffCreditsTable.orgId, actor.orgId),
+            eq(compOffCreditsTable.userId, payload.userId),
+            eq(compOffCreditsTable.workDate, sql`CAST(${workDateKey} AS date)`),
+            eq(compOffCreditsTable.status, "pending")
+          )
+        )
+        .limit(1);
+
+      if (existingRequest) {
+        throw new BadRequestException(
+          "A pending comp-off request already exists for this user and date"
+        );
+      }
+
+      // Check if a timesheet already exists for this date
       const [timesheet] = await tx
         .select({
           id: timesheetsTable.id,
@@ -775,95 +790,55 @@ export class LeavesService {
         )
         .limit(1);
 
-      if (!timesheet) {
-        throw new BadRequestException(
-          "No timesheet exists for the selected date"
-        );
-      }
-
       const timesheetHours =
-        timesheet.totalHours !== null && timesheet.totalHours !== undefined
+        timesheet?.totalHours !== null && timesheet?.totalHours !== undefined
           ? Number(timesheet.totalHours)
           : 0;
 
-      const requiredHours =
-        payload.duration === "half_day"
-          ? COMP_OFF_HALF_DAY_HOURS
-          : COMP_OFF_FULL_DAY_HOURS;
+      if (timesheet && timesheetHours > 0) {
+        const eligibility = this.calculateCompOffEligibility(timesheetHours);
+        if (eligibility.durationType) {
+          const [{ creditedSoFar }] = await tx
+            .select({
+              creditedSoFar: sql<number>`COALESCE(SUM(${compOffCreditsTable.creditedHours}), 0)`,
+            })
+            .from(compOffCreditsTable)
+            .where(
+              and(
+                eq(compOffCreditsTable.orgId, actor.orgId),
+                eq(compOffCreditsTable.userId, payload.userId),
+                eq(compOffCreditsTable.workDate, sql`CAST(${workDateKey} AS date)`),
+                eq(compOffCreditsTable.status, "granted")
+              )
+            );
 
-      if (timesheetHours < requiredHours) {
-        throw new BadRequestException(
-          `Timesheet must record at least ${requiredHours} hours for a ${payload.duration.replace(
-            "_",
-            " "
-          )} comp-off`
-        );
+          const remainingEligibilityHours =
+            Number(eligibility.creditedHours ?? 0) - Number(creditedSoFar ?? 0);
+
+          if (remainingEligibilityHours <= HOURS_NEGATIVE_TOLERANCE) {
+            throw new BadRequestException(
+              "Comp-off eligibility is already fully consumed for this work date"
+            );
+          }
+        }
       }
-
-      const [{ creditedSoFar }] = await tx
-        .select({
-          creditedSoFar: sql<number>`COALESCE(SUM(${compOffCreditsTable.creditedHours}), 0)`,
-        })
-        .from(compOffCreditsTable)
-        .where(
-          and(
-            eq(compOffCreditsTable.orgId, actor.orgId),
-            eq(compOffCreditsTable.userId, payload.userId),
-            eq(
-              compOffCreditsTable.workDate,
-              sql`CAST(${workDateKey} AS date)`
-            ),
-            eq(compOffCreditsTable.status, "granted")
-          )
-        );
-
-      const totalForDay = Number(creditedSoFar ?? 0) + creditHours;
-      if (totalForDay - HOURS_NEGATIVE_TOLERANCE > COMP_OFF_FULL_DAY_HOURS) {
-        throw new BadRequestException(
-          "Cannot credit more than one full day of comp-off for a single date"
-        );
-      }
-
-      const leaveTypeId = await this.ensureCompOffLeaveType(tx, actor.orgId);
-      await this.ensureLeaveBalanceRow(tx, payload.userId, leaveTypeId);
-
-      await this.expireStaleCompOffCredits(
-        tx,
-        actor.orgId,
-        payload.userId,
-        leaveTypeId,
-        now
-      );
-
-      let snapshot = await this.fetchLeaveBalanceSnapshot(
-        tx,
-        payload.userId,
-        leaveTypeId
-      );
-
-      snapshot = await this.updateLeaveBalanceFromSnapshot(tx, snapshot, {
-        balanceHours: creditHours,
-      });
 
       const expiresAt = new Date(workDate);
       expiresAt.setUTCDate(expiresAt.getUTCDate() + COMP_OFF_EXPIRY_DAYS);
 
-      const creditedHoursValue = creditHours.toFixed(2);
-      const timesheetHoursValue = timesheetHours.toFixed(2);
-
-      const [credit] = await tx
+      // Create comp-off request in pending state. Balance will be updated only after timesheet is filled.
+      const [workRequest] = await tx
         .insert(compOffCreditsTable)
         .values({
           orgId: actor.orgId,
           userId: payload.userId,
           managerId: directManagerId ?? actor.id,
           createdBy: actor.id,
-          timesheetId: timesheet.id,
           workDate: sql`CAST(${workDateKey} AS date)`,
           durationType: payload.duration,
-          creditedHours: creditedHoursValue,
-          timesheetHours: timesheetHoursValue,
-          status: "granted",
+          creditedHours: "0.00",
+          timesheetHours: null,
+          status: "pending",
           expiresAt,
           notes: payload.notes ?? null,
         })
@@ -871,31 +846,127 @@ export class LeavesService {
           id: compOffCreditsTable.id,
           workDate: compOffCreditsTable.workDate,
           durationType: compOffCreditsTable.durationType,
+          status: compOffCreditsTable.status,
+          notes: compOffCreditsTable.notes,
+          createdAt: compOffCreditsTable.createdAt,
+        });
+
+      // For future dates, no timesheet can exist yet — comp off pending
+      if (workDate > today) {
+        return {
+          workRequest: {
+            id: workRequest.id,
+            workDate: workRequest.workDate,
+            durationType: workRequest.durationType,
+            status: workRequest.status,
+            notes: workRequest.notes ?? null,
+            createdAt: workRequest.createdAt,
+          },
+          compOff: {
+            granted: false,
+            reason:
+              "Timesheet not yet available (future date). Comp off will be auto-credited once the employee fills the timesheet.",
+          },
+        };
+      }
+
+      if (!timesheet || timesheetHours === 0) {
+        return {
+          workRequest: {
+            id: workRequest.id,
+            workDate: workRequest.workDate,
+            durationType: workRequest.durationType,
+            status: workRequest.status,
+            notes: workRequest.notes ?? null,
+            createdAt: workRequest.createdAt,
+          },
+          compOff: {
+            granted: false,
+            reason:
+              "No timesheet found for this date. Comp off will be auto-credited once the employee fills the timesheet.",
+          },
+        };
+      }
+
+      // Both conditions met — calculate comp off eligibility from actual hours
+      const granted = await this.processCompOffCredit(
+        tx,
+        workRequest.id,
+        timesheet.id,
+        timesheetHours,
+      );
+
+      if (!granted) {
+        return {
+          workRequest: {
+            id: workRequest.id,
+            workDate: workRequest.workDate,
+            durationType: workRequest.durationType,
+            status: "pending",
+            notes: workRequest.notes ?? null,
+            createdAt: workRequest.createdAt,
+          },
+          compOff: {
+            granted: false,
+            reason:
+              timesheetHours < 3
+                ? `Timesheet has ${timesheetHours} hours which is below the minimum 3 hours required for comp off.`
+                : "Comp-off request is pending and will be granted once validation is complete.",
+          },
+        };
+      }
+
+      const [credit] = await tx
+        .select({
+          id: compOffCreditsTable.id,
+          workDate: compOffCreditsTable.workDate,
+          durationType: compOffCreditsTable.durationType,
           creditedHours: compOffCreditsTable.creditedHours,
+          timesheetHours: compOffCreditsTable.timesheetHours,
           status: compOffCreditsTable.status,
           expiresAt: compOffCreditsTable.expiresAt,
           notes: compOffCreditsTable.notes,
-        });
+        })
+        .from(compOffCreditsTable)
+        .where(eq(compOffCreditsTable.id, workRequest.id))
+        .limit(1);
+
+      const leaveTypeId = await this.ensureCompOffLeaveType(tx, actor.orgId);
+      let snapshot = await this.fetchLeaveBalanceSnapshot(tx, payload.userId, leaveTypeId);
 
       return {
-        credit: {
-          id: credit.id,
-          workDate: credit.workDate,
-          durationType: credit.durationType,
-          creditedHours: Number(credit.creditedHours ?? 0),
-          status: credit.status,
-          expiresAt: credit.expiresAt,
-          notes: credit.notes ?? null,
+        workRequest: {
+          id: workRequest.id,
+          workDate: workRequest.workDate,
+          durationType: workRequest.durationType,
+          status: workRequest.status,
+          notes: workRequest.notes ?? null,
+          createdAt: workRequest.createdAt,
         },
-        balance: {
-          leaveTypeId,
-          balanceHours: snapshot.balanceHours,
-          pendingHours: snapshot.pendingHours,
-          bookedHours: snapshot.bookedHours,
+        compOff: {
+          granted: true,
+          credit: {
+            id: credit.id,
+            workDate: credit.workDate,
+            durationType: credit.durationType,
+            creditedHours: Number(credit.creditedHours ?? 0),
+            timesheetHours: Number(credit.timesheetHours ?? 0),
+            status: credit.status,
+            expiresAt: credit.expiresAt,
+            notes: credit.notes ?? null,
+          },
+          balance: {
+            leaveTypeId,
+            balanceHours: snapshot.balanceHours,
+            pendingHours: snapshot.pendingHours,
+            bookedHours: snapshot.bookedHours,
+            allocatedHours: snapshot.allocatedHours,
+          },
         },
       };
     });
   }
+
 
   async listCompOffCredits(
     actor: AuthenticatedUser,
@@ -1008,9 +1079,9 @@ export class LeavesService {
         throw new NotFoundException("Comp-off credit not found");
       }
 
-      if (credit.status !== "granted") {
+      if (credit.status !== "granted" && credit.status !== "pending") {
         throw new BadRequestException(
-          "Only active comp-off credits can be revoked"
+          "Only pending or active comp-off requests can be revoked"
         );
       }
 
@@ -1035,22 +1106,27 @@ export class LeavesService {
         );
       }
 
-      const leaveTypeId = await this.ensureCompOffLeaveType(tx, actor.orgId);
-      await this.ensureLeaveBalanceRow(tx, credit.userId, leaveTypeId);
+      let leaveTypeId: number | null = null;
+      let snapshot: LeaveBalanceSnapshot | null = null;
 
-      let snapshot = await this.fetchLeaveBalanceSnapshot(
-        tx,
-        credit.userId,
-        leaveTypeId
-      );
+      if (credit.status === "granted") {
+        leaveTypeId = await this.ensureCompOffLeaveType(tx, actor.orgId);
+        await this.ensureLeaveBalanceRow(tx, credit.userId, leaveTypeId);
 
-      const creditHours = Number(credit.creditedHours ?? 0);
-      if (creditHours > 0 && snapshot.balanceHours > 0) {
-        const deduction = Math.min(snapshot.balanceHours, creditHours);
-        if (deduction > 0) {
-          snapshot = await this.updateLeaveBalanceFromSnapshot(tx, snapshot, {
-            balanceHours: -deduction,
-          });
+        snapshot = await this.fetchLeaveBalanceSnapshot(
+          tx,
+          credit.userId,
+          leaveTypeId
+        );
+
+        const creditHours = Number(credit.creditedHours ?? 0);
+        if (creditHours > 0 && snapshot.balanceHours > 0) {
+          const deduction = Math.min(snapshot.balanceHours, creditHours);
+          if (deduction > 0) {
+            snapshot = await this.updateLeaveBalanceFromSnapshot(tx, snapshot, {
+              balanceHours: -deduction,
+            });
+          }
         }
       }
 
@@ -1072,13 +1148,221 @@ export class LeavesService {
       return {
         creditId: credit.id,
         status: "revoked",
-        balance: {
-          leaveTypeId,
-          balanceHours: snapshot.balanceHours,
-          pendingHours: snapshot.pendingHours,
-          bookedHours: snapshot.bookedHours,
-        },
+        balance:
+          leaveTypeId && snapshot
+            ? {
+                leaveTypeId,
+                balanceHours: snapshot.balanceHours,
+                pendingHours: snapshot.pendingHours,
+                bookedHours: snapshot.bookedHours,
+                allocatedHours: snapshot.allocatedHours,
+              }
+            : null,
       };
+    });
+  }
+
+
+  /**
+   * Calculate comp off eligibility based on timesheet hours
+   * Returns the duration type and credited hours
+   */
+  private calculateCompOffEligibility(timesheetHours: number): {
+    durationType: "half_day" | "full_day" | null;
+    creditedHours: number;
+  } {
+    if (timesheetHours < 3) {
+      return {
+        durationType: null,
+        creditedHours: 0,
+      };
+    } else if (timesheetHours >= 3 && timesheetHours < 6) {
+      return {
+        durationType: "half_day",
+        creditedHours: COMP_OFF_HALF_DAY_HOURS,
+      };
+    } else {
+      // timesheetHours >= 6
+      return {
+        durationType: "full_day",
+        creditedHours: COMP_OFF_FULL_DAY_HOURS,
+      };
+    }
+  }
+
+  /**
+   * Process comp off credit based on off-day work request and timesheet
+   * This is called automatically when:
+   * 1. Manager creates an off-day work request and timesheet exists
+   * 2. Employee fills a timesheet for a date that has an off-day work request
+   */
+  async processCompOffCredit(
+    tx: DatabaseService["connection"],
+    requestId: number,
+    timesheetId: number,
+    timesheetHours: number,
+  ): Promise<boolean> {
+    const [request] = await tx
+      .select({
+        id: compOffCreditsTable.id,
+        orgId: compOffCreditsTable.orgId,
+        userId: compOffCreditsTable.userId,
+        workDate: compOffCreditsTable.workDate,
+        durationType: compOffCreditsTable.durationType,
+        status: compOffCreditsTable.status,
+        expiresAt: compOffCreditsTable.expiresAt,
+      })
+      .from(compOffCreditsTable)
+      .where(eq(compOffCreditsTable.id, requestId))
+      .limit(1);
+
+    if (!request || request.status !== "pending") {
+      return false;
+    }
+
+    const workDateKey = this.formatDateKey(this.normalizeDateUTC(new Date(request.workDate)));
+
+    if (new Date(request.expiresAt) < new Date()) {
+      await tx
+        .update(compOffCreditsTable)
+        .set({ status: "expired", updatedAt: new Date() })
+        .where(eq(compOffCreditsTable.id, request.id));
+      return false;
+    }
+
+    // Calculate comp off eligibility based on timesheet hours
+    const eligibility = this.calculateCompOffEligibility(timesheetHours);
+
+    if (!eligibility.durationType) {
+      // Not enough hours to grant comp off
+      return false;
+    }
+
+    // Fetch already granted comp-off for this date
+    const [{ creditedSoFar }] = await tx
+      .select({
+        creditedSoFar: sql<number>`COALESCE(SUM(${compOffCreditsTable.creditedHours}), 0)`,
+      })
+      .from(compOffCreditsTable)
+      .where(
+        and(
+          eq(compOffCreditsTable.orgId, request.orgId),
+          eq(compOffCreditsTable.userId, request.userId),
+          eq(compOffCreditsTable.workDate, sql`CAST(${workDateKey} AS date)`),
+          eq(compOffCreditsTable.status, "granted")
+        )
+      );
+
+    const alreadyGrantedHours = Number(creditedSoFar ?? 0);
+    const eligibilityHours = Number(eligibility.creditedHours ?? 0);
+    const remainingEligibilityHours = eligibilityHours - alreadyGrantedHours;
+
+    if (remainingEligibilityHours <= HOURS_NEGATIVE_TOLERANCE) {
+      return false;
+    }
+
+    // Final grant = MIN(manager permission, remaining eligibility)
+    const managerPermissionHours =
+      request.durationType === "half_day"
+        ? COMP_OFF_HALF_DAY_HOURS
+        : COMP_OFF_FULL_DAY_HOURS;
+
+    const finalCreditedHours = Math.min(
+      managerPermissionHours,
+      remainingEligibilityHours
+    );
+
+    if (finalCreditedHours <= HOURS_NEGATIVE_TOLERANCE) {
+      return false;
+    }
+
+    let finalDurationType: "half_day" | "full_day";
+    if (finalCreditedHours >= COMP_OFF_FULL_DAY_HOURS - HOURS_NEGATIVE_TOLERANCE) {
+      finalDurationType = "full_day";
+    } else {
+      finalDurationType = "half_day";
+    }
+
+    const leaveTypeId = await this.ensureCompOffLeaveType(tx, request.orgId);
+    await this.ensureLeaveBalanceRow(tx, request.userId, leaveTypeId);
+
+    const now = new Date();
+    await this.expireStaleCompOffCredits(tx, request.orgId, request.userId, leaveTypeId, now);
+
+    let snapshot = await this.fetchLeaveBalanceSnapshot(tx, request.userId, leaveTypeId);
+
+    snapshot = await this.updateLeaveBalanceFromSnapshot(tx, snapshot, {
+      balanceHours: finalCreditedHours,
+      allocatedHours: finalCreditedHours,
+    });
+
+    const grantExpiresAt = new Date(request.workDate as unknown as string | Date);
+    grantExpiresAt.setUTCDate(grantExpiresAt.getUTCDate() + COMP_OFF_EXPIRY_DAYS);
+
+    await tx
+      .update(compOffCreditsTable)
+      .set({
+        timesheetId,
+        durationType: finalDurationType,
+        creditedHours: finalCreditedHours.toFixed(2),
+        timesheetHours: timesheetHours.toFixed(2),
+        status: "granted",
+        expiresAt: grantExpiresAt,
+        updatedAt: now,
+      })
+      .where(eq(compOffCreditsTable.id, request.id));
+
+    return true;
+  }
+
+  /**
+   * Public method to trigger comp off processing for a specific date
+   * Can be called by timesheet service when a timesheet is created/updated
+   */
+  async tryProcessCompOffForTimesheet(
+    orgId: number,
+    userId: number,
+    workDate: Date,
+    timesheetId: number,
+    timesheetHours: number
+  ): Promise<boolean> {
+    const db = this.database.connection;
+    const workDateKey = this.formatDateKey(workDate);
+
+    return db.transaction(async (tx) => {
+      await this.expireStalePendingCompOffRequests(tx, orgId, userId, new Date());
+
+      // Process pending comp-off request(s) for this user/date
+      const pendingRequests = await tx
+        .select({
+          id: compOffCreditsTable.id,
+        })
+        .from(compOffCreditsTable)
+        .where(
+          and(
+            eq(compOffCreditsTable.orgId, orgId),
+            eq(compOffCreditsTable.userId, userId),
+            eq(compOffCreditsTable.workDate, sql`CAST(${workDateKey} AS date)`),
+            eq(compOffCreditsTable.status, "pending")
+          )
+        );
+
+      if (pendingRequests.length === 0) {
+        return false;
+      }
+
+      let processed = false;
+      for (const pendingRequest of pendingRequests) {
+        const granted = await this.processCompOffCredit(
+          tx,
+          pendingRequest.id,
+          timesheetId,
+          timesheetHours,
+        );
+        processed = processed || granted;
+      }
+
+      return processed;
     });
   }
 
@@ -1896,6 +2180,8 @@ export class LeavesService {
     userId: number,
     orgId: number
   ) {
+    await this.expireStalePendingCompOffRequests(tx, orgId, userId, new Date());
+
     const leaveTypeId = await this.findCompOffLeaveTypeId(tx, orgId);
     if (!leaveTypeId) {
       return;
@@ -1919,6 +2205,28 @@ export class LeavesService {
     await this.expireStaleCompOffCredits(tx, orgId, userId, leaveTypeId, new Date());
   }
 
+  private async expireStalePendingCompOffRequests(
+    tx: DatabaseService["connection"],
+    orgId: number,
+    userId: number,
+    referenceDate: Date
+  ) {
+    await tx
+      .update(compOffCreditsTable)
+      .set({
+        status: "expired",
+        updatedAt: referenceDate,
+      })
+      .where(
+        and(
+          eq(compOffCreditsTable.orgId, orgId),
+          eq(compOffCreditsTable.userId, userId),
+          eq(compOffCreditsTable.status, "pending"),
+          lt(compOffCreditsTable.expiresAt, referenceDate)
+        )
+      );
+  }
+
   private async expireStaleCompOffCredits(
     tx: DatabaseService["connection"],
     orgId: number,
@@ -1930,6 +2238,7 @@ export class LeavesService {
       .select({
         id: compOffCreditsTable.id,
         creditedHours: compOffCreditsTable.creditedHours,
+        status: compOffCreditsTable.status,
       })
       .from(compOffCreditsTable)
       .where(
@@ -2007,16 +2316,21 @@ export class LeavesService {
     const bookedHours = this.normalizeHours(
       snapshot.bookedHours + (deltas.bookedHours ?? 0)
     );
+    const allocatedHours = this.normalizeHours(
+      snapshot.allocatedHours + (deltas.allocatedHours ?? 0)
+    );
 
     this.ensureNonNegative(balanceHours, "balance");
     this.ensureNonNegative(pendingHours, "pending");
     this.ensureNonNegative(bookedHours, "booked");
+    this.ensureNonNegative(allocatedHours, "allocated");
 
     return {
       id: snapshot.id,
       balanceHours,
       pendingHours,
       bookedHours,
+      allocatedHours,
     };
   }
 
@@ -2031,6 +2345,7 @@ export class LeavesService {
         balanceHours: leaveBalancesTable.balanceHours,
         pendingHours: leaveBalancesTable.pendingHours,
         bookedHours: leaveBalancesTable.bookedHours,
+        allocatedHours: leaveBalancesTable.allocatedHours,
       })
       .from(leaveBalancesTable)
       .where(
@@ -2053,6 +2368,7 @@ export class LeavesService {
       balanceHours: Number(row.balanceHours ?? 0),
       pendingHours: Number(row.pendingHours ?? 0),
       bookedHours: Number(row.bookedHours ?? 0),
+      allocatedHours: Number(row.allocatedHours ?? 0),
     };
   }
 
@@ -2069,6 +2385,7 @@ export class LeavesService {
         balanceHours: this.formatHours(next.balanceHours),
         pendingHours: this.formatHours(next.pendingHours),
         bookedHours: this.formatHours(next.bookedHours),
+        allocatedHours: this.formatHours(next.allocatedHours),
         updatedAt: new Date(),
       })
       .where(eq(leaveBalancesTable.id, snapshot.id));
