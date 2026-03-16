@@ -555,14 +555,10 @@ export const auditLogs = pgTable("audit_logs", {
   actorRole: varchar("actor_role", { length: 32 }),
   action: varchar("action", { length: 120 }).notNull(),
   subjectType: varchar("subject_type", { length: 80 }).notNull(),
-  subjectId: integer("subject_id"),
+  targetUserId: integer("target_user_id"),
   prev: jsonb("prev"),
   next: jsonb("next"),
-  meta: jsonb("meta"),
-  at: timestamp("at", { withTimezone: true }).defaultNow().notNull(),
-  legacySubjectType: varchar("subjectType", { length: 80 }),
-  legacyMetadata: jsonb("metadata"),
-  legacyCreatedAt: timestamp("createdAt", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 export const authBlacklistedTokens = pgTable(

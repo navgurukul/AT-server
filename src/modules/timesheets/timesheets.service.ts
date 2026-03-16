@@ -17,8 +17,10 @@ import {
 } from "drizzle-orm";
 
 import { SalaryCycleUtil } from '../../common/utils/salary-cycle.util';
+import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { DatabaseService } from '../../database/database.service';
 import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, notificationsTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
+import { AuditService } from '../audit/audit.service';
 import { CalendarService } from '../calendar/calendar.service';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 import { CreateTimesheetAdminDto } from './dto/create-timesheet-admin.dto';
@@ -48,7 +50,8 @@ export class TimesheetsService {
 
   constructor(
     private readonly database: DatabaseService,
-    private readonly calendarService: CalendarService
+    private readonly calendarService: CalendarService,
+    private readonly auditService: AuditService,
   ) {}
 
   async listTimesheets(params: ListTimesheetParams) {
@@ -651,7 +654,8 @@ export class TimesheetsService {
   async createOrUpsertByAdmin(
     payload: CreateTimesheetAdminDto,
     adminId: number,
-    orgId: number
+    orgId: number,
+    actorRoles: string[] = [],
   ) {
     const db = this.database.connection;
 
@@ -686,9 +690,28 @@ export class TimesheetsService {
     };
 
     // Call the existing createOrUpsert method with the target user ID
-    return this.createOrUpsert(timesheetDto, payload.userId, orgId, {
+    const result = await this.createOrUpsert(timesheetDto, payload.userId, orgId, {
       skipBackfillDeduction: true,
     });
+
+    const actorRole = this.getPrivilegedActorRole(actorRoles);
+    if (actorRole) {
+      await this.auditService.createLog({
+        orgId,
+        actorUserId: adminId,
+        actorRole,
+        action: 'timesheet_created',
+        subjectType: 'timesheet_created',
+        targetUserId: payload.userId,
+        next: {
+          workDate: payload.workDate,
+          notes: payload.notes ?? null,
+          entriesCount: payload.entries.length,
+        },
+      });
+    }
+
+    return result;
   }
 
   async updateBackfillLimit(payload: {
@@ -697,8 +720,9 @@ export class TimesheetsService {
     year: number;
     month: number;
     limit: number;
+    actor?: AuthenticatedUser;
   }) {
-    const { orgId, userId, year, month, limit } = payload;
+    const { orgId, userId, year, month, limit, actor } = payload;
     const db = this.database.connection;
     const now = new Date();
 
@@ -720,6 +744,7 @@ export class TimesheetsService {
       .limit(1);
 
     let used = counter ? Number(counter.used ?? 0) : 0;
+    const previousLimit = counter ? Number(counter.limit ?? DEFAULT_BACKFILL_PER_MONTH) : null;
 
     if (!counter) {
       used = await this.countBackfilledDaysForMonth(
@@ -761,6 +786,32 @@ export class TimesheetsService {
           lastUsedAt: now,
         })
         .where(eq(backfillCountersTable.id, counter.id));
+    }
+
+    const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
+    if (actorRole) {
+      await this.auditService.createLog({
+        orgId,
+        actorUserId: actor?.id,
+        actorRole,
+        action: 'Lifelines_Edited',
+        subjectType: 'Lifelines_Edited',
+        targetUserId: userId,
+        prev: {
+          userId,
+          year,
+          month,
+          used,
+          limit: previousLimit,
+        },
+        next: {
+          userId,
+          year,
+          month,
+          used,
+          limit,
+        },
+      });
     }
 
     return {
@@ -2318,6 +2369,7 @@ export class TimesheetsService {
       activities?: string;
     },
     orgId: number,
+    actor?: AuthenticatedUser,
   ) {
     const db = this.database.connection;
     const now = new Date();
@@ -2329,6 +2381,7 @@ export class TimesheetsService {
         timesheetId: timesheetEntriesTable.timesheetId,
         projectId: timesheetEntriesTable.projectId,
         hoursDecimal: timesheetEntriesTable.hoursDecimal,
+        taskDescription: timesheetEntriesTable.taskDescription,
       })
       .from(timesheetEntriesTable)
       .innerJoin(
@@ -2463,6 +2516,28 @@ export class TimesheetsService {
       .where(eq(timesheetEntriesTable.id, entryId))
       .returning();
 
+    const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
+    if (actorRole) {
+      await this.auditService.createLog({
+        orgId,
+        actorUserId: actor?.id,
+        actorRole,
+        action: 'timesheet_edited',
+        subjectType: 'timesheet_edited',
+        targetUserId,
+        prev: {
+          projectId: existingEntry.projectId,
+          hours: Number(existingEntry.hoursDecimal ?? 0),
+          activities: existingEntry.taskDescription ?? null,
+        },
+        next: {
+          projectId: updatedEntry.projectId,
+          hours: Number(updatedEntry.hoursDecimal ?? 0),
+          activities: updatedEntry.taskDescription ?? null,
+        },
+      });
+    }
+
     // Recalculate total hours for affected timesheets (only approved entries)
     const timesheetIds = new Set<number>([existingEntry.timesheetId]);
     if (updatePayload.timesheetId) {
@@ -2494,7 +2569,12 @@ export class TimesheetsService {
     return updatedEntry;
   }
 
-  async deleteTimesheetEntry(entryId: number, targetUserId: number, orgId: number) {
+  async deleteTimesheetEntry(
+    entryId: number,
+    targetUserId: number,
+    orgId: number,
+    actor?: AuthenticatedUser,
+  ) {
     const db = this.database.connection;
 
     // Check if the entry exists and belongs to the specified user
@@ -2502,6 +2582,9 @@ export class TimesheetsService {
       .select({
         id: timesheetEntriesTable.id,
         timesheetId: timesheetEntriesTable.timesheetId,
+        projectId: timesheetEntriesTable.projectId,
+        hoursDecimal: timesheetEntriesTable.hoursDecimal,
+        taskDescription: timesheetEntriesTable.taskDescription,
       })
       .from(timesheetEntriesTable)
       .innerJoin(
@@ -2554,7 +2637,38 @@ export class TimesheetsService {
       })
       .where(eq(timesheetsTable.id, timesheetId));
 
+    const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
+    if (actorRole) {
+      await this.auditService.createLog({
+        orgId,
+        actorUserId: actor?.id,
+        actorRole,
+        action: 'timesheet_deleted',
+        subjectType: 'timesheet_deleted',
+        targetUserId,
+        prev: {
+          projectId: existingEntry.projectId,
+          hours: Number(existingEntry.hoursDecimal ?? 0),
+          activities: existingEntry.taskDescription ?? null,
+          status: 'approved',
+        },
+        next: {
+          status: 'rejected',
+        },
+      });
+    }
+
     return { success: true, message: 'Timesheet entry deleted successfully' };
+  }
+
+  private getPrivilegedActorRole(roles: string[]): 'super_admin' | 'admin' | null {
+    if (roles.includes('super_admin')) {
+      return 'super_admin';
+    }
+    if (roles.includes('admin')) {
+      return 'admin';
+    }
+    return null;
   }
 }
 
