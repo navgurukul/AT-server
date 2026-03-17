@@ -1,12 +1,13 @@
 import { Module, OnModuleInit } from '@nestjs/common';
 import { ModuleRef } from "@nestjs/core";
 
+import { AuditModule } from '../audit/audit.module';
 import { CalendarModule } from '../calendar/calendar.module';
 import { LeavesController } from './leaves.controller';
 import { LeavesService } from './leaves.service';
 
 @Module({
-  imports: [CalendarModule],
+  imports: [CalendarModule, AuditModule],
   controllers: [LeavesController],
   providers: [LeavesService],
   exports: [LeavesService],

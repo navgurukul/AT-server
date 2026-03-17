@@ -1,7 +1,9 @@
 import { Body, Controller, Get, Param, ParseIntPipe, Post } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Permissions } from '../../common/decorators/permissions.decorator';
+import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { AssignPermissionsDto } from './dto/assign-permissions.dto';
 import { AssignRolesDto } from './dto/assign-roles.dto';
 import { RbacService } from './rbac.service';
@@ -46,7 +48,8 @@ export class RbacController {
   assignRolesToUser(
     @Param('userId', ParseIntPipe) userId: number,
     @Body() payload: AssignRolesDto,
+    @CurrentUser() actor: AuthenticatedUser | undefined,
   ) {
-    return this.rbacService.assignRolesToUser(userId, payload.roleKeys);
+    return this.rbacService.assignRolesToUser(userId, payload.roleKeys, actor);
   }
 }

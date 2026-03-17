@@ -1,46 +1,74 @@
 import { Injectable } from '@nestjs/common';
-import { and, desc, eq, ilike, or } from 'drizzle-orm';
+import { and, desc, eq, ilike, inArray, or } from 'drizzle-orm';
 
 import { DatabaseService } from '../../database/database.service';
 import { auditLogs, usersTable } from '../../db/schema';
 
 interface AuditFilters {
-  subjectType?: string;
+  role?: 'admin' | 'super_admin';
   actorId?: number;
-  search?: string;
-  limit?: number;
+  targetUserId?: number;
+}
+
+interface CreateAuditLogParams {
+  orgId: number;
+  actorUserId?: number | null;
+  actorRole?: string | null;
+  action: string;
+  subjectType: string;
+  targetUserId?: number | null;
+  prev?: unknown;
+  next?: unknown;
+  tx?: any;
 }
 
 @Injectable()
 export class AuditService {
   constructor(private readonly database: DatabaseService) {}
 
+  async createLog(params: CreateAuditLogParams) {
+    const db = params.tx ?? this.database.connection;
+
+    const [created] = await db
+      .insert(auditLogs)
+      .values({
+        orgId: params.orgId,
+        actorUserId: params.actorUserId ?? null,
+        actorRole: params.actorRole ?? null,
+        action: params.action,
+        subjectType: params.subjectType,
+        targetUserId: params.targetUserId ?? null,
+        prev: params.prev ?? null,
+        next: params.next ?? null,
+      })
+      .returning({ id: auditLogs.id });
+
+    return created;
+  }
+
   async listLogs(params: AuditFilters = {}) {
     const db = this.database.connection;
 
-    const filters = [];
-    if (params.subjectType) {
-      filters.push(eq(auditLogs.subjectType, params.subjectType));
-    }
+    const privilegedRoles: Array<'admin' | 'super_admin'> = [
+      'admin',
+      'super_admin',
+    ];
+
+    const filters = [
+      params.role
+        ? eq(auditLogs.actorRole, params.role)
+        : inArray(auditLogs.actorRole, privilegedRoles),
+    ];
+
     if (params.actorId) {
       filters.push(eq(auditLogs.actorUserId, params.actorId));
     }
-    if (params.search) {
-      const term = `%${params.search.toLowerCase()}%`;
-      filters.push(
-        or(
-          ilike(auditLogs.action, term),
-          ilike(auditLogs.subjectType, term),
-        ),
-      );
+    if (params.targetUserId) {
+      filters.push(eq(auditLogs.targetUserId, params.targetUserId));
     }
 
-    const whereClause =
-      filters.length > 0
-        ? and(...(filters as [typeof filters[number], ...typeof filters]))
-        : undefined;
-
-    const limit = params.limit && params.limit > 0 ? params.limit : 100;
+    const whereClause = and(...filters);
+    const limit = 100;
 
     const logs = await db
       .select({
@@ -50,11 +78,10 @@ export class AuditService {
         actorRole: auditLogs.actorRole,
         action: auditLogs.action,
         subjectType: auditLogs.subjectType,
-        subjectId: auditLogs.subjectId,
+        targetUserId: auditLogs.targetUserId,
         prev: auditLogs.prev,
         next: auditLogs.next,
-        meta: auditLogs.meta,
-        at: auditLogs.at,
+        createdAt: auditLogs.createdAt,
         actor: {
           id: usersTable.id,
           name: usersTable.name,
@@ -64,7 +91,7 @@ export class AuditService {
       .from(auditLogs)
       .leftJoin(usersTable, eq(auditLogs.actorUserId, usersTable.id))
       .where(whereClause)
-      .orderBy(desc(auditLogs.at), desc(auditLogs.id))
+      .orderBy(desc(auditLogs.createdAt), desc(auditLogs.id))
       .limit(limit);
 
     return logs;
