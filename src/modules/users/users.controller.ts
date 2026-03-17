@@ -146,9 +146,9 @@ export class UsersController {
   updateUser(
     @Param('id', ParseIntPipe) id: number,
     @Body() payload: UpdateUserDto,
-    @CurrentUser() _actor: AuthenticatedUser,
+    @CurrentUser() actor: AuthenticatedUser,
   ) {
-    return this.usersService.updateUser(id, payload);
+    return this.usersService.updateUser(id, payload, actor);
   }
 
   @Post('sync/google-sheet')

@@ -37,6 +37,7 @@ import {
   users,
 } from "../../db/schema";
 import { CalendarService } from "../calendar/calendar.service";
+import { AuditService } from "../audit/audit.service";
 import { CreateLeaveRequestDto } from "./dto/create-leave-request.dto";
 import { CreateLeaveForUserDto } from "./dto/create-leave-for-user.dto";
 import { BulkReviewLeaveIdsDto } from "./dto/bulk-review-leave-ids.dto";
@@ -85,7 +86,8 @@ interface LeaveBalanceSnapshot {
 export class LeavesService {
   constructor(
     private readonly database: DatabaseService,
-    private readonly calendarService: CalendarService
+    private readonly calendarService: CalendarService,
+    private readonly auditService: AuditService,
   ) {}
 
   async listBalances(userId: number) {
@@ -347,7 +349,8 @@ export class LeavesService {
   async createLeaveRequest(
     userId: number,
     orgId: number,
-    payload: CreateLeaveRequestDto
+    payload: CreateLeaveRequestDto,
+    actor?: AuthenticatedUser,
   ) {
     const db = this.database.connection;
     const startDate = new Date(payload.startDate);
@@ -667,6 +670,27 @@ export class LeavesService {
 
     await this.notifyLatestProjectSlackChannel(userId, orgId, notificationPayload);
 
+    const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
+    if (actorRole) {
+      await this.auditService.createLog({
+        orgId,
+        actorUserId: actor?.id,
+        actorRole,
+        action: 'leave_applied',
+        subjectType: 'leave_applied',
+        targetUserId: userId,
+        next: {
+          userId,
+          leaveTypeId: payload.leaveTypeId,
+          startDate: payload.startDate,
+          endDate: payload.endDate,
+          durationType: requestedDurationType,
+          hours: requestedHours,
+          reason: payload.reason ?? null,
+        },
+      });
+    }
+
     return request;
   }
 
@@ -697,7 +721,7 @@ export class LeavesService {
     }
 
     // Create leave request for the target user
-    return this.createLeaveRequest(payload.userId, targetUser.orgId, payload);
+    return this.createLeaveRequest(payload.userId, targetUser.orgId, payload, actor);
   }
 
   async grantCompOffCredit(
@@ -934,6 +958,26 @@ export class LeavesService {
       const leaveTypeId = await this.ensureCompOffLeaveType(tx, actor.orgId);
       let snapshot = await this.fetchLeaveBalanceSnapshot(tx, payload.userId, leaveTypeId);
 
+      const actorRole = this.getPrivilegedActorRole(actor.roles ?? []);
+      if (actorRole) {
+        await this.auditService.createLog({
+          tx,
+          orgId: actor.orgId,
+          actorUserId: actor.id,
+          actorRole,
+          action: 'comp_off_modified',
+          subjectType: 'comp_off_modified',
+          targetUserId: payload.userId,
+          next: {
+            userId: payload.userId,
+            workDate: payload.workDate,
+            duration: payload.duration,
+            creditedHours: Number(credit.creditedHours ?? 0),
+            status: credit.status,
+          },
+        });
+      }
+
       return {
         workRequest: {
           id: workRequest.id,
@@ -1144,6 +1188,29 @@ export class LeavesService {
           updatedAt: now,
         })
         .where(eq(compOffCreditsTable.id, credit.id));
+
+      const actorRole = this.getPrivilegedActorRole(actor.roles ?? []);
+      if (actorRole) {
+        await this.auditService.createLog({
+          tx,
+          orgId: actor.orgId,
+          actorUserId: actor.id,
+          actorRole,
+          action: 'comp_off_modified',
+          subjectType: 'comp_off_modified',
+          targetUserId: credit.userId,
+          prev: {
+            userId: credit.userId,
+            status: credit.status,
+            creditedHours: Number(credit.creditedHours ?? 0),
+            notes: credit.notes ?? null,
+          },
+          next: {
+            status: 'revoked',
+            notes: updatedNotes,
+          },
+        });
+      }
 
       return {
         creditId: credit.id,
@@ -1377,6 +1444,7 @@ export class LeavesService {
       const [request] = await tx
         .select({
           id: leaveRequestsTable.id,
+          orgId: leaveRequestsTable.orgId,
           state: leaveRequestsTable.state,
           userId: leaveRequestsTable.userId,
           hours: leaveRequestsTable.hours,
@@ -1424,6 +1492,11 @@ export class LeavesService {
       const isAdmin = roleKeys.includes("admin");
       const isSuperAdmin = roleKeys.includes("super_admin");
       const isManager = roleKeys.includes("manager");
+      const actorRole = isSuperAdmin
+        ? 'super_admin'
+        : isAdmin
+        ? 'admin'
+        : null;
 
       // Admin and super_admin can approve any request (except their own)
       if (isAdmin || isSuperAdmin) {
@@ -1510,6 +1583,25 @@ export class LeavesService {
         }
       }
 
+      if (actorRole) {
+        await this.auditService.createLog({
+          tx,
+          orgId: request.orgId,
+          actorUserId: approverId,
+          actorRole,
+          action: 'leave_modified',
+          subjectType: 'leave_modified',
+          targetUserId: request.userId,
+          prev: {
+            state: previousState,
+          },
+          next: {
+            state: newState,
+            comment: payload.comment ?? null,
+          },
+        });
+      }
+
       return updated;
     });
   }
@@ -1561,6 +1653,11 @@ export class LeavesService {
       const isAdmin = roleKeys.includes("admin");
       const isSuperAdmin = roleKeys.includes("super_admin");
       const isManager = roleKeys.includes("manager");
+      const actorRole = isSuperAdmin
+        ? 'super_admin'
+        : isAdmin
+        ? 'admin'
+        : null;
 
       // Check if user has any authorization role
       if (!isAdmin && !isSuperAdmin && !isManager) {
@@ -1729,6 +1826,27 @@ export class LeavesService {
         }
       }
 
+      if (actorRole) {
+        for (const request of eligible) {
+          await this.auditService.createLog({
+            tx,
+            orgId: request.orgId,
+            actorUserId: approverId,
+            actorRole,
+            action: 'leave_modified',
+            subjectType: 'leave_modified',
+            targetUserId: request.userId,
+            prev: {
+              state: request.state,
+            },
+            next: {
+              state: newState,
+              comment: payload.comment ?? null,
+            },
+          });
+        }
+      }
+
       const skipped = managedCandidates
         .filter((request) => !eligibleIdSet.has(request.id))
         .map((request) => ({
@@ -1747,6 +1865,16 @@ export class LeavesService {
         skipped,
       };
     });
+  }
+
+  private getPrivilegedActorRole(roles: string[]): 'super_admin' | 'admin' | null {
+    if (roles.includes('super_admin')) {
+      return 'super_admin';
+    }
+    if (roles.includes('admin')) {
+      return 'admin';
+    }
+    return null;
   }
   private async assertNoHolidays(
     orgId: number,

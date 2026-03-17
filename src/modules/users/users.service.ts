@@ -3,7 +3,9 @@ import { JWT } from 'google-auth-library';
 import { createHash } from 'crypto';
 import { and, count, eq, ilike, inArray, isNotNull, or } from 'drizzle-orm';
 
+import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { DatabaseService } from '../../database/database.service';
+import { AuditService } from '../audit/audit.service';
 import {
   employeeDepartmentsTable,
   permissionsTable,
@@ -42,7 +44,10 @@ export interface ManagerRoleSyncResult {
 
 @Injectable()
 export class UsersService {
-  constructor(private readonly database: DatabaseService) {}
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly auditService: AuditService,
+  ) {}
 
   async findUserByEmailInOrg(params: { email: string; orgId: number }) {
     const email = params.email.trim().toLowerCase();
@@ -490,13 +495,24 @@ export class UsersService {
     };
   }
 
-  async updateUser(id: number, payload: UpdateUserDto) {
+  async updateUser(id: number, payload: UpdateUserDto, actor?: AuthenticatedUser) {
     const db = this.database.connection;
 
     const [existing] = await db
       .select({
         id: usersTable.id,
         orgId: usersTable.orgId,
+        managerId: usersTable.managerId,
+        employeeDepartmentId: usersTable.employeeDepartmentId,
+        workLocationType: usersTable.workLocationType,
+        employmentType: usersTable.employmentType,
+        employmentStatus: usersTable.employmentStatus,
+        slackId: usersTable.slackId,
+        alumniStatus: usersTable.alumniStatus,
+        gender: usersTable.gender,
+        discordId: usersTable.discordId,
+        dateOfJoining: usersTable.dateOfJoining,
+        dateOfExit: usersTable.dateOfExit,
       })
       .from(usersTable)
       .where(eq(usersTable.id, id))
@@ -505,6 +521,12 @@ export class UsersService {
     if (!existing) {
       throw new NotFoundException(`User with id ${id} not found`);
     }
+
+    const currentRoles = await db
+      .select({ roleKey: rolesTable.key })
+      .from(userRolesTable)
+      .innerJoin(rolesTable, eq(userRolesTable.roleId, rolesTable.id))
+      .where(eq(userRolesTable.userId, id));
 
     const updateStatements: Record<string, unknown> = {};
     if (payload.managerId !== undefined) {
@@ -699,7 +721,7 @@ export class UsersService {
       }
     }
 
-    return {
+    const response = {
       ...user,
       managerId:
         user.managerId !== null && user.managerId !== undefined
@@ -716,6 +738,48 @@ export class UsersService {
         ...new Set(userRoles.map((assignment) => assignment.permissions)),
       ],
     };
+
+    const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
+    if (actorRole) {
+      await this.auditService.createLog({
+        orgId: Number(existing.orgId),
+        actorUserId: actor?.id,
+        actorRole,
+        action: 'profile_modified',
+        subjectType: 'profile_modified',
+        targetUserId: id,
+        prev: {
+          managerId: existing.managerId,
+          employeeDepartmentId: existing.employeeDepartmentId,
+          workLocationType: existing.workLocationType,
+          employmentType: existing.employmentType,
+          employmentStatus: existing.employmentStatus,
+          slackId: existing.slackId,
+          alumniStatus: existing.alumniStatus,
+          gender: existing.gender,
+          discordId: existing.discordId,
+          dateOfJoining: existing.dateOfJoining,
+          dateOfExit: existing.dateOfExit,
+          roles: currentRoles.map((r) => r.roleKey),
+        },
+        next: {
+          managerId: response.managerId,
+          employeeDepartmentId: response.employeeDepartmentId,
+          workLocationType: response.workLocationType,
+          employmentType: response.employmentType,
+          employmentStatus: response.employmentStatus,
+          slackId: response.slackId,
+          alumniStatus: response.alumniStatus,
+          gender: response.gender,
+          discordId: response.discordId,
+          dateOfJoining: response.dateOfJoining,
+          dateOfExit: response.dateOfExit,
+          roles: response.roles,
+        },
+      });
+    }
+
+    return response;
   }
 
   async syncUsersFromSheet(): Promise<SheetSyncResult> {
@@ -1150,7 +1214,7 @@ export class UsersService {
 
     // Fetch target user
     const [user] = await db
-      .select({ id: usersTable.id, name: usersTable.name, email: usersTable.email })
+      .select({ id: usersTable.id, orgId: usersTable.orgId, name: usersTable.name, email: usersTable.email })
       .from(usersTable)
       .where(eq(usersTable.id, userId))
       .limit(1);
@@ -1206,6 +1270,24 @@ export class UsersService {
     await db.delete(userRolesTable).where(eq(userRolesTable.userId, userId));
     await db.insert(userRolesTable).values({ userId, roleId: roleRecord.id });
 
+    const actorRole = this.getPrivilegedActorRole(actor.roles);
+    if (actorRole) {
+      await this.auditService.createLog({
+        orgId: Number(user.orgId),
+        actorUserId: actor.id,
+        actorRole,
+        action: role === 'employee' ? 'role_revoked' : 'role_assigned',
+        subjectType: 'user_role',
+        targetUserId: userId,
+        prev: {
+          role: currentRole,
+        },
+        next: {
+          role: roleRecord.key,
+        },
+      });
+    }
+
     return {
       success: true,
       message: `User role updated successfully`,
@@ -1219,5 +1301,15 @@ export class UsersService {
         name: roleRecord.name,
       },
     };
+  }
+
+  private getPrivilegedActorRole(roles: string[]): 'super_admin' | 'admin' | null {
+    if (roles.includes('super_admin')) {
+      return 'super_admin';
+    }
+    if (roles.includes('admin')) {
+      return 'admin';
+    }
+    return null;
   }
 }

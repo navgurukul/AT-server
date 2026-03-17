@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { asc, desc, eq, inArray } from 'drizzle-orm';
 
+import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { DatabaseService } from '../../database/database.service';
 import {
   permissionsTable,
@@ -13,6 +14,7 @@ import {
   userRolesTable,
   usersTable,
 } from '../../db/schema';
+import { AuditService } from '../audit/audit.service';
 
 export interface RoleWithPermissions {
   id: number;
@@ -23,7 +25,10 @@ export interface RoleWithPermissions {
 
 @Injectable()
 export class RbacService {
-  constructor(private readonly database: DatabaseService) {}
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly auditService: AuditService,
+  ) {}
 
   async listRoles(): Promise<RoleWithPermissions[]> {
     const db = this.database.connection;
@@ -243,7 +248,11 @@ export class RbacService {
     };
   }
 
-  async assignRolesToUser(userId: number, roleKeys: string[]) {
+  async assignRolesToUser(
+    userId: number,
+    roleKeys: string[],
+    actor?: AuthenticatedUser,
+  ) {
     const db = this.database.connection;
     const uniqueKeys = [...new Set(roleKeys.map((key) => key.trim()))].filter(
       (key) => key.length > 0,
@@ -262,6 +271,14 @@ export class RbacService {
     if (!user) {
       throw new NotFoundException(`User with id '${userId}' not found`);
     }
+
+    const existingAssignments = await db
+      .select({ roleKey: rolesTable.key })
+      .from(userRolesTable)
+      .innerJoin(rolesTable, eq(userRolesTable.roleId, rolesTable.id))
+      .where(eq(userRolesTable.userId, userId));
+
+    const existingRoleKeys = new Set(existingAssignments.map((r) => r.roleKey));
 
     const roles =
       uniqueKeys.length === 0
@@ -293,6 +310,41 @@ export class RbacService {
           })),
         )
         .onConflictDoNothing();
+    }
+
+    const addedRoles = roles
+      .map((role) => role.key)
+      .filter((roleKey) => !existingRoleKeys.has(roleKey));
+
+    const actorRole = actor?.roles?.includes('super_admin')
+      ? 'super_admin'
+      : actor?.roles?.includes('admin')
+      ? 'admin'
+      : null;
+
+    if (actor && actorRole && addedRoles.length > 0) {
+      const [targetUser] = await db
+        .select({ orgId: usersTable.orgId })
+        .from(usersTable)
+        .where(eq(usersTable.id, userId))
+        .limit(1);
+
+      if (targetUser?.orgId) {
+        await this.auditService.createLog({
+          orgId: Number(targetUser.orgId),
+          actorUserId: actor.id,
+          actorRole,
+          action: 'role_assigned',
+          subjectType: 'role_assigned',
+          targetUserId: userId,
+          prev: {
+            roles: [...existingRoleKeys],
+          },
+          next: {
+            roles: [...existingRoleKeys, ...addedRoles],
+          },
+        });
+      }
     }
 
     return this.getUserRoleSummary(userId);

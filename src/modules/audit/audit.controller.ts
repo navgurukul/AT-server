@@ -10,16 +10,19 @@ export class AuditController {
   constructor(private readonly auditService: AuditService) {}
 
   @Get('logs')
-  @ApiQuery({ name: 'subjectType', required: false })
+  @ApiQuery({ name: 'role', required: false, enum: ['admin', 'super_admin'] })
   @ApiQuery({ name: 'actorId', required: false })
+  @ApiQuery({ name: 'targetUserId', required: false })
   @Permissions('audit:view')
   listLogs(
-    @Query('subjectType') subjectType?: string,
+    @Query('role') role?: 'admin' | 'super_admin',
     @Query('actorId') actorId?: string,
+    @Query('targetUserId') targetUserId?: string,
   ) {
     return this.auditService.listLogs({
-      subjectType: subjectType ?? undefined,
+      role,
       actorId: actorId ? Number.parseInt(actorId, 10) : undefined,
+      targetUserId: targetUserId ? Number.parseInt(targetUserId, 10) : undefined,
     });
   }
 }

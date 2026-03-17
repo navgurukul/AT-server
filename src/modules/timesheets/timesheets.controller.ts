@@ -136,7 +136,12 @@ export class TimesheetsController {
     if (!user) {
       return null;
     }
-    return this.timesheetsService.createOrUpsertByAdmin(payload, user.id, user.orgId);
+    return this.timesheetsService.createOrUpsertByAdmin(
+      payload,
+      user.id,
+      user.orgId,
+      user.roles,
+    );
   }
 
   @Post('backfill/limit')
@@ -154,6 +159,7 @@ export class TimesheetsController {
       year: payload.year,
       month: payload.month,
       limit: payload.limit,
+      actor,
     });
   }
 
@@ -197,6 +203,7 @@ export class TimesheetsController {
         activities: payload.activities,
       },
       actor.orgId,
+      actor,
     );
   }
 
@@ -229,6 +236,7 @@ export class TimesheetsController {
       parsedEntryId,
       parsedTargetUserId,
       actor.orgId,
+      actor,
     );
   }
 
