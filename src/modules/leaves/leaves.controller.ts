@@ -100,7 +100,8 @@ export class LeavesController {
   @Permissions("leave:view:self")
   listCompOffCredits(
     @Query("userId") userId: string | undefined,
-    @Query("status") status: "granted" | "expired" | "revoked" | undefined,
+    @Query("status")
+    status: "pending" | "granted" | "expired" | "revoked" | undefined,
     @CurrentUser() actor: AuthenticatedUser | undefined
   ) {
     if (!actor) {

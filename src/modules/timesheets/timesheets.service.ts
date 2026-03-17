@@ -22,6 +22,7 @@ import { DatabaseService } from '../../database/database.service';
 import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, notificationsTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
 import { AuditService } from '../audit/audit.service';
 import { CalendarService } from '../calendar/calendar.service';
+import { LeavesService } from '../leaves/leaves.service';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 import { CreateTimesheetAdminDto } from './dto/create-timesheet-admin.dto';
 
@@ -51,6 +52,7 @@ export class TimesheetsService {
   constructor(
     private readonly database: DatabaseService,
     private readonly calendarService: CalendarService,
+    private readonly leavesService: LeavesService,
     private readonly auditService: AuditService,
   ) {}
 
@@ -581,7 +583,29 @@ export class TimesheetsService {
         ? backfillAllowance.remaining
         : Math.max(backfillAllowance.remaining - (existing ? 0 : 1), 0)
       : backfillAllowance.remaining;
+// Try to automatically process comp off for this timesheet
+    // This happens after the transaction to avoid any conflicts
+    try {
+      const totalHoursNum = Number(result.timesheet.totalHours ?? 0);
+      if (totalHoursNum > 0) {
+        await this.leavesService.tryProcessCompOffForTimesheet(
+          orgId,
+          userId,
+          workDate,
+          result.timesheet.id,
+          totalHoursNum
+        );
+      }
+    } catch (error) {
+      // If comp off processing fails, just log it
+      // The comp off can be processed manually later or retried
+      this.logger.warn(
+        `Failed to auto-process comp off for timesheet ${result.timesheet.id}:`,
+        error
+      );
+    }
 
+    // 
     // Send Slack notifications per project channel
     const entriesByProject = result.entries.reduce<
       Record<

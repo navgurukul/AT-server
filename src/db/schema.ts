@@ -56,6 +56,7 @@ export const leaveStateEnum = pgEnum("leave_state", [
 ]);
 
 export const compOffStatusEnum = pgEnum("comp_off_status", [
+  "pending",
   "granted",
   "expired",
   "revoked",
@@ -696,6 +697,7 @@ export const schema = {
   leavePolicies,
   leaveBalances,
   leaveRequests,
+  compOffCredits,
   approvals,
   payrollWindows,
   jobs,
