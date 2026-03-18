@@ -1,4 +1,5 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { JWT } from 'google-auth-library';
 import { createHash } from 'crypto';
 import { and, count, eq, ilike, inArray, isNotNull, or } from 'drizzle-orm';
@@ -1075,6 +1076,22 @@ export class UsersService {
       missingManagers: Array.from(missingManagers),
     };
   }
+
+@Cron(`0 1 * * *`, {
+  name: 'users-google-sheet-sync',
+  timeZone: 'UTC',
+})
+async syncUsersFromSheetCron() {
+  await this.syncUsersFromSheet();
+}
+
+@Cron('30 1 * * *', {
+  name: 'users-manager-roles-sync',
+  timeZone: 'UTC',
+})
+async syncManagerRolesCron() {
+  await this.ensureReportingManagersHaveManagerRole();
+}
 
   async ensureReportingManagersHaveManagerRole(): Promise<ManagerRoleSyncResult> {
     const db = this.database.connection;
