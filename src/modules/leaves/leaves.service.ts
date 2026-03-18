@@ -44,6 +44,7 @@ import { BulkReviewLeaveIdsDto } from "./dto/bulk-review-leave-ids.dto";
 import { ReviewLeaveRequestDto } from "./dto/review-leave-request.dto";
 import { GrantCompOffDto } from "./dto/grant-comp-off.dto";
 import { RevokeCompOffDto } from "./dto/revoke-comp-off.dto";
+import { UpdateAllocatedLeaveDto } from "./dto/update-allocated-leave.dto";
 import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
 import { SalaryCycleUtil } from "../../common/utils/salary-cycle.util";
 
@@ -146,6 +147,105 @@ export class LeavesService {
       userId,
       balances,
     };
+  }
+
+  async listBalancesForActor(
+    actor: AuthenticatedUser,
+    requestedUserId?: number
+  ) {
+    if (!requestedUserId || Number.isNaN(requestedUserId)) {
+      return this.listBalances(actor.id);
+    }
+
+    if (requestedUserId === actor.id) {
+      return this.listBalances(actor.id);
+    }
+
+    const db = this.database.connection;
+
+    const [targetUser] = await db
+      .select({
+        id: usersTable.id,
+        orgId: usersTable.orgId,
+        managerId: usersTable.managerId,
+      })
+      .from(usersTable)
+      .where(eq(usersTable.id, requestedUserId))
+      .limit(1);
+
+    if (!targetUser || Number(targetUser.orgId) !== actor.orgId) {
+      throw new NotFoundException("User not found in this organisation");
+    }
+
+    if (this.hasOrgWideLeaveBalanceAccess(actor)) {
+      return this.listBalances(requestedUserId);
+    }
+
+    const isDirectReport =
+      targetUser.managerId !== null &&
+      targetUser.managerId !== undefined &&
+      Number(targetUser.managerId) === actor.id;
+
+    if (this.isReportingManager(actor) && isDirectReport) {
+      return this.listBalances(requestedUserId);
+    }
+
+    throw new ForbiddenException(
+      "You can only view leave balances for your direct reports"
+    );
+  }
+
+  async listBalancesForActorByEmail(
+    actor: AuthenticatedUser,
+    requestedEmail: string
+  ) {
+    const normalizedEmail = requestedEmail.trim().toLowerCase();
+
+    if (!normalizedEmail) {
+      throw new BadRequestException("email is required");
+    }
+
+    if (normalizedEmail === actor.email.trim().toLowerCase()) {
+      return this.listBalances(actor.id);
+    }
+
+    const db = this.database.connection;
+
+    const [targetUser] = await db
+      .select({
+        id: usersTable.id,
+        orgId: usersTable.orgId,
+        managerId: usersTable.managerId,
+      })
+      .from(usersTable)
+      .where(
+        and(
+          eq(usersTable.orgId, actor.orgId),
+          sql`lower(${usersTable.email}) = ${normalizedEmail}`
+        )
+      )
+      .limit(1);
+
+    if (!targetUser) {
+      throw new NotFoundException("User not found in this organisation");
+    }
+
+    if (this.hasOrgWideLeaveBalanceAccess(actor)) {
+      return this.listBalances(targetUser.id);
+    }
+
+    const isDirectReport =
+      targetUser.managerId !== null &&
+      targetUser.managerId !== undefined &&
+      Number(targetUser.managerId) === actor.id;
+
+    if (this.isReportingManager(actor) && isDirectReport) {
+      return this.listBalances(targetUser.id);
+    }
+
+    throw new ForbiddenException(
+      "You can only view leave balances for your direct reports"
+    );
   }
 
   async listLeaveTypes(orgId: number) {
@@ -722,6 +822,647 @@ export class LeavesService {
 
     // Create leave request for the target user
     return this.createLeaveRequest(payload.userId, targetUser.orgId, payload, actor);
+  }
+
+  async adminEditLeaveRequest(
+    actor: AuthenticatedUser,
+    requestId: number,
+    payload: CreateLeaveRequestDto
+  ) {
+    const isPrivilegedActor =
+      actor.roles.includes("admin") || actor.roles.includes("super_admin");
+
+    if (!isPrivilegedActor) {
+      throw new ForbiddenException(
+        "Only admin and super_admin can edit leave applications"
+      );
+    }
+
+    const db = this.database.connection;
+    const startDate = new Date(payload.startDate);
+    const endDate = new Date(payload.endDate);
+
+    if (endDate < startDate) {
+      throw new BadRequestException("End date cannot be before start date");
+    }
+
+    const today = this.normalizeDateUTC(new Date());
+    const normalizedStartDate = this.normalizeDateUTC(startDate);
+    const normalizedEndDate = this.normalizeDateUTC(endDate);
+    if (normalizedStartDate < today || normalizedEndDate < today) {
+      const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(new Date());
+      const cycleStart = this.normalizeDateUTC(currentCycle.start);
+      const cycleEnd = this.normalizeDateUTC(currentCycle.end);
+
+      if (normalizedStartDate < cycleStart || normalizedEndDate < cycleStart) {
+        throw new BadRequestException(
+          `Leave requests for past dates are only allowed within the current salary cycle (${currentCycle.cycleLabel})`
+        );
+      }
+
+      if (normalizedStartDate >= cycleEnd || normalizedEndDate >= cycleEnd) {
+        throw new BadRequestException(
+          `Leave requests for past dates are only allowed within the current salary cycle (${currentCycle.cycleLabel})`
+        );
+      }
+    }
+
+    return db.transaction(async (tx) => {
+      const [existingRequest] = await tx
+        .select({
+          id: leaveRequestsTable.id,
+          orgId: leaveRequestsTable.orgId,
+          userId: leaveRequestsTable.userId,
+          leaveTypeId: leaveRequestsTable.leaveTypeId,
+          state: leaveRequestsTable.state,
+          hours: leaveRequestsTable.hours,
+          leaveTypePaid: leaveTypesTable.paid,
+          startDate: leaveRequestsTable.startDate,
+          endDate: leaveRequestsTable.endDate,
+          durationType: leaveRequestsTable.durationType,
+          halfDaySegment: leaveRequestsTable.halfDaySegment,
+          reason: leaveRequestsTable.reason,
+        })
+        .from(leaveRequestsTable)
+        .innerJoin(
+          leaveTypesTable,
+          eq(leaveTypesTable.id, leaveRequestsTable.leaveTypeId)
+        )
+        .where(eq(leaveRequestsTable.id, requestId))
+        .limit(1);
+
+      if (!existingRequest) {
+        throw new NotFoundException("Leave request not found");
+      }
+
+      if (Number(existingRequest.orgId) !== actor.orgId) {
+        throw new ForbiddenException(
+          "Cannot edit leave requests from a different organization"
+        );
+      }
+
+      if (existingRequest.state !== "pending") {
+        throw new BadRequestException(
+          `Only pending leave requests can be edited (current state: ${existingRequest.state})`
+        );
+      }
+
+      const [targetLeaveType] = await tx
+        .select({
+          id: leaveTypesTable.id,
+          paid: leaveTypesTable.paid,
+        })
+        .from(leaveTypesTable)
+        .where(
+          and(
+            eq(leaveTypesTable.id, payload.leaveTypeId),
+            eq(leaveTypesTable.orgId, actor.orgId)
+          )
+        )
+        .limit(1);
+
+      if (!targetLeaveType) {
+        throw new NotFoundException("Leave type not found for this organisation");
+      }
+
+      const [policy] = await tx
+        .select({ id: leavePoliciesTable.id })
+        .from(leavePoliciesTable)
+        .where(
+          and(
+            eq(leavePoliciesTable.leaveTypeId, payload.leaveTypeId),
+            eq(leavePoliciesTable.orgId, actor.orgId)
+          )
+        )
+        .limit(1);
+
+      if (!policy) {
+        throw new BadRequestException(
+          "No leave policy configured for the selected leave type"
+        );
+      }
+
+      const { workingDays, totalHours } = await this.calculateWorkingHours(
+        actor.orgId,
+        startDate,
+        endDate
+      );
+
+      if (totalHours <= 0) {
+        throw new BadRequestException(
+          "Selected date range contains no working days"
+        );
+      }
+
+      let requestedDurationType: "half_day" | "full_day" | "custom" = "full_day";
+      let requestedHours = 0;
+      let requestedHalfDaySegment: "first_half" | "second_half" | null = null;
+
+      switch (payload.durationType) {
+        case "half_day":
+          if (!payload.halfDaySegment) {
+            throw new BadRequestException(
+              "Half-day requests must specify whether it is the first or second half"
+            );
+          }
+          requestedDurationType = "half_day";
+          requestedHours = workingDays * HALF_DAY_HOURS;
+          requestedHalfDaySegment = payload.halfDaySegment;
+          break;
+        case "full_day":
+          requestedDurationType = "full_day";
+          requestedHours = totalHours;
+          break;
+        case "custom":
+          if (payload.hours === undefined) {
+            throw new BadRequestException(
+              "Custom duration requires leave hours to be specified"
+            );
+          }
+          requestedDurationType = "custom";
+          requestedHours = payload.hours;
+          break;
+        default:
+          if (payload.hours !== undefined) {
+            requestedDurationType = "custom";
+            requestedHours = payload.hours;
+          } else {
+            requestedDurationType = "full_day";
+            requestedHours = totalHours;
+          }
+      }
+
+      if (
+        payload.halfDaySegment &&
+        requestedDurationType !== "half_day"
+      ) {
+        throw new BadRequestException(
+          "Half-day segment can only be provided for half-day requests"
+        );
+      }
+
+      if (requestedHours <= 0) {
+        throw new BadRequestException("Leave hours must be greater than zero");
+      }
+
+      if (requestedHours > totalHours) {
+        throw new BadRequestException(
+          `Requested hours exceed available working hours (${totalHours})`
+        );
+      }
+
+      const overlappingRequests = await tx
+        .select({
+          id: leaveRequestsTable.id,
+          durationType: leaveRequestsTable.durationType,
+          halfDaySegment: leaveRequestsTable.halfDaySegment,
+        })
+        .from(leaveRequestsTable)
+        .where(
+          and(
+            eq(leaveRequestsTable.userId, existingRequest.userId),
+            inArray(leaveRequestsTable.state, ["pending", "approved"]),
+            sql`${leaveRequestsTable.id} != ${requestId}`,
+            or(
+              and(
+                gte(leaveRequestsTable.startDate, startDate),
+                lte(leaveRequestsTable.startDate, endDate)
+              ),
+              and(
+                gte(leaveRequestsTable.endDate, startDate),
+                lte(leaveRequestsTable.endDate, endDate)
+              ),
+              and(
+                lte(leaveRequestsTable.startDate, startDate),
+                gte(leaveRequestsTable.endDate, endDate)
+              )
+            )
+          )
+        );
+
+      for (const existing of overlappingRequests) {
+        if (
+          requestedDurationType === "half_day" &&
+          existing.durationType === "half_day" &&
+          requestedHalfDaySegment !== existing.halfDaySegment
+        ) {
+          continue;
+        }
+
+        throw new BadRequestException(
+          "Overlapping leave request exists for the selected period"
+        );
+      }
+
+      if (
+        await this.hasBlockingTimesheet(
+          actor.orgId,
+          existingRequest.userId,
+          startDate,
+          endDate,
+          requestedDurationType
+        )
+      ) {
+        throw new BadRequestException(
+          "Cannot request leave for dates where timesheets already exist"
+        );
+      }
+
+      const previousHours = Number(existingRequest.hours ?? 0);
+      const previousLeaveTypeId = Number(existingRequest.leaveTypeId);
+      const previousPaidLeave = existingRequest.leaveTypePaid ?? true;
+      const nextPaidLeave = targetLeaveType.paid ?? true;
+
+      if (previousPaidLeave) {
+        await this.ensureLeaveBalanceRow(
+          tx,
+          existingRequest.userId,
+          previousLeaveTypeId
+        );
+
+        if (existingRequest.state === "pending") {
+          await this.adjustLeaveBalance(tx, existingRequest.userId, previousLeaveTypeId, {
+            balanceHours: previousHours,
+            pendingHours: -previousHours,
+          });
+        } else {
+          await this.adjustLeaveBalance(tx, existingRequest.userId, previousLeaveTypeId, {
+            balanceHours: previousHours,
+            bookedHours: -previousHours,
+          });
+        }
+      }
+
+      if (nextPaidLeave) {
+        await this.ensureLeaveBalanceRow(
+          tx,
+          existingRequest.userId,
+          payload.leaveTypeId
+        );
+
+        const nextSnapshot = await this.fetchLeaveBalanceSnapshot(
+          tx,
+          existingRequest.userId,
+          payload.leaveTypeId
+        );
+
+        if (nextSnapshot.balanceHours < requestedHours) {
+          throw new BadRequestException(
+            "Insufficient leave balance for this leave type"
+          );
+        }
+
+        if (existingRequest.state === "pending") {
+          await this.updateLeaveBalanceFromSnapshot(tx, nextSnapshot, {
+            balanceHours: -requestedHours,
+            pendingHours: requestedHours,
+          });
+        } else {
+          await this.updateLeaveBalanceFromSnapshot(tx, nextSnapshot, {
+            balanceHours: -requestedHours,
+            bookedHours: requestedHours,
+          });
+        }
+      }
+
+      const [updatedRequest] = await tx
+        .update(leaveRequestsTable)
+        .set({
+          leaveTypeId: payload.leaveTypeId,
+          startDate,
+          endDate,
+          durationType: requestedDurationType,
+          halfDaySegment: requestedHalfDaySegment,
+          hours: requestedHours.toFixed(2),
+          reason:
+            payload.reason !== undefined
+              ? payload.reason
+              : existingRequest.reason ?? null,
+          updatedAt: new Date(),
+        })
+        .where(eq(leaveRequestsTable.id, requestId))
+        .returning({
+          id: leaveRequestsTable.id,
+          userId: leaveRequestsTable.userId,
+          leaveTypeId: leaveRequestsTable.leaveTypeId,
+          state: leaveRequestsTable.state,
+          startDate: leaveRequestsTable.startDate,
+          endDate: leaveRequestsTable.endDate,
+          durationType: leaveRequestsTable.durationType,
+          halfDaySegment: leaveRequestsTable.halfDaySegment,
+          hours: leaveRequestsTable.hours,
+          reason: leaveRequestsTable.reason,
+          updatedAt: leaveRequestsTable.updatedAt,
+        });
+
+      const actorRole = this.getPrivilegedActorRole(actor.roles ?? []);
+      if (actorRole) {
+        await this.auditService.createLog({
+          tx,
+          orgId: actor.orgId,
+          actorUserId: actor.id,
+          actorRole,
+          action: "leave_Edited",
+          subjectType: "leave_modified",
+          targetUserId: existingRequest.userId,
+          prev: {
+            id: existingRequest.id,
+            leaveTypeId: previousLeaveTypeId,
+            state: existingRequest.state,
+            startDate: existingRequest.startDate,
+            endDate: existingRequest.endDate,
+            durationType: existingRequest.durationType,
+            halfDaySegment: existingRequest.halfDaySegment,
+            hours: previousHours,
+            reason: existingRequest.reason ?? null,
+          },
+          next: {
+            id: updatedRequest.id,
+            leaveTypeId: updatedRequest.leaveTypeId,
+            state: updatedRequest.state,
+            startDate: updatedRequest.startDate,
+            endDate: updatedRequest.endDate,
+            durationType: updatedRequest.durationType,
+            halfDaySegment: updatedRequest.halfDaySegment,
+            hours: Number(updatedRequest.hours ?? 0),
+            reason: updatedRequest.reason ?? null,
+          },
+        });
+      }
+
+      return {
+        id: updatedRequest.id,
+        userId: updatedRequest.userId,
+        leaveTypeId: updatedRequest.leaveTypeId,
+        state: updatedRequest.state,
+        startDate: updatedRequest.startDate,
+        endDate: updatedRequest.endDate,
+        durationType: updatedRequest.durationType,
+        halfDaySegment: updatedRequest.halfDaySegment,
+        hours: Number(updatedRequest.hours ?? 0),
+        reason: updatedRequest.reason ?? null,
+        updatedAt: updatedRequest.updatedAt,
+      };
+    });
+  }
+
+  async adminDeleteApprovedLeaveRequest(
+    actor: AuthenticatedUser,
+    requestId: number
+  ) {
+    const isPrivilegedActor =
+      actor.roles.includes("admin") || actor.roles.includes("super_admin");
+
+    if (!isPrivilegedActor) {
+      throw new ForbiddenException(
+        "Only admin and super_admin can delete leave applications"
+      );
+    }
+
+    const db = this.database.connection;
+
+    return db.transaction(async (tx) => {
+      const [existingRequest] = await tx
+        .select({
+          id: leaveRequestsTable.id,
+          orgId: leaveRequestsTable.orgId,
+          userId: leaveRequestsTable.userId,
+          leaveTypeId: leaveRequestsTable.leaveTypeId,
+          state: leaveRequestsTable.state,
+          hours: leaveRequestsTable.hours,
+          leaveTypePaid: leaveTypesTable.paid,
+          startDate: leaveRequestsTable.startDate,
+          endDate: leaveRequestsTable.endDate,
+          durationType: leaveRequestsTable.durationType,
+          halfDaySegment: leaveRequestsTable.halfDaySegment,
+          reason: leaveRequestsTable.reason,
+        })
+        .from(leaveRequestsTable)
+        .innerJoin(
+          leaveTypesTable,
+          eq(leaveTypesTable.id, leaveRequestsTable.leaveTypeId)
+        )
+        .where(eq(leaveRequestsTable.id, requestId))
+        .limit(1);
+
+      if (!existingRequest) {
+        throw new NotFoundException("Leave request not found");
+      }
+
+      if (Number(existingRequest.orgId) !== actor.orgId) {
+        throw new ForbiddenException(
+          "Cannot delete leave requests from a different organization"
+        );
+      }
+
+      if (existingRequest.state !== "approved") {
+        throw new BadRequestException(
+          `Only approved leave requests can be deleted (current state: ${existingRequest.state})`
+        );
+      }
+
+      const approvedHours = Number(existingRequest.hours ?? 0);
+      let updatedBalance: LeaveBalanceSnapshot | null = null;
+
+      if (existingRequest.leaveTypePaid ?? true) {
+        await this.ensureLeaveBalanceRow(
+          tx,
+          existingRequest.userId,
+          existingRequest.leaveTypeId
+        );
+
+        updatedBalance = await this.adjustLeaveBalance(
+          tx,
+          existingRequest.userId,
+          existingRequest.leaveTypeId,
+          {
+            bookedHours: -approvedHours,
+            balanceHours: approvedHours,
+          }
+        );
+      }
+
+      await tx
+        .delete(approvalsTable)
+        .where(
+          and(
+            eq(approvalsTable.subjectType, "leave_request"),
+            eq(approvalsTable.subjectId, requestId)
+          )
+        );
+
+      await tx
+        .delete(leaveRequestsTable)
+        .where(eq(leaveRequestsTable.id, requestId));
+
+      const actorRole = this.getPrivilegedActorRole(actor.roles ?? []);
+      if (actorRole) {
+        await this.auditService.createLog({
+          tx,
+          orgId: actor.orgId,
+          actorUserId: actor.id,
+          actorRole,
+          action: "leave_deleted",
+          subjectType: "leave_modified",
+          targetUserId: existingRequest.userId,
+          prev: {
+            id: existingRequest.id,
+            leaveTypeId: existingRequest.leaveTypeId,
+            state: existingRequest.state,
+            startDate: existingRequest.startDate,
+            endDate: existingRequest.endDate,
+            durationType: existingRequest.durationType,
+            halfDaySegment: existingRequest.halfDaySegment,
+            hours: approvedHours,
+            reason: existingRequest.reason ?? null,
+          },
+          next: {
+            deleted: true,
+            restoredHours: approvedHours,
+          },
+        });
+      }
+
+      return {
+        deletedRequestId: existingRequest.id,
+        userId: existingRequest.userId,
+        leaveTypeId: existingRequest.leaveTypeId,
+        restoredHours: approvedHours,
+        recalculatedBalance: updatedBalance
+          ? {
+              balanceHours: this.normalizeHours(updatedBalance.balanceHours),
+              pendingHours: this.normalizeHours(updatedBalance.pendingHours),
+              bookedHours: this.normalizeHours(updatedBalance.bookedHours),
+            }
+          : null,
+      };
+    });
+  }
+
+  async adminUpdateAllocatedLeave(
+    actor: AuthenticatedUser,
+    payload: UpdateAllocatedLeaveDto
+  ) {
+    const isPrivilegedActor =
+      actor.roles.includes("admin") || actor.roles.includes("super_admin");
+
+    if (!isPrivilegedActor) {
+      throw new ForbiddenException(
+        "Only admin and super_admin can update allocated leave"
+      );
+    }
+
+    const db = this.database.connection;
+
+    return db.transaction(async (tx) => {
+      const [targetUser] = await tx
+        .select({ id: usersTable.id, orgId: usersTable.orgId })
+        .from(usersTable)
+        .where(eq(usersTable.id, payload.userId))
+        .limit(1);
+
+      if (!targetUser || Number(targetUser.orgId) !== actor.orgId) {
+        throw new NotFoundException("User not found in this organisation");
+      }
+
+      const [leaveType] = await tx
+        .select({ id: leaveTypesTable.id, orgId: leaveTypesTable.orgId })
+        .from(leaveTypesTable)
+        .where(eq(leaveTypesTable.id, payload.leaveTypeId))
+        .limit(1);
+
+      if (!leaveType || Number(leaveType.orgId) !== actor.orgId) {
+        throw new NotFoundException(
+          "Leave type not found in this organisation"
+        );
+      }
+
+      await this.ensureLeaveBalanceRow(tx, payload.userId, payload.leaveTypeId);
+
+      const snapshot = await this.fetchLeaveBalanceSnapshot(
+        tx,
+        payload.userId,
+        payload.leaveTypeId
+      );
+
+      const nextAllocatedHours = this.normalizeHours(
+        Number(payload.allocatedHours)
+      );
+      this.ensureNonNegative(nextAllocatedHours, "allocated");
+
+      const recalculatedBalanceHours = this.normalizeHours(
+        nextAllocatedHours - snapshot.pendingHours - snapshot.bookedHours
+      );
+
+      if (recalculatedBalanceHours < -HOURS_NEGATIVE_TOLERANCE) {
+        throw new BadRequestException(
+          "Allocated leave cannot be less than pending plus booked leave hours"
+        );
+      }
+
+      const nextSnapshot: LeaveBalanceSnapshot = {
+        id: snapshot.id,
+        allocatedHours: nextAllocatedHours,
+        balanceHours: recalculatedBalanceHours,
+        pendingHours: snapshot.pendingHours,
+        bookedHours: snapshot.bookedHours,
+      };
+
+      await tx
+        .update(leaveBalancesTable)
+        .set({
+          balanceHours: this.formatHours(nextSnapshot.balanceHours),
+          pendingHours: this.formatHours(nextSnapshot.pendingHours),
+          bookedHours: this.formatHours(nextSnapshot.bookedHours),
+          allocatedHours: this.formatHours(nextSnapshot.allocatedHours),
+          updatedAt: new Date(),
+        })
+        .where(eq(leaveBalancesTable.id, snapshot.id));
+
+      const actorRole = this.getPrivilegedActorRole(actor.roles ?? []);
+      if (actorRole) {
+        await this.auditService.createLog({
+          tx,
+          orgId: actor.orgId,
+          actorUserId: actor.id,
+          actorRole,
+          action: "leave_balance_allocated_updated",
+          subjectType: "leave_balance",
+          targetUserId: payload.userId,
+          prev: {
+            leaveTypeId: payload.leaveTypeId,
+            allocatedHours: this.normalizeHours(snapshot.allocatedHours),
+            balanceHours: this.normalizeHours(snapshot.balanceHours),
+            pendingHours: this.normalizeHours(snapshot.pendingHours),
+            bookedHours: this.normalizeHours(snapshot.bookedHours),
+          },
+          next: {
+            leaveTypeId: payload.leaveTypeId,
+            allocatedHours: this.normalizeHours(nextSnapshot.allocatedHours),
+            balanceHours: this.normalizeHours(nextSnapshot.balanceHours),
+            pendingHours: this.normalizeHours(nextSnapshot.pendingHours),
+            bookedHours: this.normalizeHours(nextSnapshot.bookedHours),
+          },
+        });
+      }
+
+      return {
+        userId: payload.userId,
+        leaveTypeId: payload.leaveTypeId,
+        previous: {
+          allocatedHours: this.normalizeHours(snapshot.allocatedHours),
+          balanceHours: this.normalizeHours(snapshot.balanceHours),
+          pendingHours: this.normalizeHours(snapshot.pendingHours),
+          bookedHours: this.normalizeHours(snapshot.bookedHours),
+        },
+        recalculated: {
+          allocatedHours: this.normalizeHours(nextSnapshot.allocatedHours),
+          balanceHours: this.normalizeHours(nextSnapshot.balanceHours),
+          pendingHours: this.normalizeHours(nextSnapshot.pendingHours),
+          bookedHours: this.normalizeHours(nextSnapshot.bookedHours),
+        },
+      };
+    });
   }
 
   async grantCompOffCredit(
@@ -2157,6 +2898,16 @@ export class LeavesService {
   private hasOrgWideCompOffAccess(actor: AuthenticatedUser): boolean {
     const privilegedRoles = new Set(["admin", "super_admin", "superadmin"]);
     return (actor.roles ?? []).some((role) => privilegedRoles.has(role));
+  }
+
+  private hasOrgWideLeaveBalanceAccess(actor: AuthenticatedUser): boolean {
+    const privilegedRoles = new Set(["admin", "super_admin", "superadmin"]);
+    return (actor.roles ?? []).some((role) => privilegedRoles.has(role));
+  }
+
+  private isReportingManager(actor: AuthenticatedUser): boolean {
+    const managerRoles = new Set(["manager", "reporting_manager"]);
+    return (actor.roles ?? []).some((role) => managerRoles.has(role));
   }
 
   private canGrantCompOffForUser(

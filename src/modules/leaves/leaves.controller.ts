@@ -1,7 +1,10 @@
 import {
+  BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
+  Patch,
   Param,
   ParseIntPipe,
   Post,
@@ -11,6 +14,7 @@ import {
 import { ApiQuery, ApiTags } from "@nestjs/swagger";
 
 import { Permissions } from "../../common/decorators/permissions.decorator";
+import { Roles } from "../../common/decorators/roles.decorator";
 import { CurrentUser } from "../../common/decorators/current-user.decorator";
 import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
 import { CreateLeaveRequestDto } from "./dto/create-leave-request.dto";
@@ -19,6 +23,7 @@ import { ReviewLeaveRequestDto } from "./dto/review-leave-request.dto";
 import { BulkReviewLeaveIdsDto } from "./dto/bulk-review-leave-ids.dto";
 import { GrantCompOffDto } from "./dto/grant-comp-off.dto";
 import { RevokeCompOffDto } from "./dto/revoke-comp-off.dto";
+import { UpdateAllocatedLeaveDto } from "./dto/update-allocated-leave.dto";
 import { LeavesService } from "./leaves.service";
 
 @ApiTags("leaves")
@@ -33,6 +38,23 @@ export class LeavesController {
       return null;
     }
     return this.leavesService.listBalances(user.id);
+  }
+
+  @Get("balances/employee")
+  @Permissions("leave:view:team")
+  getEmployeeBalancesByEmail(
+    @CurrentUser() user: AuthenticatedUser | undefined,
+    @Query("email") email?: string
+  ) {
+    if (!user) {
+      return null;
+    }
+
+    if (!email || !email.trim()) {
+      throw new BadRequestException("email is required");
+    }
+
+    return this.leavesService.listBalancesForActorByEmail(user, email);
   }
 
   @Get("requests")
@@ -235,5 +257,46 @@ export class LeavesController {
       return null;
     }
     return this.leavesService.createLeaveRequestForUser(actor, payload);
+  }
+
+  @Patch("admin/requests/:id")
+  @Permissions("leave:create:any")
+  @Roles("admin", "super_admin")
+  editLeaveRequestForAnyEmployee(
+    @Param("id", ParseIntPipe) requestId: number,
+    @Body() payload: CreateLeaveRequestDto,
+    @CurrentUser() actor: AuthenticatedUser | undefined
+  ) {
+    if (!actor) {
+      return null;
+    }
+    return this.leavesService.adminEditLeaveRequest(actor, requestId, payload);
+  }
+
+  @Delete("admin/requests/:id")
+  @Permissions("leave:create:any")
+  @Roles("admin", "super_admin")
+  deleteApprovedLeaveForAnyEmployee(
+    @Param("id", ParseIntPipe) requestId: number,
+    @CurrentUser() actor: AuthenticatedUser | undefined
+  ) {
+    if (!actor) {
+      return null;
+    }
+    return this.leavesService.adminDeleteApprovedLeaveRequest(actor, requestId);
+  }
+
+  @Patch("admin/balances/allocated")
+  @Permissions("leave:create:any")
+  @Roles("admin", "super_admin")
+  updateAllocatedLeaveForAnyEmployee(
+    @Body() payload: UpdateAllocatedLeaveDto,
+    @CurrentUser() actor: AuthenticatedUser | undefined
+  ) {
+    if (!actor) {
+      return null;
+    }
+
+    return this.leavesService.adminUpdateAllocatedLeave(actor, payload);
   }
 }
