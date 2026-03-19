@@ -1079,7 +1079,6 @@ export class UsersService {
 
 @Cron(`0 1 * * *`, {
   name: 'users-google-sheet-sync',
-  timeZone: 'UTC',
 })
 async syncUsersFromSheetCron() {
   await this.syncUsersFromSheet();
@@ -1087,7 +1086,6 @@ async syncUsersFromSheetCron() {
 
 @Cron('30 1 * * *', {
   name: 'users-manager-roles-sync',
-  timeZone: 'UTC',
 })
 async syncManagerRolesCron() {
   await this.ensureReportingManagersHaveManagerRole();
