@@ -373,35 +373,11 @@ export class UsersService {
   async listReferencedManagers(params: { query?: string; page?: number; limit?: number }) {
     const db = this.database.connection;
 
-    // Ensure any referenced managers have the manager role.
-    await this.ensureReportingManagersHaveManagerRole();
-
-    const managerIdRows = await db
-      .select({ managerId: usersTable.managerId })
-      .from(usersTable)
-      .where(isNotNull(usersTable.managerId));
-
-    const managerIds = [
-      ...new Set(
-        managerIdRows
-          .map((row) =>
-            row.managerId === null || row.managerId === undefined
-              ? null
-              : Number(row.managerId),
-          )
-          .filter((id): id is number => id !== null && !Number.isNaN(id)),
-      ),
-    ];
-
-    if (managerIds.length === 0) {
-      return { data: [], page: 1, limit: params.limit ?? 25, total: 0 };
-    }
-
     const limit = params.limit && params.limit > 0 ? params.limit : 25;
     const page = params.page && params.page > 0 ? params.page : 1;
     const offset = (page - 1) * limit;
 
-    const filters: unknown[] = [inArray(usersTable.id, managerIds)];
+    const filters: unknown[] = [];
     if (params.query) {
       const q = `%${params.query.toLowerCase()}%`;
       filters.push(or(ilike(usersTable.name, q), ilike(usersTable.email, q)));
