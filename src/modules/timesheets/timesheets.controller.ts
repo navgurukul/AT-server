@@ -114,6 +114,35 @@ export class TimesheetsController {
     return result.csv;
   }
 
+  @Get('payable-days/csv')
+  @ApiQuery({
+    name: 'cycle',
+    required: true,
+    description: 'Salary cycle end date in YYYY-MM-DD format',
+  })
+  @Permissions('timesheet:view')
+  async getPayableDaysCSV(
+    @Query('cycle') cycle: string,
+    @CurrentUser() user: AuthenticatedUser | undefined,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    if (!user) {
+      return null;
+    }
+
+    const result = await this.timesheetsService.getAllUsersPayableDaysCSVByCycle({
+      orgId: user.orgId,
+      cycle,
+    });
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="payable-days-${result.cycle}.csv"`,
+    );
+    return result.csv;
+  }
+
   @Post()
   @Permissions('timesheet:edit:self')
   createOrUpsert(

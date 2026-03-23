@@ -19,7 +19,7 @@ import {
 import { SalaryCycleUtil } from '../../common/utils/salary-cycle.util';
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { DatabaseService } from '../../database/database.service';
-import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, notificationsTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
+import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, notificationsTable, payableDaysTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
 import { AuditService } from '../audit/audit.service';
 import { CalendarService } from '../calendar/calendar.service';
 import { LeavesService } from '../leaves/leaves.service';
@@ -1571,6 +1571,8 @@ export class TimesheetsService {
     let totalHours = 0;
     let totalWorkingDays = 0;
     let paidLeaves = 0;
+    let earnLeave = 0;
+    let specialLeave = 0;
     let totalCompOffLeaveTaken = 0;
     let weekOffDays = 0;
     let numOfWorkOnWeekendDays = 0;
@@ -1671,6 +1673,11 @@ export class TimesheetsService {
         totalCompOffLeaveTaken += leaveDaysCount;
       } else if (isPaidLeave) {
         paidLeaves += leaveDaysCount;
+        if (this.isEarnLeaveType(request.leaveTypeCode, request.leaveTypeName)) {
+          earnLeave += leaveDaysCount;
+        } else {
+          specialLeave += leaveDaysCount;
+        }
       }
 
       // Calculate leave hours for this request
@@ -1722,6 +1729,8 @@ export class TimesheetsService {
       totalHours,
       totalWorkingDays,
       paidLeaves,
+      earnLeave,
+      specialLeave,
       totalCompOffLeaveTaken,
       weekOffDays,
       numOfWorkOnWeekendDays,
@@ -1832,6 +1841,220 @@ export class TimesheetsService {
     };
   }
 
+  async getAllUsersPayableDaysCSVByCycle(params: {
+    orgId: number;
+    cycle: string;
+  }) {
+    const { orgId, cycle } = params;
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(cycle)) {
+      throw new BadRequestException('cycle must be in YYYY-MM-DD format');
+    }
+
+    const parsedCycle = new Date(`${cycle}T00:00:00.000Z`);
+    if (Number.isNaN(parsedCycle.getTime())) {
+      throw new BadRequestException('cycle must be a valid date in YYYY-MM-DD format');
+    }
+
+    const cycleDate = this.normalizeDateUTC(parsedCycle);
+    const cycleDay = cycleDate.getUTCDate();
+
+    const cycleEnd = new Date(cycleDate);
+    if (cycleDay >= 26) {
+      // If date is on/after 26th, cycle ends on 25th of next month.
+      cycleEnd.setUTCMonth(cycleEnd.getUTCMonth() + 1, 25);
+    } else {
+      // If date is before 26th, cycle ends on 25th of current month.
+      cycleEnd.setUTCDate(25);
+    }
+
+    const cycleStart = new Date(cycleEnd);
+    cycleStart.setUTCMonth(cycleStart.getUTCMonth() - 1, 26);
+
+    const db = this.database.connection;
+
+    const users = await db
+      .select({
+        id: usersTable.id,
+        email: usersTable.email,
+        employmentType: usersTable.employmentType,
+        joiningDate: usersTable.dateOfJoining,
+        exitDate: usersTable.dateOfExit,
+        status: usersTable.employmentStatus,
+      })
+      .from(usersTable)
+      .where(
+        and(
+          eq(usersTable.orgId, orgId),
+          or(
+            isNull(usersTable.employmentStatus),
+            not(eq(usersTable.employmentStatus, 'inactive')),
+          ),
+        ),
+      )
+      .orderBy(asc(usersTable.id));
+
+    const userIds = users.map((user) => user.id);
+    const payableDaysRows =
+      userIds.length === 0
+        ? []
+        : await db
+            .select({
+              userId: payableDaysTable.userId,
+              expectedAttendance: payableDaysTable.expectedAttendance,
+              totalHours: payableDaysTable.totalHours,
+              totalWorkingDays: payableDaysTable.totalWorkingDays,
+              weekOff: payableDaysTable.weekOff,
+              totalPayableDays: payableDaysTable.totalPayableDays,
+            })
+            .from(payableDaysTable)
+            .where(
+              and(
+                eq(payableDaysTable.cycle, cycle),
+                inArray(payableDaysTable.userId, userIds),
+              ),
+            );
+
+    const payableDaysByUserId = new Map(
+      payableDaysRows.map((row) => [Number(row.userId), row]),
+    );
+
+    const parseNumericValue = (value: unknown): number => {
+      const parsed = Number(value ?? 0);
+      if (!Number.isFinite(parsed)) {
+        return 0;
+      }
+      return parsed;
+    };
+
+    const workingDayInfo = await this.getWorkingDayInfo(orgId, cycleStart, cycleEnd);
+    const leaveBreakdownByUserId = await this.getApprovedLeaveBreakdownByUserForCycle({
+      userIds,
+      monthStart: cycleStart,
+      monthEnd: cycleEnd,
+      workingDayInfo,
+    });
+
+    const payableRows = users.map((user) => {
+        const leaveBreakdown = leaveBreakdownByUserId.get(user.id) ?? {
+          earnLeave: 0,
+          specialLeave: 0,
+          compOffLeaves: 0,
+          lwp: 0,
+        };
+        const payableRow = payableDaysByUserId.get(user.id);
+
+        return {
+          userId: user.id,
+          email: user.email,
+          employmentType: user.employmentType,
+          joiningDate: user.joiningDate,
+          exitDate: user.exitDate,
+          status: user.status,
+          expectedAttendance: parseNumericValue(payableRow?.expectedAttendance),
+          cycle,
+          totalHours: Number(parseNumericValue(payableRow?.totalHours).toFixed(1)),
+          totalWorkingDays: Number(
+            parseNumericValue(payableRow?.totalWorkingDays).toFixed(1),
+          ),
+          earnLeave: Number(leaveBreakdown.earnLeave.toFixed(1)),
+          specialLeave: Number(leaveBreakdown.specialLeave.toFixed(1)),
+          compOffLeaves: Number(leaveBreakdown.compOffLeaves.toFixed(1)),
+          weekOff: Number(parseNumericValue(payableRow?.weekOff).toFixed(1)),
+          totalPayableDays: Number(
+            parseNumericValue(payableRow?.totalPayableDays).toFixed(1),
+          ),
+          lwp: Number(leaveBreakdown.lwp.toFixed(1)),
+        };
+      });
+
+    const csv = this.convertPayableDaysToCSV(payableRows);
+
+    return {
+      csv,
+      cycle,
+      count: payableRows.length,
+    };
+  }
+
+  private convertPayableDaysToCSV(
+    data: Array<{
+      userId: number;
+      email: string;
+      employmentType: string | null;
+      joiningDate: string | Date | null;
+      exitDate: string | Date | null;
+      status: string | null;
+      expectedAttendance: number | null;
+      cycle: string;
+      totalHours: number;
+      totalWorkingDays: number;
+      earnLeave: number;
+      specialLeave: number;
+      compOffLeaves: number;
+      weekOff: number;
+      totalPayableDays: number;
+      lwp: number;
+    }>,
+  ): string {
+    const headers = [
+      'Email',
+      'Employment Type',
+      'Joining Date',
+      'Exit Date',
+      'Status',
+      'Expected Attendance',
+      'Cycle',
+      'Total Hours',
+      'Total Working Days',
+      'Earn Leave',
+      'Special Leave',
+      'Comp Off Leaves',
+      'Week Off',
+      'Total Payable Days',
+      'LWP',
+    ];
+
+    if (data.length === 0) {
+      return headers.join(',');
+    }
+
+    const rows = data.map((row) => [
+      this.escapeCSVValue(row.email),
+      this.escapeCSVValue(row.employmentType),
+      this.escapeCSVValue(this.formatCsvDateValue(row.joiningDate)),
+      this.escapeCSVValue(this.formatCsvDateValue(row.exitDate)),
+      this.escapeCSVValue(row.status),
+      row.expectedAttendance ?? '',
+      this.escapeCSVValue(row.cycle),
+      row.totalHours,
+      row.totalWorkingDays,
+      row.earnLeave,
+      row.specialLeave,
+      row.compOffLeaves,
+      row.weekOff,
+      row.totalPayableDays,
+      row.lwp,
+    ]);
+
+    return [headers.join(','), ...rows.map((row) => row.join(','))].join('\n');
+  }
+
+  private formatCsvDateValue(value: string | Date | null | undefined): string {
+    if (!value) {
+      return '';
+    }
+
+    if (value instanceof Date) {
+      if (Number.isNaN(value.getTime())) {
+        return '';
+      }
+      return value.toISOString().split('T')[0];
+    }
+
+    return value.includes('T') ? value.split('T')[0] : value;
+  }
+
   private convertToCSV(data: Awaited<ReturnType<typeof this.getSalarySummary>>[]): string {
     if (data.length === 0) {
       return 'No data available';
@@ -1882,6 +2105,133 @@ export class TimesheetsService {
     const month = date.getUTCMonth() + 1;
     const year = date.getUTCFullYear();
     return `${day}/${month}/${year}`;
+  }
+
+  private isEarnLeaveType(
+    leaveTypeCode: string | null | undefined,
+    leaveTypeName: string | null | undefined,
+  ): boolean {
+    const code = (leaveTypeCode ?? '').toLowerCase();
+    const name = (leaveTypeName ?? '').toLowerCase();
+
+    const earnLeaveCodes = new Set(['casual', 'casual_leave', 'wellness', 'wellness_leave']);
+    return (
+      earnLeaveCodes.has(code) ||
+      name.includes('casual') ||
+      name.includes('wellness')
+    );
+  }
+
+  private async getApprovedLeaveBreakdownByUserForCycle(params: {
+    userIds: number[];
+    monthStart: Date;
+    monthEnd: Date;
+    workingDayInfo: Map<
+      string,
+      { isWorkingDay: boolean; isHoliday: boolean; isWeekend: boolean; holidayName: string | null }
+    >;
+  }): Promise<
+    Map<number, { earnLeave: number; specialLeave: number; compOffLeaves: number; lwp: number }>
+  > {
+    const { userIds, monthStart, monthEnd, workingDayInfo } = params;
+    const db = this.database.connection;
+
+    if (userIds.length === 0) {
+      return new Map();
+    }
+
+    const approvedLeaves = await db
+      .select({
+        userId: leaveRequestsTable.userId,
+        startDate: leaveRequestsTable.startDate,
+        endDate: leaveRequestsTable.endDate,
+        hours: leaveRequestsTable.hours,
+        durationType: leaveRequestsTable.durationType,
+        leaveTypeCode: leaveTypesTable.code,
+        leaveTypeName: leaveTypesTable.name,
+      })
+      .from(leaveRequestsTable)
+      .innerJoin(
+        leaveTypesTable,
+        eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id),
+      )
+      .where(
+        and(
+          inArray(leaveRequestsTable.userId, userIds),
+          eq(leaveRequestsTable.state, 'approved'),
+          lte(leaveRequestsTable.startDate, monthEnd),
+          gte(leaveRequestsTable.endDate, monthStart),
+        ),
+      );
+
+    const leaveByUser = new Map<
+      number,
+      { earnLeave: number; specialLeave: number; compOffLeaves: number; lwp: number }
+    >();
+
+    for (const request of approvedLeaves) {
+      const userId = Number(request.userId);
+      const bucket = leaveByUser.get(userId) ?? {
+        earnLeave: 0,
+        specialLeave: 0,
+        compOffLeaves: 0,
+        lwp: 0,
+      };
+
+      const requestStart = this.normalizeDateUTC(new Date(request.startDate));
+      const requestEnd = this.normalizeDateUTC(new Date(request.endDate));
+      const requestHours = request.hours ? Number(request.hours) : 0;
+
+      const windowStart = requestStart > monthStart ? requestStart : monthStart;
+      const windowEnd = requestEnd < monthEnd ? requestEnd : monthEnd;
+
+      if (windowEnd < windowStart) {
+        continue;
+      }
+
+      const dayKeys: string[] = [];
+      const cursor = new Date(windowStart);
+      while (cursor <= windowEnd) {
+        const key = this.formatDateKey(cursor);
+        if (workingDayInfo.get(key)?.isWorkingDay) {
+          dayKeys.push(key);
+        }
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+
+      if (dayKeys.length === 0) {
+        continue;
+      }
+
+      let leaveDaysCount = 0;
+      if (requestHours > 0) {
+        leaveDaysCount = requestHours / HOURS_PER_WORKING_DAY;
+      } else if (request.durationType === 'half_day') {
+        leaveDaysCount = dayKeys.length * 0.5;
+      } else {
+        leaveDaysCount = dayKeys.length;
+      }
+
+      const leaveTypeCode = request.leaveTypeCode ?? '';
+      const leaveTypeName = request.leaveTypeName ?? '';
+      const normalizedName = leaveTypeName.toLowerCase();
+      const isLWP = leaveTypeCode === 'lwp' || normalizedName.includes('without pay');
+      const isCompOff = leaveTypeCode === 'comp_off' || normalizedName.includes('comp off');
+
+      if (isLWP) {
+        bucket.lwp += leaveDaysCount;
+      } else if (isCompOff) {
+        bucket.compOffLeaves += leaveDaysCount;
+      } else if (this.isEarnLeaveType(leaveTypeCode, leaveTypeName)) {
+        bucket.earnLeave += leaveDaysCount;
+      } else {
+        bucket.specialLeave += leaveDaysCount;
+      }
+
+      leaveByUser.set(userId, bucket);
+    }
+
+    return leaveByUser;
   }
 
   private escapeCSVValue(value: any): string {
