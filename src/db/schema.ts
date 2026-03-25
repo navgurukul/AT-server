@@ -631,6 +631,27 @@ export const backfillDates = pgTable(
   })
 );
 
+export const payableDays = pgTable("payable_days", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  expectedAttendance: integer("expected_attendance"),
+  cycle: date("cycle").notNull(),
+  totalHours: numeric("total_hours", { precision: 10, scale: 1 })
+    .notNull()
+    .default("0.0"),
+  totalWorkingDays: numeric("total_working_days", { precision: 10, scale: 1 })
+    .notNull()
+    .default("0.0"),
+  weekOff: numeric("week_off", { precision: 10, scale: 1 }).notNull().default("0.0"),
+  totalPayableDays: numeric("total_payable_days", { precision: 10, scale: 1 })
+    .notNull()
+    .default("0.0"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const mvProjectCostsMonthly = pgTable(
   "mv_project_costs_monthly",
   {
@@ -708,6 +729,7 @@ export const schema = {
   authBlacklistedTokens,
   backfillCounters,
   backfillDates,
+  payableDays,
   mvProjectCostsMonthly,
   mvUserProductivityDaily,
   mvLeaveTrendsMonthly,
@@ -742,6 +764,7 @@ export const auditLogsTable = auditLogs;
 export const authBlacklistedTokensTable = authBlacklistedTokens;
 export const backfillCountersTable = backfillCounters;
 export const backfillDatesTable = backfillDates;
+export const payableDaysTable = payableDays;
 export const mvProjectCostsMonthlyTable = mvProjectCostsMonthly;
 export const mvUserProductivityDailyTable = mvUserProductivityDaily;
 export const mvLeaveTrendsMonthlyTable = mvLeaveTrendsMonthly;
