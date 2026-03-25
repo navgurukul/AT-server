@@ -36,6 +36,9 @@ interface ListTimesheetParams {
 const DEFAULT_BACKFILL_PER_MONTH = 3;
 const BACKFILL_CUTOFF_DAY = 25;
 const MAX_HOURS_PER_DAY = 12;
+const MIN_TASK_DESCRIPTION_LENGTH = 10;
+const HALF_DAY_TIMESHEET_MAX_HOURS = 5.5;
+const NEXT_DAY_GRACE_HOUR = 7;
 const HOURS_PER_WORKING_DAY = 8;
 const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 
@@ -225,6 +228,20 @@ export class TimesheetsService {
           ? entry.taskTitle.trim()
           : null;
 
+      const taskDescription =
+        entry.taskDescription && entry.taskDescription.trim().length > 0
+          ? entry.taskDescription.trim()
+          : null;
+
+      if (
+        taskDescription &&
+        taskDescription.length < MIN_TASK_DESCRIPTION_LENGTH
+      ) {
+        throw new BadRequestException(
+          `Entry ${index + 1} task description must be at least ${MIN_TASK_DESCRIPTION_LENGTH} characters`
+        );
+      }
+
       const tags = Array.isArray(entry.tags)
         ? entry.tags.filter((tag) => typeof tag === "string" && tag.trim() !== "")
         : [];
@@ -248,10 +265,7 @@ export class TimesheetsService {
         const normalized = {
           projectId,
           taskTitle,
-          taskDescription:
-            entry.taskDescription && entry.taskDescription.trim().length > 0
-              ? entry.taskDescription.trim()
-              : null,
+          taskDescription,
           hours,
           tags,
         };
@@ -337,21 +351,90 @@ export class TimesheetsService {
       throw new BadRequestException("Cannot create timesheet for future date");
     }
 
-    // Check if workDate is within the current salary cycle
     const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(now);
-    const normalizedCycleStart = normalizeDate(currentCycle.start);
-    const normalizedCycleEnd = normalizeDate(currentCycle.end);
-    
-    if (workDate < normalizedCycleStart || workDate >= normalizedCycleEnd) {
+
+    const workDateEndExclusive = new Date(workDate);
+    workDateEndExclusive.setUTCDate(workDateEndExclusive.getUTCDate() + 1);
+
+    const leaveRequestsForDate = await db
+      .select({
+        id: leaveRequestsTable.id,
+        startDate: leaveRequestsTable.startDate,
+        endDate: leaveRequestsTable.endDate,
+        hours: leaveRequestsTable.hours,
+        durationType: leaveRequestsTable.durationType,
+        state: leaveRequestsTable.state,
+      })
+      .from(leaveRequestsTable)
+      .where(
+        and(
+          eq(leaveRequestsTable.userId, userId),
+          inArray(leaveRequestsTable.state, ['pending', 'approved'] as const),
+          lte(leaveRequestsTable.startDate, workDateEndExclusive),
+          gte(leaveRequestsTable.endDate, workDate),
+        ),
+      );
+
+    let hasFullDayLeaveForDate = false;
+    let hasHalfDayLeaveForDate = false;
+
+    for (const leaveRequest of leaveRequestsForDate) {
+      let leaveHoursForDate = 0;
+
+      if (leaveRequest.durationType === 'full_day') {
+        leaveHoursForDate = HOURS_PER_WORKING_DAY;
+      } else if (leaveRequest.durationType === 'half_day') {
+        leaveHoursForDate = HALF_DAY_HOURS;
+      } else {
+        const totalLeaveHours = Number(leaveRequest.hours ?? 0);
+        if (totalLeaveHours > 0) {
+          const requestStartDate = normalizeDate(new Date(leaveRequest.startDate));
+          const requestEndDate = normalizeDate(new Date(leaveRequest.endDate));
+          const totalDaysInRequest =
+            Math.max(
+              Math.floor(
+                (requestEndDate.getTime() - requestStartDate.getTime()) /
+                  (24 * 60 * 60 * 1000),
+              ) + 1,
+              1,
+            );
+          leaveHoursForDate = totalLeaveHours / totalDaysInRequest;
+        }
+      }
+
+      if (leaveHoursForDate >= HOURS_PER_WORKING_DAY) {
+        hasFullDayLeaveForDate = true;
+        break;
+      }
+
+      if (leaveHoursForDate > 0) {
+        hasHalfDayLeaveForDate = true;
+      }
+    }
+
+    if (hasFullDayLeaveForDate) {
       throw new BadRequestException(
-        `Timesheets can only be filled for dates within the current salary cycle (${currentCycle.cycleLabel})`
+        'Cannot submit timesheet entry for a date with full-day leave applied',
+      );
+    }
+
+    if (hasHalfDayLeaveForDate && totalHoursForDay > HALF_DAY_TIMESHEET_MAX_HOURS) {
+      throw new BadRequestException(
+        `On a half-day leave date, timesheet hours cannot exceed ${HALF_DAY_TIMESHEET_MAX_HOURS} hours`,
       );
     }
 
     // Allow logging activities on non-working days (weekends, holidays) for comp-off generation
     // Removed validation that blocked timesheets on non-working days
 
-    const isBackfill = workDate < today;
+    const isSameDaySubmission = workDate.getTime() === today.getTime();
+    const nextDayGraceCutoff = new Date(workDate);
+    nextDayGraceCutoff.setUTCDate(nextDayGraceCutoff.getUTCDate() + 1);
+    nextDayGraceCutoff.setUTCHours(NEXT_DAY_GRACE_HOUR, 0, 0, 0);
+    const isWithinNextDayGraceWindow =
+      !isSameDaySubmission && now.getTime() < nextDayGraceCutoff.getTime();
+
+    const isBackfill = workDate < today && !isWithinNextDayGraceWindow;
     const backfillAllowance = isBackfill
       ? await this.getBackfillAllowanceForCycle(orgId, userId, currentCycle, now)
       : { limit: DEFAULT_BACKFILL_PER_MONTH, used: 0, remaining: DEFAULT_BACKFILL_PER_MONTH };
@@ -367,6 +450,39 @@ export class TimesheetsService {
       throw new BadRequestException(
         `Backfilling (lifeline) is limited to ${backfillAllowance.limit} days per salary cycle. Lifelines reset on the 26th of each month at 7:01 AM.`
       );
+    }
+
+    const normalizedCycleStart = normalizeDate(currentCycle.start);
+    const normalizedCycleEnd = normalizeDate(currentCycle.end);
+
+    if (workDate < normalizedCycleStart || workDate > normalizedCycleEnd) {
+      throw new BadRequestException(
+        `Salary cycle is closed for ${payload.workDate}. Timesheets can only be filled within the current salary cycle (${currentCycle.cycleLabel})`,
+      );
+    }
+
+    if (isBackfill && !skipBackfillDeduction) {
+      const yesterday = new Date(today);
+      yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+
+      const workingDayInfo = await this.getWorkingDayInfo(orgId, workDate, yesterday);
+
+      let pastWorkingDaysCount = 0;
+      const cursor = new Date(workDate);
+      while (cursor <= yesterday) {
+        const key = this.formatDateKey(cursor);
+        const info = workingDayInfo.get(key);
+        if (info?.isWorkingDay) {
+          pastWorkingDaysCount += 1;
+        }
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+
+      if (pastWorkingDaysCount > backfillAllowance.limit) {
+        throw new BadRequestException(
+          `Entry date is outside the allowed past working days window (${backfillAllowance.limit} working days).`,
+        );
+      }
     }
 
     const [existing] = await db
