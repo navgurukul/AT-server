@@ -36,11 +36,10 @@ export class SalaryCycleUtil {
    * @returns SalaryCycleRange object with start and end dates
    */
   static getCurrentSalaryCycle(now: Date = new Date()): SalaryCycleRange {
-    const year = now.getFullYear();
-    const month = now.getMonth(); // 0-indexed
-    const day = now.getDate();
-    const hour = now.getHours();
-    const minute = now.getMinutes();
+    const year = now.getUTCFullYear();
+    const month = now.getUTCMonth(); // 0-indexed
+    const day = now.getUTCDate();
+    const hour = now.getUTCHours();
 
     let cycleStartYear = year;
     let cycleStartMonth = month;
@@ -57,7 +56,15 @@ export class SalaryCycleUtil {
     }
 
     // Start: 26th at 7:00 AM of cycleStartMonth
-    const start = new Date(cycleStartYear, cycleStartMonth, this.CYCLE_START_DAY, this.CYCLE_START_HOUR, this.CYCLE_START_MINUTE, 0, 0);
+    const start = new Date(Date.UTC(
+      cycleStartYear,
+      cycleStartMonth,
+      this.CYCLE_START_DAY,
+      this.CYCLE_START_HOUR,
+      this.CYCLE_START_MINUTE,
+      0,
+      0,
+    ));
 
     // End: 25th at 7:00 AM of next month
     let cycleEndYear = cycleStartYear;
@@ -66,7 +73,15 @@ export class SalaryCycleUtil {
       cycleEndMonth = 0;
       cycleEndYear++;
     }
-    const end = new Date(cycleEndYear, cycleEndMonth, this.CYCLE_END_DAY, this.CYCLE_END_HOUR, this.CYCLE_END_MINUTE, 0, 0);
+    const end = new Date(Date.UTC(
+      cycleEndYear,
+      cycleEndMonth,
+      this.CYCLE_END_DAY,
+      this.CYCLE_END_HOUR,
+      this.CYCLE_END_MINUTE,
+      0,
+      0,
+    ));
 
     const cycleLabel = this.formatCycleLabel(start, end);
 
@@ -175,14 +190,14 @@ export class SalaryCycleUtil {
     const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     
     // Start display is 26th
-    const startDay = start.getDate();
-    const startMonth = monthNames[start.getMonth()];
-    const startYear = start.getFullYear();
+    const startDay = start.getUTCDate();
+    const startMonth = monthNames[start.getUTCMonth()];
+    const startYear = start.getUTCFullYear();
 
     // End display is 25th
-    const endDay = end.getDate();
-    const endMonth = monthNames[end.getMonth()];
-    const endYear = end.getFullYear();
+    const endDay = end.getUTCDate();
+    const endMonth = monthNames[end.getUTCMonth()];
+    const endYear = end.getUTCFullYear();
 
     return `${startDay} ${startMonth} ${startYear} - ${endDay} ${endMonth} ${endYear}`;
   }
@@ -192,8 +207,8 @@ export class SalaryCycleUtil {
    * When this time passes, lifelines should be reset for the new cycle
    */
   static shouldResetLifelines(now: Date = new Date()): boolean {
-    const day = now.getDate();
-    const hour = now.getHours();
+    const day = now.getUTCDate();
+    const hour = now.getUTCHours();
 
     // Check if we're exactly at or past 26th 7:00 AM
     return day === this.CYCLE_START_DAY && hour >= this.CYCLE_START_HOUR;
