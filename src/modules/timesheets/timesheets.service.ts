@@ -36,9 +36,6 @@ interface ListTimesheetParams {
 const DEFAULT_BACKFILL_PER_MONTH = 3;
 const BACKFILL_CUTOFF_DAY = 25;
 const MAX_HOURS_PER_DAY = 12;
-const MIN_TASK_DESCRIPTION_LENGTH = 10;
-const HALF_DAY_TIMESHEET_MAX_HOURS = 5.5;
-const NEXT_DAY_GRACE_HOUR = 7;
 const HOURS_PER_WORKING_DAY = 8;
 const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 
@@ -206,7 +203,6 @@ export class TimesheetsService {
         projectId: number | null;
         taskTitle: string | null;
         taskDescription: string | null;
-        taskDescriptionParts: string[];
         hours: number;
         tags: string[];
       }
@@ -231,11 +227,6 @@ export class TimesheetsService {
           ? entry.taskTitle.trim()
           : null;
 
-      const taskDescription =
-        entry.taskDescription && entry.taskDescription.trim().length > 0
-          ? entry.taskDescription.trim()
-          : null;
-
       const tags = Array.isArray(entry.tags)
         ? entry.tags.filter((tag) => typeof tag === "string" && tag.trim() !== "")
         : [];
@@ -251,28 +242,18 @@ export class TimesheetsService {
       const existing = normalizedEntriesMap.get(key);
 
       if (existing) {
-        // Accumulate hours for the same project and preserve all unique descriptions.
+        // Accumulate hours for the same project, keep the first entry's other properties
         existing.hours += hours;
-        if (!existing.taskTitle && taskTitle) {
-          existing.taskTitle = taskTitle;
-        }
-        if (taskDescription) {
-          const hasDescription = existing.taskDescriptionParts.some(
-            (part) => part.toLowerCase() === taskDescription.toLowerCase(),
-          );
-          if (!hasDescription) {
-            existing.taskDescriptionParts.push(taskDescription);
-          }
-          existing.taskDescription = existing.taskDescriptionParts.join(', ');
-        }
         // Merge tags
         existing.tags = Array.from(new Set([...existing.tags, ...tags]));
       } else {
         const normalized = {
           projectId,
           taskTitle,
-          taskDescription,
-          taskDescriptionParts: taskDescription ? [taskDescription] : [],
+          taskDescription:
+            entry.taskDescription && entry.taskDescription.trim().length > 0
+              ? entry.taskDescription.trim()
+              : null,
           hours,
           tags,
         };
@@ -291,17 +272,6 @@ export class TimesheetsService {
         `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day`
       );
     }
-
-    const nonNullProjectIds = Array.from(
-      new Set(
-        normalizedEntries
-          .map((entry) => entry.projectId)
-          .filter((id): id is number => id !== null)
-      )
-    );
-    const includesNullProject = normalizedEntries.some(
-      (entry) => entry.projectId === null
-    );
 
     const projectIds = Array.from(
       new Set(
@@ -358,6 +328,7 @@ export class TimesheetsService {
       throw new BadRequestException("Cannot create timesheet for future date");
     }
 
+    // Check if workDate is within the current salary cycle
     const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(now);
     const normalizedCycleStart = normalizeDate(currentCycle.start);
     const normalizedCycleEnd = normalizeDate(currentCycle.end);
@@ -367,7 +338,7 @@ export class TimesheetsService {
       (workDate < normalizedCycleStart || workDate >= normalizedCycleEnd)
     ) {
       throw new BadRequestException(
-        `On a half-day leave date, timesheet hours cannot exceed ${HALF_DAY_TIMESHEET_MAX_HOURS} hours`,
+        `Timesheets can only be filled for dates within the current salary cycle (${currentCycle.cycleLabel})`
       );
     }
 
@@ -420,11 +391,16 @@ export class TimesheetsService {
       );
     }
 
+    // Fetch existing entries for this timesheet to merge/accumulate with new entries
+    let entriesToSave = [...normalizedEntries];
     if (existing) {
-      // Get ALL existing hours for this timesheet (only approved entries)
-      const [{ totalHours: allExistingHours }] = await db
+      const existingEntries = await db
         .select({
-          totalHours: sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
+          id: timesheetEntriesTable.id,
+          projectId: timesheetEntriesTable.projectId,
+          taskDescription: timesheetEntriesTable.taskDescription,
+          hoursDecimal: timesheetEntriesTable.hoursDecimal,
+          taskTitle: timesheetEntriesTable.taskTitle,
         })
         .from(timesheetEntriesTable)
         .where(
@@ -434,12 +410,47 @@ export class TimesheetsService {
           ),
         );
 
-      const combinedHours =
-        Number(allExistingHours ?? 0) + Number(totalHoursForDay ?? 0);
+      // Create a map of existing entries by projectId for merging
+      const existingByProjectId = new Map<number | null, typeof existingEntries[0]>();
+      for (const entry of existingEntries) {
+        const key = entry.projectId ?? null;
+        existingByProjectId.set(key, entry);
+      }
 
+      // Merge new entries with existing ones - accumulate hours and descriptions
+      entriesToSave = normalizedEntries.map((newEntry) => {
+        const key = newEntry.projectId ?? null;
+        const existing = existingByProjectId.get(key);
+
+        if (existing) {
+          // Accumulate hours
+          const mergedHours = newEntry.hours + (Number(existing.hoursDecimal) || 0);
+          
+          // Merge descriptions: append new descriptions to existing ones
+          let mergedDescription = existing.taskDescription || '';
+          if (newEntry.taskDescription && mergedDescription) {
+            // Only add if not already present (case-insensitive)
+            if (!mergedDescription.toLowerCase().includes(newEntry.taskDescription.toLowerCase())) {
+              mergedDescription = mergedDescription + ', ' + newEntry.taskDescription;
+            }
+          } else if (newEntry.taskDescription) {
+            mergedDescription = newEntry.taskDescription;
+          }
+
+          return {
+            ...newEntry,
+            hours: mergedHours,
+            taskDescription: mergedDescription || null,
+          };
+        }
+        return newEntry;
+      });
+
+      // Validate combined hours does not exceed limit
+      const combinedHours = entriesToSave.reduce((acc, entry) => acc + entry.hours, 0);
       if (combinedHours > MAX_HOURS_PER_DAY) {
         throw new BadRequestException(
-          `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day`
+          `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day (total: ${combinedHours}h)`
         );
       }
     }
@@ -481,26 +492,38 @@ export class TimesheetsService {
         { channel: string | null; discordWebhook: string | null; name: string | null }
       > = {};
 
-      if (normalizedEntries.length > 0) {
-        const projectConditions = [];
-        if (nonNullProjectIds.length > 0) {
-          projectConditions.push(
-            inArray(timesheetEntriesTable.projectId, nonNullProjectIds)
-          );
-        }
-        if (includesNullProject) {
-          projectConditions.push(isNull(timesheetEntriesTable.projectId));
-        }
+      if (entriesToSave.length > 0) {
+        // Delete only entries for projects being updated (to allow accumulated additions)
+        const projectIdsToUpdate = Array.from(
+          new Set(
+            entriesToSave
+              .map((entry) => entry.projectId)
+              .filter((id): id is number => id !== null)
+          )
+        );
+        const includesNullProject = entriesToSave.some(
+          (entry) => entry.projectId === null
+        );
 
-        if (projectConditions.length > 0) {
+        if (projectIdsToUpdate.length > 0 || includesNullProject) {
+          const deleteConditions = [];
+          if (projectIdsToUpdate.length > 0) {
+            deleteConditions.push(
+              inArray(timesheetEntriesTable.projectId, projectIdsToUpdate)
+            );
+          }
+          if (includesNullProject) {
+            deleteConditions.push(isNull(timesheetEntriesTable.projectId));
+          }
+
           await tx
             .delete(timesheetEntriesTable)
             .where(
               and(
                 eq(timesheetEntriesTable.timesheetId, timesheetId),
-                projectConditions.length === 1
-                  ? projectConditions[0]
-                  : or(...projectConditions)
+                deleteConditions.length === 1
+                  ? deleteConditions[0]
+                  : or(...deleteConditions)
               )
             );
         }
@@ -520,7 +543,7 @@ export class TimesheetsService {
         }
 
         await tx.insert(timesheetEntriesTable).values(
-          normalizedEntries.map((entry) => ({
+          entriesToSave.map((entry) => ({
             orgId,
             timesheetId,
             projectId: entry.projectId,
@@ -614,13 +637,10 @@ export class TimesheetsService {
     try {
       const totalHoursNum = Number(result.timesheet.totalHours ?? 0);
       if (totalHoursNum > 0) {
-        const workDateForCompOff = normalizeDate(
-          new Date(result.timesheet.workDate),
-        );
         await this.leavesService.tryProcessCompOffForTimesheet(
           orgId,
           userId,
-          workDateForCompOff,
+          workDate,
           result.timesheet.id,
           totalHoursNum
         );
@@ -2953,14 +2973,6 @@ export class TimesheetsService {
       timesheetIds.add(updatePayload.timesheetId);
     }
 
-    const reconciledTimesheets: Array<{
-      id: number;
-      userId: number;
-      orgId: number;
-      workDate: Date;
-      totalHours: string;
-    }> = [];
-
     for (const timesheetId of timesheetIds) {
       const [{ totalHours }] = await db
         .select({
@@ -2974,46 +2986,13 @@ export class TimesheetsService {
           ),
         );
 
-      const [updatedTimesheet] = await db
+      await db
         .update(timesheetsTable)
         .set({
           totalHours: String(totalHours ?? 0),
           updatedAt: now,
         })
-        .where(eq(timesheetsTable.id, timesheetId))
-        .returning({
-          id: timesheetsTable.id,
-          userId: timesheetsTable.userId,
-          orgId: timesheetsTable.orgId,
-          workDate: timesheetsTable.workDate,
-          totalHours: timesheetsTable.totalHours,
-        });
-
-      if (updatedTimesheet) {
-        reconciledTimesheets.push(updatedTimesheet);
-      }
-    }
-
-    // Reprocess comp-off after admin edits because credited hours depend on final total hours for the date.
-    for (const timesheet of reconciledTimesheets) {
-      try {
-        const totalHoursNum = Number(timesheet.totalHours ?? 0);
-        if (totalHoursNum > 0) {
-          const workDateForCompOff = normalizeDate(new Date(timesheet.workDate));
-          await this.leavesService.tryProcessCompOffForTimesheet(
-            timesheet.orgId,
-            timesheet.userId,
-            workDateForCompOff,
-            timesheet.id,
-            totalHoursNum,
-          );
-        }
-      } catch (error) {
-        this.logger.warn(
-          `Failed to auto-process comp off after entry update for timesheet ${timesheet.id}:`,
-          error,
-        );
-      }
+        .where(eq(timesheetsTable.id, timesheetId));
     }
 
     return updatedEntry;
@@ -3079,43 +3058,13 @@ export class TimesheetsService {
         ),
       );
 
-    const [updatedTimesheet] = await db
+    await db
       .update(timesheetsTable)
       .set({
         totalHours: String(totalHours ?? 0),
         updatedAt: new Date(),
       })
-      .where(eq(timesheetsTable.id, timesheetId))
-      .returning({
-        id: timesheetsTable.id,
-        userId: timesheetsTable.userId,
-        orgId: timesheetsTable.orgId,
-        workDate: timesheetsTable.workDate,
-        totalHours: timesheetsTable.totalHours,
-      });
-
-    if (updatedTimesheet) {
-      try {
-        const totalHoursNum = Number(updatedTimesheet.totalHours ?? 0);
-        if (totalHoursNum > 0) {
-          const workDateForCompOff = normalizeDate(
-            new Date(updatedTimesheet.workDate),
-          );
-          await this.leavesService.tryProcessCompOffForTimesheet(
-            updatedTimesheet.orgId,
-            updatedTimesheet.userId,
-            workDateForCompOff,
-            updatedTimesheet.id,
-            totalHoursNum,
-          );
-        }
-      } catch (error) {
-        this.logger.warn(
-          `Failed to auto-process comp off after entry deletion for timesheet ${updatedTimesheet.id}:`,
-          error,
-        );
-      }
-    }
+      .where(eq(timesheetsTable.id, timesheetId));
 
     const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
     if (actorRole) {
