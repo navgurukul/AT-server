@@ -36,9 +36,6 @@ interface ListTimesheetParams {
 const DEFAULT_BACKFILL_PER_MONTH = 3;
 const BACKFILL_CUTOFF_DAY = 25;
 const MAX_HOURS_PER_DAY = 12;
-const MIN_TASK_DESCRIPTION_LENGTH = 10;
-const HALF_DAY_TIMESHEET_MAX_HOURS = 5.5;
-const NEXT_DAY_GRACE_HOUR = 7;
 const HOURS_PER_WORKING_DAY = 8;
 const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 
@@ -177,12 +174,14 @@ export class TimesheetsService {
     orgId: number,
     options?: {
       skipBackfillDeduction?: boolean;
+      enforceCurrentSalaryCycle?: boolean;
     }
   ) {
     const db = this.database.connection;
     const workDate = normalizeDate(new Date(payload.workDate));
     const now = new Date();
     const skipBackfillDeduction = options?.skipBackfillDeduction ?? false;
+    const enforceCurrentSalaryCycle = options?.enforceCurrentSalaryCycle ?? true;
 
     const [userInfo] = await db
       .select({ 
@@ -228,20 +227,6 @@ export class TimesheetsService {
           ? entry.taskTitle.trim()
           : null;
 
-      const taskDescription =
-        entry.taskDescription && entry.taskDescription.trim().length > 0
-          ? entry.taskDescription.trim()
-          : null;
-
-      if (
-        taskDescription &&
-        taskDescription.length < MIN_TASK_DESCRIPTION_LENGTH
-      ) {
-        throw new BadRequestException(
-          `Entry ${index + 1} task description must be at least ${MIN_TASK_DESCRIPTION_LENGTH} characters`
-        );
-      }
-
       const tags = Array.isArray(entry.tags)
         ? entry.tags.filter((tag) => typeof tag === "string" && tag.trim() !== "")
         : [];
@@ -265,7 +250,10 @@ export class TimesheetsService {
         const normalized = {
           projectId,
           taskTitle,
-          taskDescription,
+          taskDescription:
+            entry.taskDescription && entry.taskDescription.trim().length > 0
+              ? entry.taskDescription.trim()
+              : null,
           hours,
           tags,
         };
@@ -284,17 +272,6 @@ export class TimesheetsService {
         `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day`
       );
     }
-
-    const nonNullProjectIds = Array.from(
-      new Set(
-        normalizedEntries
-          .map((entry) => entry.projectId)
-          .filter((id): id is number => id !== null)
-      )
-    );
-    const includesNullProject = normalizedEntries.some(
-      (entry) => entry.projectId === null
-    );
 
     const projectIds = Array.from(
       new Set(
@@ -351,139 +328,28 @@ export class TimesheetsService {
       throw new BadRequestException("Cannot create timesheet for future date");
     }
 
+    // Check if workDate is within the current salary cycle
     const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(now);
-
-    const workDateEndExclusive = new Date(workDate);
-    workDateEndExclusive.setUTCDate(workDateEndExclusive.getUTCDate() + 1);
-
-    const leaveRequestsForDate = await db
-      .select({
-        id: leaveRequestsTable.id,
-        startDate: leaveRequestsTable.startDate,
-        endDate: leaveRequestsTable.endDate,
-        hours: leaveRequestsTable.hours,
-        durationType: leaveRequestsTable.durationType,
-        state: leaveRequestsTable.state,
-      })
-      .from(leaveRequestsTable)
-      .where(
-        and(
-          eq(leaveRequestsTable.userId, userId),
-          inArray(leaveRequestsTable.state, ['pending', 'approved'] as const),
-          lte(leaveRequestsTable.startDate, workDateEndExclusive),
-          gte(leaveRequestsTable.endDate, workDate),
-        ),
-      );
-
-    let hasFullDayLeaveForDate = false;
-    let hasHalfDayLeaveForDate = false;
-
-    for (const leaveRequest of leaveRequestsForDate) {
-      let leaveHoursForDate = 0;
-
-      if (leaveRequest.durationType === 'full_day') {
-        leaveHoursForDate = HOURS_PER_WORKING_DAY;
-      } else if (leaveRequest.durationType === 'half_day') {
-        leaveHoursForDate = HALF_DAY_HOURS;
-      } else {
-        const totalLeaveHours = Number(leaveRequest.hours ?? 0);
-        if (totalLeaveHours > 0) {
-          const requestStartDate = normalizeDate(new Date(leaveRequest.startDate));
-          const requestEndDate = normalizeDate(new Date(leaveRequest.endDate));
-          const totalDaysInRequest =
-            Math.max(
-              Math.floor(
-                (requestEndDate.getTime() - requestStartDate.getTime()) /
-                  (24 * 60 * 60 * 1000),
-              ) + 1,
-              1,
-            );
-          leaveHoursForDate = totalLeaveHours / totalDaysInRequest;
-        }
-      }
-
-      if (leaveHoursForDate >= HOURS_PER_WORKING_DAY) {
-        hasFullDayLeaveForDate = true;
-        break;
-      }
-
-      if (leaveHoursForDate > 0) {
-        hasHalfDayLeaveForDate = true;
-      }
-    }
-
-    if (hasFullDayLeaveForDate) {
+    const normalizedCycleStart = normalizeDate(currentCycle.start);
+    const normalizedCycleEnd = normalizeDate(currentCycle.end);
+    
+    if (
+      enforceCurrentSalaryCycle &&
+      (workDate < normalizedCycleStart || workDate >= normalizedCycleEnd)
+    ) {
       throw new BadRequestException(
-        'Cannot submit timesheet entry for a date with full-day leave applied',
-      );
-    }
-
-    if (hasHalfDayLeaveForDate && totalHoursForDay > HALF_DAY_TIMESHEET_MAX_HOURS) {
-      throw new BadRequestException(
-        `On a half-day leave date, timesheet hours cannot exceed ${HALF_DAY_TIMESHEET_MAX_HOURS} hours`,
+        `Timesheets can only be filled for dates within the current salary cycle (${currentCycle.cycleLabel})`
       );
     }
 
     // Allow logging activities on non-working days (weekends, holidays) for comp-off generation
     // Removed validation that blocked timesheets on non-working days
 
-    const isSameDaySubmission = workDate.getTime() === today.getTime();
-    const nextDayGraceCutoff = new Date(workDate);
-    nextDayGraceCutoff.setUTCDate(nextDayGraceCutoff.getUTCDate() + 1);
-    nextDayGraceCutoff.setUTCHours(NEXT_DAY_GRACE_HOUR, 0, 0, 0);
-    const isWithinNextDayGraceWindow =
-      !isSameDaySubmission && now.getTime() < nextDayGraceCutoff.getTime();
-
-    const isBackfill = workDate < today && !isWithinNextDayGraceWindow;
-    const backfillAllowance = isBackfill
+    const isBackfill = workDate < today;
+    const shouldApplyBackfillRules = enforceCurrentSalaryCycle;
+    const backfillAllowance = shouldApplyBackfillRules && isBackfill
       ? await this.getBackfillAllowanceForCycle(orgId, userId, currentCycle, now)
       : { limit: DEFAULT_BACKFILL_PER_MONTH, used: 0, remaining: DEFAULT_BACKFILL_PER_MONTH };
-
-    // Lifelines are available throughout the salary cycle, no cutoff date restriction
-    // The restriction is only within the current salary cycle
-
-    if (
-      isBackfill &&
-      !skipBackfillDeduction &&
-      backfillAllowance.remaining <= 0
-    ) {
-      throw new BadRequestException(
-        `Backfilling (lifeline) is limited to ${backfillAllowance.limit} days per salary cycle. Lifelines reset on the 26th of each month at 7:01 AM.`
-      );
-    }
-
-    const normalizedCycleStart = normalizeDate(currentCycle.start);
-    const normalizedCycleEnd = normalizeDate(currentCycle.end);
-
-    if (workDate < normalizedCycleStart || workDate > normalizedCycleEnd) {
-      throw new BadRequestException(
-        `Salary cycle is closed for ${payload.workDate}. Timesheets can only be filled within the current salary cycle (${currentCycle.cycleLabel})`,
-      );
-    }
-
-    if (isBackfill && !skipBackfillDeduction) {
-      const yesterday = new Date(today);
-      yesterday.setUTCDate(yesterday.getUTCDate() - 1);
-
-      const workingDayInfo = await this.getWorkingDayInfo(orgId, workDate, yesterday);
-
-      let pastWorkingDaysCount = 0;
-      const cursor = new Date(workDate);
-      while (cursor <= yesterday) {
-        const key = this.formatDateKey(cursor);
-        const info = workingDayInfo.get(key);
-        if (info?.isWorkingDay) {
-          pastWorkingDaysCount += 1;
-        }
-        cursor.setUTCDate(cursor.getUTCDate() + 1);
-      }
-
-      if (pastWorkingDaysCount > backfillAllowance.limit) {
-        throw new BadRequestException(
-          `Entry date is outside the allowed past working days window (${backfillAllowance.limit} working days).`,
-        );
-      }
-    }
 
     const [existing] = await db
       .select({
@@ -501,6 +367,21 @@ export class TimesheetsService {
       )
       .limit(1);
 
+    // Lifelines are available throughout the salary cycle, no cutoff date restriction
+    // The restriction is only within the current salary cycle
+
+    if (
+      shouldApplyBackfillRules &&
+      isBackfill &&
+      !skipBackfillDeduction &&
+      !existing &&
+      backfillAllowance.remaining <= 0
+    ) {
+      throw new BadRequestException(
+        `Backfilling (lifeline) is limited to ${backfillAllowance.limit} days per salary cycle. Lifelines reset on the 26th of each month at 7:01 AM.`
+      );
+    }
+
     if (
       existing &&
       ["submitted", "approved", "locked"].includes(existing.state)
@@ -510,11 +391,16 @@ export class TimesheetsService {
       );
     }
 
+    // Fetch existing entries for this timesheet to merge/accumulate with new entries
+    let entriesToSave = [...normalizedEntries];
     if (existing) {
-      // Get ALL existing hours for this timesheet (only approved entries)
-      const [{ totalHours: allExistingHours }] = await db
+      const existingEntries = await db
         .select({
-          totalHours: sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
+          id: timesheetEntriesTable.id,
+          projectId: timesheetEntriesTable.projectId,
+          taskDescription: timesheetEntriesTable.taskDescription,
+          hoursDecimal: timesheetEntriesTable.hoursDecimal,
+          taskTitle: timesheetEntriesTable.taskTitle,
         })
         .from(timesheetEntriesTable)
         .where(
@@ -524,12 +410,47 @@ export class TimesheetsService {
           ),
         );
 
-      const combinedHours =
-        Number(allExistingHours ?? 0) + Number(totalHoursForDay ?? 0);
+      // Create a map of existing entries by projectId for merging
+      const existingByProjectId = new Map<number | null, typeof existingEntries[0]>();
+      for (const entry of existingEntries) {
+        const key = entry.projectId ?? null;
+        existingByProjectId.set(key, entry);
+      }
 
+      // Merge new entries with existing ones - accumulate hours and descriptions
+      entriesToSave = normalizedEntries.map((newEntry) => {
+        const key = newEntry.projectId ?? null;
+        const existing = existingByProjectId.get(key);
+
+        if (existing) {
+          // Accumulate hours
+          const mergedHours = newEntry.hours + (Number(existing.hoursDecimal) || 0);
+          
+          // Merge descriptions: append new descriptions to existing ones
+          let mergedDescription = existing.taskDescription || '';
+          if (newEntry.taskDescription && mergedDescription) {
+            // Only add if not already present (case-insensitive)
+            if (!mergedDescription.toLowerCase().includes(newEntry.taskDescription.toLowerCase())) {
+              mergedDescription = mergedDescription + ', ' + newEntry.taskDescription;
+            }
+          } else if (newEntry.taskDescription) {
+            mergedDescription = newEntry.taskDescription;
+          }
+
+          return {
+            ...newEntry,
+            hours: mergedHours,
+            taskDescription: mergedDescription || null,
+          };
+        }
+        return newEntry;
+      });
+
+      // Validate combined hours does not exceed limit
+      const combinedHours = entriesToSave.reduce((acc, entry) => acc + entry.hours, 0);
       if (combinedHours > MAX_HOURS_PER_DAY) {
         throw new BadRequestException(
-          `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day`
+          `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day (total: ${combinedHours}h)`
         );
       }
     }
@@ -571,26 +492,38 @@ export class TimesheetsService {
         { channel: string | null; discordWebhook: string | null; name: string | null }
       > = {};
 
-      if (normalizedEntries.length > 0) {
-        const projectConditions = [];
-        if (nonNullProjectIds.length > 0) {
-          projectConditions.push(
-            inArray(timesheetEntriesTable.projectId, nonNullProjectIds)
-          );
-        }
-        if (includesNullProject) {
-          projectConditions.push(isNull(timesheetEntriesTable.projectId));
-        }
+      if (entriesToSave.length > 0) {
+        // Delete only entries for projects being updated (to allow accumulated additions)
+        const projectIdsToUpdate = Array.from(
+          new Set(
+            entriesToSave
+              .map((entry) => entry.projectId)
+              .filter((id): id is number => id !== null)
+          )
+        );
+        const includesNullProject = entriesToSave.some(
+          (entry) => entry.projectId === null
+        );
 
-        if (projectConditions.length > 0) {
+        if (projectIdsToUpdate.length > 0 || includesNullProject) {
+          const deleteConditions = [];
+          if (projectIdsToUpdate.length > 0) {
+            deleteConditions.push(
+              inArray(timesheetEntriesTable.projectId, projectIdsToUpdate)
+            );
+          }
+          if (includesNullProject) {
+            deleteConditions.push(isNull(timesheetEntriesTable.projectId));
+          }
+
           await tx
             .delete(timesheetEntriesTable)
             .where(
               and(
                 eq(timesheetEntriesTable.timesheetId, timesheetId),
-                projectConditions.length === 1
-                  ? projectConditions[0]
-                  : or(...projectConditions)
+                deleteConditions.length === 1
+                  ? deleteConditions[0]
+                  : or(...deleteConditions)
               )
             );
         }
@@ -610,7 +543,7 @@ export class TimesheetsService {
         }
 
         await tx.insert(timesheetEntriesTable).values(
-          normalizedEntries.map((entry) => ({
+          entriesToSave.map((entry) => ({
             orgId,
             timesheetId,
             projectId: entry.projectId,
@@ -683,7 +616,7 @@ export class TimesheetsService {
         .orderBy(asc(timesheetEntriesTable.id));
 
       // If this is a new backfill entry, increment usage counters for the salary cycle.
-      if (isBackfill && isNewTimesheet && !skipBackfillDeduction) {
+      if (shouldApplyBackfillRules && isBackfill && isNewTimesheet && !skipBackfillDeduction) {
         await this.incrementBackfillUsageForCycle(tx, orgId, userId, currentCycle, workDate, now);
       }
 
@@ -694,7 +627,7 @@ export class TimesheetsService {
       };
     });
 
-    const backfillRemaining = isBackfill
+    const backfillRemaining = shouldApplyBackfillRules && isBackfill
       ? skipBackfillDeduction
         ? backfillAllowance.remaining
         : Math.max(backfillAllowance.remaining - (existing ? 0 : 1), 0)
@@ -832,6 +765,7 @@ export class TimesheetsService {
     // Call the existing createOrUpsert method with the target user ID
     const result = await this.createOrUpsert(timesheetDto, payload.userId, orgId, {
       skipBackfillDeduction: true,
+      enforceCurrentSalaryCycle: false,
     });
 
     const actorRole = this.getPrivilegedActorRole(actorRoles);
@@ -2938,6 +2872,11 @@ export class TimesheetsService {
     let targetTimesheetId = existingEntry.timesheetId;
     if (updateData.date) {
       const workDate = normalizeDate(new Date(updateData.date));
+
+      const today = normalizeDate(now);
+      if (workDate > today) {
+        throw new BadRequestException('Cannot move timesheet entry to a future date');
+      }
 
       // Find or create the target timesheet for the user
       const [targetTimesheet] = await db

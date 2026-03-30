@@ -249,6 +249,7 @@ export class LeavesController {
 
   @Post("admin/apply")
   @Permissions("leave:create:any")
+  @Roles("admin", "super_admin")
   applyLeaveForUser(
     @Body() payload: CreateLeaveForUserDto,
     @CurrentUser() actor: AuthenticatedUser | undefined

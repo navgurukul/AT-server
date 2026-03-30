@@ -465,26 +465,7 @@ export class LeavesService {
       throw new BadRequestException("End date cannot be before start date");
     }
 
-    const today = this.normalizeDateUTC(new Date());
-    const normalizedStartDate = this.normalizeDateUTC(startDate);
-    const normalizedEndDate = this.normalizeDateUTC(endDate);
-    if (normalizedStartDate < today || normalizedEndDate < today) {
-      const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(new Date());
-      const cycleStart = this.normalizeDateUTC(currentCycle.start);
-      const cycleEnd = this.normalizeDateUTC(currentCycle.end);
-
-      if (normalizedStartDate < cycleStart || normalizedEndDate < cycleStart) {
-        throw new BadRequestException(
-          `Leave requests for past dates are only allowed within the current salary cycle (${currentCycle.cycleLabel})`
-        );
-      }
-
-      if (normalizedStartDate >= cycleEnd || normalizedEndDate >= cycleEnd) {
-        throw new BadRequestException(
-          `Leave requests for past dates are only allowed within the current salary cycle (${currentCycle.cycleLabel})`
-        );
-      }
-    }
+    this.enforcePastDateWindowForNonPrivilegedActor(startDate, endDate, actor);
 
     const request = await db.transaction(async (tx) => {
       const [leaveType] = await tx
@@ -846,26 +827,7 @@ export class LeavesService {
       throw new BadRequestException("End date cannot be before start date");
     }
 
-    const today = this.normalizeDateUTC(new Date());
-    const normalizedStartDate = this.normalizeDateUTC(startDate);
-    const normalizedEndDate = this.normalizeDateUTC(endDate);
-    if (normalizedStartDate < today || normalizedEndDate < today) {
-      const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(new Date());
-      const cycleStart = this.normalizeDateUTC(currentCycle.start);
-      const cycleEnd = this.normalizeDateUTC(currentCycle.end);
-
-      if (normalizedStartDate < cycleStart || normalizedEndDate < cycleStart) {
-        throw new BadRequestException(
-          `Leave requests for past dates are only allowed within the current salary cycle (${currentCycle.cycleLabel})`
-        );
-      }
-
-      if (normalizedStartDate >= cycleEnd || normalizedEndDate >= cycleEnd) {
-        throw new BadRequestException(
-          `Leave requests for past dates are only allowed within the current salary cycle (${currentCycle.cycleLabel})`
-        );
-      }
-    }
+    this.enforcePastDateWindowForNonPrivilegedActor(startDate, endDate, actor);
 
     return db.transaction(async (tx) => {
       const [existingRequest] = await tx
@@ -2084,13 +2046,6 @@ export class LeavesService {
       return false;
     }
 
-    let finalDurationType: "half_day" | "full_day";
-    if (finalCreditedHours >= COMP_OFF_FULL_DAY_HOURS - HOURS_NEGATIVE_TOLERANCE) {
-      finalDurationType = "full_day";
-    } else {
-      finalDurationType = "half_day";
-    }
-
     const leaveTypeId = await this.ensureCompOffLeaveType(tx, request.orgId);
     await this.ensureLeaveBalanceRow(tx, request.userId, leaveTypeId);
 
@@ -2111,7 +2066,6 @@ export class LeavesService {
       .update(compOffCreditsTable)
       .set({
         timesheetId,
-        durationType: finalDurationType,
         creditedHours: finalCreditedHours.toFixed(2),
         timesheetHours: timesheetHours.toFixed(2),
         status: "granted",
@@ -2150,14 +2104,13 @@ export class LeavesService {
           and(
             eq(compOffCreditsTable.orgId, orgId),
             eq(compOffCreditsTable.userId, userId),
-            eq(compOffCreditsTable.workDate, sql`CAST(${workDateKey} AS date)`),
+            or(
+              eq(compOffCreditsTable.workDate, sql`CAST(${workDateKey} AS date)`),
+              eq(compOffCreditsTable.timesheetId, timesheetId),
+            ),
             eq(compOffCreditsTable.status, "pending")
           )
         );
-
-      if (pendingRequests.length === 0) {
-        return false;
-      }
 
       let processed = false;
       for (const pendingRequest of pendingRequests) {
@@ -2168,6 +2121,100 @@ export class LeavesService {
           timesheetHours,
         );
         processed = processed || granted;
+      }
+
+      const eligibility = this.calculateCompOffEligibility(timesheetHours);
+      const eligibilityHours = Number(eligibility.creditedHours ?? 0);
+
+      // Reconcile already granted credits for this work date when timesheet hours increase.
+      // This prevents stale comp-off values after admin edits to timesheet entries.
+      if (eligibilityHours > HOURS_NEGATIVE_TOLERANCE) {
+        const grantedCredits = await tx
+          .select({
+            id: compOffCreditsTable.id,
+            durationType: compOffCreditsTable.durationType,
+            creditedHours: compOffCreditsTable.creditedHours,
+          })
+          .from(compOffCreditsTable)
+          .where(
+            and(
+              eq(compOffCreditsTable.orgId, orgId),
+              eq(compOffCreditsTable.userId, userId),
+              or(
+                eq(compOffCreditsTable.workDate, sql`CAST(${workDateKey} AS date)`),
+                eq(compOffCreditsTable.timesheetId, timesheetId),
+              ),
+              eq(compOffCreditsTable.status, "granted")
+            )
+          )
+          .orderBy(compOffCreditsTable.createdAt, compOffCreditsTable.id);
+
+        const totalGranted = grantedCredits.reduce(
+          (sum, credit) => sum + Number(credit.creditedHours ?? 0),
+          0,
+        );
+
+        let remainingEligibility = this.normalizeHours(eligibilityHours - totalGranted);
+
+        if (remainingEligibility > HOURS_NEGATIVE_TOLERANCE && grantedCredits.length > 0) {
+          const leaveTypeId = await this.ensureCompOffLeaveType(tx, orgId);
+          await this.ensureLeaveBalanceRow(tx, userId, leaveTypeId);
+
+          const now = new Date();
+          await this.expireStaleCompOffCredits(tx, orgId, userId, leaveTypeId, now);
+
+          let snapshot = await this.fetchLeaveBalanceSnapshot(tx, userId, leaveTypeId);
+
+          for (const credit of grantedCredits) {
+            if (remainingEligibility <= HOURS_NEGATIVE_TOLERANCE) {
+              break;
+            }
+
+            const currentCredited = Number(credit.creditedHours ?? 0);
+            // Reconcile to current earned eligibility (not only initial requested duration),
+            // so increasing timesheet hours can upgrade 4h comp-off to 8h.
+            const requestedCap =
+              eligibility.durationType === "full_day"
+                ? COMP_OFF_FULL_DAY_HOURS
+                : credit.durationType === "full_day"
+                  ? COMP_OFF_FULL_DAY_HOURS
+                  : COMP_OFF_HALF_DAY_HOURS;
+            const additionalAllowed = this.normalizeHours(requestedCap - currentCredited);
+
+            if (additionalAllowed <= HOURS_NEGATIVE_TOLERANCE) {
+              continue;
+            }
+
+            const additionalHours = Math.min(additionalAllowed, remainingEligibility);
+            if (additionalHours <= HOURS_NEGATIVE_TOLERANCE) {
+              continue;
+            }
+
+            const nextCredited = this.normalizeHours(currentCredited + additionalHours);
+
+            await tx
+              .update(compOffCreditsTable)
+              .set({
+                timesheetId,
+                durationType:
+                  nextCredited >= COMP_OFF_FULL_DAY_HOURS - HOURS_NEGATIVE_TOLERANCE
+                    ? "full_day"
+                    : credit.durationType,
+                creditedHours: nextCredited.toFixed(2),
+                timesheetHours: timesheetHours.toFixed(2),
+                updatedAt: now,
+              })
+              .where(eq(compOffCreditsTable.id, credit.id));
+
+            snapshot = await this.updateLeaveBalanceFromSnapshot(tx, snapshot, {
+              balanceHours: additionalHours,
+              allocatedHours: additionalHours,
+            });
+
+            remainingEligibility = this.normalizeHours(remainingEligibility - additionalHours);
+            processed = true;
+          }
+        }
       }
 
       return processed;
@@ -2617,6 +2664,50 @@ export class LeavesService {
     }
     return null;
   }
+
+  private isAdminOrSuperAdmin(actor?: AuthenticatedUser): boolean {
+    if (!actor) {
+      return false;
+    }
+
+    const privilegedRoles = new Set(["admin", "super_admin", "superadmin"]);
+    return (actor.roles ?? []).some((role) => privilegedRoles.has(role));
+  }
+
+  private enforcePastDateWindowForNonPrivilegedActor(
+    startDate: Date,
+    endDate: Date,
+    actor?: AuthenticatedUser,
+  ) {
+    if (this.isAdminOrSuperAdmin(actor)) {
+      return;
+    }
+
+    const today = this.normalizeDateUTC(new Date());
+    const normalizedStartDate = this.normalizeDateUTC(startDate);
+    const normalizedEndDate = this.normalizeDateUTC(endDate);
+
+    if (normalizedStartDate >= today && normalizedEndDate >= today) {
+      return;
+    }
+
+    const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(new Date());
+    const cycleStart = this.normalizeDateUTC(currentCycle.start);
+    const cycleEnd = this.normalizeDateUTC(currentCycle.end);
+
+    if (normalizedStartDate < cycleStart || normalizedEndDate < cycleStart) {
+      throw new BadRequestException(
+        `Leave requests for past dates are only allowed within the current salary cycle (${currentCycle.cycleLabel})`
+      );
+    }
+
+    if (normalizedStartDate >= cycleEnd || normalizedEndDate >= cycleEnd) {
+      throw new BadRequestException(
+        `Leave requests for past dates are only allowed within the current salary cycle (${currentCycle.cycleLabel})`
+      );
+    }
+  }
+
   private async assertNoHolidays(
     orgId: number,
     startDate: Date,
