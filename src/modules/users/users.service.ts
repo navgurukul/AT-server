@@ -2,11 +2,12 @@ import { BadRequestException, ForbiddenException, Injectable, NotFoundException 
 import { Cron } from '@nestjs/schedule';
 import { JWT } from 'google-auth-library';
 import { createHash } from 'crypto';
-import { and, count, eq, ilike, inArray, isNotNull, or } from 'drizzle-orm';
+import { and, count, eq, ilike, inArray, isNotNull, isNull, or } from 'drizzle-orm';
 
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { DatabaseService } from '../../database/database.service';
 import { AuditService } from '../audit/audit.service';
+import { TimesheetsService } from '../timesheets/timesheets.service';
 import {
   employeeDepartmentsTable,
   permissionsTable,
@@ -48,6 +49,7 @@ export class UsersService {
   constructor(
     private readonly database: DatabaseService,
     private readonly auditService: AuditService,
+    private readonly timesheetsService: TimesheetsService,
   ) {}
 
   async findUserByEmailInOrg(params: { email: string; orgId: number }) {
@@ -817,6 +819,7 @@ export class UsersService {
     const existingUsers = await db
       .select({
         id: usersTable.id,
+        orgId: usersTable.orgId,
         email: usersTable.email,
       })
       .from(usersTable);
@@ -879,6 +882,7 @@ export class UsersService {
     let created = 0;
     let updated = 0;
     const missingManagers = new Set<string>();
+    const usersForPayableRecalc = new Map<number, number>();
 
     const ensureUser = async (
       email: string,
@@ -914,15 +918,21 @@ export class UsersService {
         })
         .returning({
           id: usersTable.id,
+          orgId: usersTable.orgId,
           email: usersTable.email,
         });
 
       const record = {
         id: Number(createdUser.id),
+        orgId: Number(createdUser.orgId),
         email: createdUser.email,
       };
       userByEmail.set(normalizedEmail, record);
       created += 1;
+
+      // Ensure newly created users get payable_days calculated for current cycle
+      usersForPayableRecalc.set(record.id, record.orgId);
+
       return record;
     };
 
@@ -1042,6 +1052,44 @@ export class UsersService {
         .set(updatePayload)
         .where(eq(usersTable.id, userRecord.id));
       updated += 1;
+
+      if (
+        Object.prototype.hasOwnProperty.call(updatePayload, 'dateOfJoining') ||
+        Object.prototype.hasOwnProperty.call(updatePayload, 'dateOfExit')
+      ) {
+        usersForPayableRecalc.set(userRecord.id, Number(userRecord.orgId));
+      }
+    }
+
+    for (const [userId, orgId] of usersForPayableRecalc.entries()) {
+      await this.timesheetsService.recalculatePayableDaysForUserByExistingCycles(
+        orgId,
+        userId,
+      );
+    }
+
+    // Also ensure all users without joining dates get payable_days calculated
+    // so they properly compute expected_attendance and week_off from cycle start/end
+    const usersWithoutJoiningDate = await db
+      .select({
+        id: usersTable.id,
+        orgId: usersTable.orgId,
+      })
+      .from(usersTable)
+      .where(
+        and(
+          eq(usersTable.orgId, 1),
+          isNull(usersTable.dateOfJoining),
+        ),
+      );
+
+    for (const user of usersWithoutJoiningDate) {
+      if (!usersForPayableRecalc.has(user.id)) {
+        await this.timesheetsService.recalculatePayableDaysForUserByExistingCycles(
+          user.orgId,
+          user.id,
+        );
+      }
     }
 
     await this.ensureReportingManagersHaveManagerRole();
