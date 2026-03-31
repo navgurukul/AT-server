@@ -716,12 +716,270 @@ export class TimesheetsService {
       }
     }
 
+    const cycleRange = this.getCycleRangeForWorkDate(workDate);
+    await this.recalculateAndPersistPayableDaysForCycle(
+      db,
+      orgId,
+      userId,
+      cycleRange.cycleStart,
+      cycleRange.cycleEnd,
+      cycleRange.cycleKey,
+      now,
+    );
+
     return {
       ...result.timesheet,
       entries: result.entries,
       backfillLimit: backfillAllowance.limit,
       backfillRemaining,
     };
+  }
+
+  private getPayableDaysForHours(hours: number): number {
+    if (hours < 3) {
+      return 0;
+    }
+    if (hours < 6) {
+      return 0.5;
+    }
+    return 1;
+  }
+
+  private getCycleRangeForWorkDate(workDate: Date): {
+    cycleStart: Date;
+    cycleEnd: Date;
+    cycleKey: string;
+  } {
+    const normalizedWorkDate = this.normalizeDateUTC(workDate);
+    const day = normalizedWorkDate.getUTCDate();
+    const year = normalizedWorkDate.getUTCFullYear();
+    const month = normalizedWorkDate.getUTCMonth();
+
+    let cycleStart: Date;
+    let cycleEnd: Date;
+
+    if (day >= 26) {
+      cycleStart = new Date(Date.UTC(year, month, 26));
+      cycleEnd = new Date(Date.UTC(year, month + 1, 25));
+    } else {
+      cycleStart = new Date(Date.UTC(year, month - 1, 26));
+      cycleEnd = new Date(Date.UTC(year, month, 25));
+    }
+
+    return {
+      cycleStart,
+      cycleEnd,
+      cycleKey: this.formatDateKey(cycleEnd),
+    };
+  }
+
+  private async recalculateAndPersistPayableDaysForCycle(
+    tx: DatabaseService['connection'],
+    orgId: number,
+    userId: number,
+    cycleStart: Date,
+    cycleEnd: Date,
+    cycleKey: string,
+    now: Date,
+  ): Promise<void> {
+    const cycleStartDate = this.normalizeDateUTC(cycleStart);
+    const cycleEndDate = this.normalizeDateUTC(cycleEnd);
+
+    const [userEmployment] = await tx
+      .select({
+        dateOfJoining: usersTable.dateOfJoining,
+        dateOfExit: usersTable.dateOfExit,
+      })
+      .from(usersTable)
+      .where(
+        and(
+          eq(usersTable.id, userId),
+          eq(usersTable.orgId, orgId),
+        ),
+      )
+      .limit(1);
+
+    const cycleTimesheets = await tx
+      .select({
+        workDate: timesheetsTable.workDate,
+        totalHours: timesheetsTable.totalHours,
+      })
+      .from(timesheetsTable)
+      .where(
+        and(
+          eq(timesheetsTable.orgId, orgId),
+          eq(timesheetsTable.userId, userId),
+          gte(timesheetsTable.workDate, cycleStartDate),
+          lte(timesheetsTable.workDate, cycleEndDate),
+        ),
+      );
+
+    const workingDayInfo = await this.getWorkingDayInfo(
+      orgId,
+      cycleStartDate,
+      cycleEndDate,
+    );
+
+    const approvedLeaves = await tx
+      .select({
+        startDate: leaveRequestsTable.startDate,
+        endDate: leaveRequestsTable.endDate,
+        durationType: leaveRequestsTable.durationType,
+        leaveTypeCode: leaveTypesTable.code,
+        leaveTypeName: leaveTypesTable.name,
+      })
+      .from(leaveRequestsTable)
+      .innerJoin(
+        leaveTypesTable,
+        eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id),
+      )
+      .where(
+        and(
+          eq(leaveRequestsTable.userId, userId),
+          eq(leaveRequestsTable.state, 'approved'),
+          lte(leaveRequestsTable.startDate, cycleEndDate),
+          gte(leaveRequestsTable.endDate, cycleStartDate),
+        ),
+      );
+
+    const joiningDate = userEmployment?.dateOfJoining
+      ? this.normalizeDateUTC(new Date(userEmployment.dateOfJoining))
+      : null;
+    const exitDate = userEmployment?.dateOfExit
+      ? this.normalizeDateUTC(new Date(userEmployment.dateOfExit))
+      : null;
+
+    const effectiveStartDate = joiningDate && joiningDate > cycleStartDate
+      ? joiningDate
+      : cycleStartDate;
+    const effectiveEndDate = joiningDate === null
+      ? cycleEndDate
+      : exitDate && exitDate < cycleEndDate
+        ? exitDate
+        : cycleEndDate;
+
+    const expectedAttendance =
+      effectiveEndDate >= effectiveStartDate
+        ? Math.floor(
+            (effectiveEndDate.getTime() - effectiveStartDate.getTime()) /
+              (24 * 60 * 60 * 1000),
+          ) + 1
+        : 0;
+
+    let weekOffDays = 0;
+    if (effectiveEndDate >= effectiveStartDate) {
+      const cursor = new Date(effectiveStartDate);
+      while (cursor <= effectiveEndDate) {
+        const key = this.formatDateKey(cursor);
+        if (!workingDayInfo.get(key)?.isWorkingDay) {
+          weekOffDays += 1;
+        }
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+    }
+
+    let totalHours = 0;
+    let totalWorkingDays = 0;
+    let totalPayableDaysFromLeaves = 0;
+
+    for (const timesheet of cycleTimesheets) {
+      const workDateKey = this.formatDateKey(new Date(timesheet.workDate));
+      const dayInfo = workingDayInfo.get(workDateKey);
+
+      // Only working-day entries count toward payable days.
+      if (!dayInfo?.isWorkingDay) {
+        continue;
+      }
+
+      const hours = Number(timesheet.totalHours ?? 0);
+      if (!Number.isFinite(hours)) {
+        continue;
+      }
+      totalHours += hours;
+      totalWorkingDays += this.getPayableDaysForHours(hours);
+    }
+
+    for (const leave of approvedLeaves) {
+      const leaveTypeCode = (leave.leaveTypeCode ?? '').toLowerCase();
+      const leaveTypeName = (leave.leaveTypeName ?? '').toLowerCase();
+      const isLwp =
+        leaveTypeCode === 'lwp' ||
+        leaveTypeName.includes('without pay') ||
+        leaveTypeName.includes('lwp');
+
+      // LWP is approved leave but should not be counted as payable.
+      if (isLwp) {
+        continue;
+      }
+
+      const leaveStart = this.normalizeDateUTC(new Date(leave.startDate));
+      const leaveEnd = this.normalizeDateUTC(new Date(leave.endDate));
+
+      const windowStart = leaveStart > cycleStartDate ? leaveStart : cycleStartDate;
+      const windowEnd = leaveEnd < cycleEndDate ? leaveEnd : cycleEndDate;
+
+      if (windowEnd < windowStart) {
+        continue;
+      }
+
+      const applicableWorkingDayKeys: string[] = [];
+      const cursor = new Date(windowStart);
+      while (cursor <= windowEnd) {
+        const key = this.formatDateKey(cursor);
+        if (workingDayInfo.get(key)?.isWorkingDay) {
+          applicableWorkingDayKeys.push(key);
+        }
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+
+      if (applicableWorkingDayKeys.length === 0) {
+        continue;
+      }
+
+      const durationType = (leave.durationType ?? 'full_day').toLowerCase();
+      const leavePayablePerDay = durationType === 'half_day' ? 0.5 : 1;
+
+      totalPayableDaysFromLeaves += applicableWorkingDayKeys.length * leavePayablePerDay;
+    }
+
+    const totalPayableDays =
+      totalWorkingDays + totalPayableDaysFromLeaves + weekOffDays;
+
+    const payableValues = {
+      userId,
+      expectedAttendance,
+      cycle: cycleKey,
+      totalHours: totalHours.toFixed(1),
+      totalWorkingDays: totalWorkingDays.toFixed(1),
+      weekOff: weekOffDays.toFixed(1),
+      totalPayableDays: totalPayableDays.toFixed(1),
+      updatedAt: now,
+    };
+
+    const [existingPayableRow] = await tx
+      .select({ id: payableDaysTable.id })
+      .from(payableDaysTable)
+      .where(
+        and(
+          eq(payableDaysTable.userId, userId),
+          eq(payableDaysTable.cycle, cycleKey),
+        ),
+      )
+      .orderBy(desc(payableDaysTable.id))
+      .limit(1);
+
+    if (existingPayableRow) {
+      await tx
+        .update(payableDaysTable)
+        .set(payableValues)
+        .where(eq(payableDaysTable.id, existingPayableRow.id));
+      return;
+    }
+
+    await tx.insert(payableDaysTable).values({
+      ...payableValues,
+      createdAt: now,
+    });
   }
 
   async createOrUpsertByAdmin(
@@ -786,6 +1044,54 @@ export class TimesheetsService {
     }
 
     return result;
+  }
+
+  async recalculatePayableDaysForUserByExistingCycles(
+    orgId: number,
+    userId: number,
+  ): Promise<number> {
+    const db = this.database.connection;
+    const now = new Date();
+
+    const rows = await db
+      .select({ cycle: payableDaysTable.cycle })
+      .from(payableDaysTable)
+      .where(eq(payableDaysTable.userId, userId));
+
+    const uniqueCycleKeys = Array.from(
+      new Set(rows.map((row) => this.formatDateKey(new Date(row.cycle)))),
+    );
+
+    const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(now);
+    const currentCycleEnd = this.normalizeDateUTC(
+      new Date(
+        Date.UTC(
+          currentCycle.end.getUTCFullYear(),
+          currentCycle.end.getUTCMonth(),
+          25,
+        ),
+      ),
+    );
+    const currentCycleKey = this.formatDateKey(currentCycleEnd);
+    if (!uniqueCycleKeys.includes(currentCycleKey)) {
+      uniqueCycleKeys.push(currentCycleKey);
+    }
+
+    for (const cycleKey of uniqueCycleKeys) {
+      const cycleDate = new Date(`${cycleKey}T00:00:00.000Z`);
+      const cycleRange = this.getCycleRangeForWorkDate(cycleDate);
+      await this.recalculateAndPersistPayableDaysForCycle(
+        db,
+        orgId,
+        userId,
+        cycleRange.cycleStart,
+        cycleRange.cycleEnd,
+        cycleRange.cycleKey,
+        now,
+      );
+    }
+
+    return uniqueCycleKeys.length;
   }
 
   async updateBackfillLimit(payload: {
@@ -965,6 +1271,7 @@ export class TimesheetsService {
     const monthEnd = cycleRange.end; // 25th of next month (payable day period)
     const nextMonthStart = new Date(monthEnd);
     nextMonthStart.setUTCDate(nextMonthStart.getUTCDate() + 1);
+    const cycleKey = this.formatDateKey(monthEnd);
 
     const db = this.database.connection;
 
@@ -982,6 +1289,23 @@ export class TimesheetsService {
     if (!user || Number(user.orgId) !== orgId) {
       throw new NotFoundException('User not found for this organisation');
     }
+
+    const [payableDaysRow] = await db
+      .select({
+        totalHours: payableDaysTable.totalHours,
+        totalWorkingDays: payableDaysTable.totalWorkingDays,
+        weekOff: payableDaysTable.weekOff,
+        totalPayableDays: payableDaysTable.totalPayableDays,
+      })
+      .from(payableDaysTable)
+      .where(
+        and(
+          eq(payableDaysTable.userId, userId),
+          eq(payableDaysTable.cycle, cycleKey),
+        ),
+      )
+      .orderBy(desc(payableDaysTable.id))
+      .limit(1);
 
     const timesheets = await db
       .select({
@@ -1394,6 +1718,19 @@ export class TimesheetsService {
 
     // Calculate total payable days using new logic: week off days + payable days from timesheets (based on hours) + paid leaves + comp-off - LWP
     const totalPayableDays = weekOffDays + totalPayableDaysFromTimesheets + paidLeaves + totalCompOffLeaveTaken - lwpDays;
+    const parseNumeric = (value: unknown) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+
+    const totalHoursFromPayableDays = parseNumeric(payableDaysRow?.totalHours);
+    const totalWorkingDaysFromPayableDays = parseNumeric(
+      payableDaysRow?.totalWorkingDays,
+    );
+    const weekOffDaysFromPayableDays = parseNumeric(payableDaysRow?.weekOff);
+    const totalPayableDaysFromPayableDays = parseNumeric(
+      payableDaysRow?.totalPayableDays,
+    );
 
     const days: Array<{
       date: string;
@@ -1490,13 +1827,13 @@ export class TimesheetsService {
         isSalaryCycle: true,
       },
       totals: {
-        totalHours: Number(totalTimesheetHours.toFixed(2)),
-        totalWorkingDays,
+        totalHours: totalHoursFromPayableDays,
+        totalWorkingDays: totalWorkingDaysFromPayableDays,
         paidLeaves,
         totalCompOffLeaveTaken,
-        weekOffDays,
+        weekOffDays: weekOffDaysFromPayableDays,
         numOfWorkOnWeekendDays,
-        totalPayableDays,
+        totalPayableDays: totalPayableDaysFromPayableDays,
         LWP: lwpDays,
         timesheetHours: Number(totalTimesheetHours.toFixed(2)),
         leaveHours: Number(totalLeaveHours.toFixed(2)),
@@ -2803,6 +3140,7 @@ export class TimesheetsService {
       .select({
         id: timesheetEntriesTable.id,
         timesheetId: timesheetEntriesTable.timesheetId,
+        workDate: timesheetsTable.workDate,
         projectId: timesheetEntriesTable.projectId,
         hoursDecimal: timesheetEntriesTable.hoursDecimal,
         taskDescription: timesheetEntriesTable.taskDescription,
@@ -2995,6 +3333,34 @@ export class TimesheetsService {
         .where(eq(timesheetsTable.id, timesheetId));
     }
 
+    const cycleKeysToRecalculate = new Set<string>();
+
+    const previousCycle = this.getCycleRangeForWorkDate(
+      new Date(existingEntry.workDate),
+    );
+    cycleKeysToRecalculate.add(previousCycle.cycleKey);
+
+    if (updateData.date) {
+      const newCycle = this.getCycleRangeForWorkDate(
+        normalizeDate(new Date(updateData.date)),
+      );
+      cycleKeysToRecalculate.add(newCycle.cycleKey);
+    }
+
+    for (const cycleKey of cycleKeysToRecalculate) {
+      const cycleDate = new Date(`${cycleKey}T00:00:00.000Z`);
+      const cycleRange = this.getCycleRangeForWorkDate(cycleDate);
+      await this.recalculateAndPersistPayableDaysForCycle(
+        db,
+        orgId,
+        targetUserId,
+        cycleRange.cycleStart,
+        cycleRange.cycleEnd,
+        cycleRange.cycleKey,
+        now,
+      );
+    }
+
     return updatedEntry;
   }
 
@@ -3005,6 +3371,7 @@ export class TimesheetsService {
     actor?: AuthenticatedUser,
   ) {
     const db = this.database.connection;
+    const now = new Date();
 
     // Check if the entry exists and belongs to the specified user
     const [existingEntry] = await db
@@ -3062,9 +3429,30 @@ export class TimesheetsService {
       .update(timesheetsTable)
       .set({
         totalHours: String(totalHours ?? 0),
-        updatedAt: new Date(),
+        updatedAt: now,
       })
       .where(eq(timesheetsTable.id, timesheetId));
+
+    const [timesheet] = await db
+      .select({
+        workDate: timesheetsTable.workDate,
+      })
+      .from(timesheetsTable)
+      .where(eq(timesheetsTable.id, timesheetId))
+      .limit(1);
+
+    if (timesheet) {
+      const cycleRange = this.getCycleRangeForWorkDate(new Date(timesheet.workDate));
+      await this.recalculateAndPersistPayableDaysForCycle(
+        db,
+        orgId,
+        targetUserId,
+        cycleRange.cycleStart,
+        cycleRange.cycleEnd,
+        cycleRange.cycleKey,
+        now,
+      );
+    }
 
     const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
     if (actorRole) {
