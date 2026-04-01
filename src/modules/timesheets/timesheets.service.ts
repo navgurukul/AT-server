@@ -227,10 +227,20 @@ export class TimesheetsService {
           ? entry.taskTitle.trim()
           : null;
 
+      const taskDescription =
+        entry.taskDescription && entry.taskDescription.trim().length > 0
+          ? entry.taskDescription.trim()
+          : null;
+
+      if (taskDescription && taskDescription.length < 10) {
+        throw new BadRequestException(
+          `Entry ${index + 1} task description must be at least 10 characters long`
+        );
+      }
+
       const tags = Array.isArray(entry.tags)
         ? entry.tags.filter((tag) => typeof tag === "string" && tag.trim() !== "")
         : [];
-
       const hours = Number(entry.hours);
       if (Number.isNaN(hours) || hours <= 0) {
         throw new BadRequestException(
@@ -250,10 +260,7 @@ export class TimesheetsService {
         const normalized = {
           projectId,
           taskTitle,
-          taskDescription:
-            entry.taskDescription && entry.taskDescription.trim().length > 0
-              ? entry.taskDescription.trim()
-              : null,
+          taskDescription: taskDescription,
           hours,
           tags,
         };
@@ -271,6 +278,41 @@ export class TimesheetsService {
       throw new BadRequestException(
         `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day`
       );
+    }
+
+    const [leaveOnWorkDate] = await db
+      .select({
+        id: leaveRequestsTable.id,
+        durationType: leaveRequestsTable.durationType,
+      })
+      .from(leaveRequestsTable)
+      .where(
+        and(
+          eq(leaveRequestsTable.userId, userId),
+          or(
+            eq(leaveRequestsTable.state, 'approved'),
+            eq(leaveRequestsTable.state, 'pending')
+          ),
+          lte(leaveRequestsTable.startDate, workDate),
+          gte(leaveRequestsTable.endDate, workDate),
+        )
+      )
+      .limit(1);
+
+    if (leaveOnWorkDate) {
+      if (leaveOnWorkDate.durationType === 'full_day') {
+        throw new BadRequestException(
+          'You cannot submit a timesheet on a full-day leave.'
+        );
+      }
+      if (leaveOnWorkDate.durationType === 'half_day') {
+        const HALF_DAY_MAX_HOURS = 5.5;
+        if (totalHoursForDay > HALF_DAY_MAX_HOURS) {
+          throw new BadRequestException(
+            `On a half-day leave, you cannot log more than ${HALF_DAY_MAX_HOURS} hours.`
+          );
+        }
+      }
     }
 
     const projectIds = Array.from(
@@ -345,7 +387,22 @@ export class TimesheetsService {
     // Allow logging activities on non-working days (weekends, holidays) for comp-off generation
     // Removed validation that blocked timesheets on non-working days
 
-    const isBackfill = workDate < today;
+    const isYesterday = today.getTime() - workDate.getTime() === 24 * 60 * 60 * 1000;
+    const nowInIST = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const isBefore7AMIST = nowInIST.getHours() < 7;
+
+    const isBackfill = workDate < today && !(isYesterday && isBefore7AMIST);
+
+    if (isBackfill) {
+      const workingDaysPast = await this.calendarService.getWorkingDaysBetween(workDate, today);
+      const ALLOWED_PAST_WORKING_DAYS = 5;
+      if (workingDaysPast > ALLOWED_PAST_WORKING_DAYS) {
+        throw new BadRequestException(
+          `Entry is too old. You can only fill timesheets for up to ${ALLOWED_PAST_WORKING_DAYS} past working days.`
+        );
+      }
+    }
+    
     const shouldApplyBackfillRules = enforceCurrentSalaryCycle;
     const backfillAllowance = shouldApplyBackfillRules && isBackfill
       ? await this.getBackfillAllowanceForCycle(orgId, userId, currentCycle, now)

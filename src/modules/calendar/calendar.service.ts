@@ -70,6 +70,37 @@ export class CalendarService {
     return map;
   }
 
+  async getWorkingDaysMap(orgId: number, start: Date, end: Date) {
+    const map = new Map<string, boolean>();
+    const cursor = new Date(start);
+    const holidayMap = await this.getHolidayMap(orgId, start, end);
+
+    while (cursor <= end) {
+      const dayOfWeek = cursor.getUTCDay();
+      const isSunday = dayOfWeek === 0;
+      const isSaturday = dayOfWeek === 6;
+      const isSecondFourthSaturday =
+        isSaturday && this.isSecondOrFourthSaturday(cursor);
+      const defaultWorking = !(isSunday || isSecondFourthSaturday);
+
+      const key = this.formatDateKey(cursor);
+      const holidayOverride = holidayMap.get(key);
+
+      const isWorkingDay =
+        holidayOverride !== undefined
+          ? holidayOverride.isWorkingDay
+          : defaultWorking;
+
+      if (isWorkingDay) {
+        map.set(key, true);
+      }
+
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+
+    return map;
+  }
+
   private isSecondOrFourthSaturday(date: Date): boolean {
     const occurrence = Math.ceil(date.getUTCDate() / 7);
     return occurrence === 2 || occurrence === 4;
@@ -100,5 +131,57 @@ export class CalendarService {
       isWeekend,
       isHoliday,
     };
+  }
+
+  async getWorkingDayInfo(orgId: number, from: Date, to: Date) {
+    const workingDays = await this.getWorkingDaysMap(orgId, from, to);
+    const holidays = await this.getHolidayMap(orgId, from, to);
+
+    const info = new Map<string, { isWorkingDay: boolean; isHoliday: boolean }>();
+    const cursor = new Date(from);
+
+    while (cursor <= to) {
+      const key = this.formatDateKey(cursor);
+      const isHoliday = holidays.has(key);
+      const isWorking = workingDays.has(key) && !isHoliday;
+
+      info.set(key, { isWorkingDay: isWorking, isHoliday });
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+
+    return info;
+  }
+
+  async getWorkingDaysBetween(startDate: Date, endDate: Date): Promise<number> {
+    const db = this.database.connection;
+    const orgId = 1; // Assuming a default orgId as it's not available here.
+    const workingDays = await this.getWorkingDaysMap(orgId, startDate, endDate);
+    const holidays = await this.getHolidayMap(orgId, startDate, endDate);
+
+    let count = 0;
+    const cursor = new Date(startDate);
+
+    while (cursor < endDate) {
+      const day = cursor.getUTCDay();
+      const key = `${cursor.getUTCFullYear()}-${(cursor.getUTCMonth() + 1)
+        .toString()
+        .padStart(2, '0')}-${cursor.getUTCDate().toString().padStart(2, '0')}`;
+
+      const isHoliday = holidays.has(key);
+      const isWorkingDay = workingDays.has(key);
+
+      if (isWorkingDay && !isHoliday) {
+        count++;
+      }
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+
+    return count;
+  }
+
+  private formatDate(date: Date): string {
+    return `${date.getUTCFullYear()}-${(date.getUTCMonth() + 1)
+      .toString()
+      .padStart(2, '0')}-${date.getUTCDate().toString().padStart(2, '0')}`;
   }
 }
