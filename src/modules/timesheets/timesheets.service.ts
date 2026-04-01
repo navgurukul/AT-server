@@ -1734,7 +1734,7 @@ export class TimesheetsService {
           state: request.state,
           durationType: request.durationType,
           halfDaySegment: request.halfDaySegment ?? null,
-          hours: Number(hoursForDay.toFixed(2)),
+          hours: request.durationType === 'half_day' ? HALF_DAY_HOURS : HOURS_PER_WORKING_DAY,
           leaveType: {
             id: request.leaveTypeId,
             code: request.leaveTypeCode ?? null,
@@ -2373,7 +2373,6 @@ export class TimesheetsService {
             .select({
               userId: payableDaysTable.userId,
               expectedAttendance: payableDaysTable.expectedAttendance,
-              totalHours: payableDaysTable.totalHours,
               totalWorkingDays: payableDaysTable.totalWorkingDays,
               weekOff: payableDaysTable.weekOff,
               totalPayableDays: payableDaysTable.totalPayableDays,
@@ -2385,6 +2384,41 @@ export class TimesheetsService {
                 inArray(payableDaysTable.userId, userIds),
               ),
             );
+
+    const cycleEndExclusive = new Date(cycleEnd);
+    cycleEndExclusive.setUTCDate(cycleEndExclusive.getUTCDate() + 1);
+
+    const cycleTimesheets =
+      userIds.length === 0
+        ? []
+        : await db
+            .select({
+              userId: timesheetsTable.userId,
+              totalHours: timesheetsTable.totalHours,
+            })
+            .from(timesheetsTable)
+            .where(
+              and(
+                eq(timesheetsTable.orgId, orgId),
+                inArray(timesheetsTable.userId, userIds),
+                gte(timesheetsTable.workDate, cycleStart),
+                lt(timesheetsTable.workDate, cycleEndExclusive),
+              ),
+            );
+
+    const totalTimesheetHoursByUserId = new Map<number, number>();
+    for (const row of cycleTimesheets) {
+      const userId = Number(row.userId);
+      const hours = Number(row.totalHours ?? 0);
+      if (!Number.isFinite(hours)) {
+        continue;
+      }
+
+      totalTimesheetHoursByUserId.set(
+        userId,
+        Number(((totalTimesheetHoursByUserId.get(userId) ?? 0) + hours).toFixed(2)),
+      );
+    }
 
     const payableDaysByUserId = new Map(
       payableDaysRows.map((row) => [Number(row.userId), row]),
@@ -2424,7 +2458,9 @@ export class TimesheetsService {
           status: user.status,
           expectedAttendance: parseNumericValue(payableRow?.expectedAttendance),
           cycle,
-          totalHours: Number(parseNumericValue(payableRow?.totalHours).toFixed(1)),
+          totalHours: Number(
+            (totalTimesheetHoursByUserId.get(user.id) ?? 0).toFixed(1),
+          ),
           totalWorkingDays: Number(
             parseNumericValue(payableRow?.totalWorkingDays).toFixed(1),
           ),
