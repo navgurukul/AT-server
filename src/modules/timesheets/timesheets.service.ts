@@ -446,8 +446,35 @@ export class TimesheetsService {
         return newEntry;
       });
 
-      // Validate combined hours does not exceed limit
-      const combinedHours = entriesToSave.reduce((acc, entry) => acc + entry.hours, 0);
+      // Validate final total hours for the day after applying this partial update.
+      // Existing entries for projects not included in the payload remain unchanged,
+      // so include them in the total check as well.
+      const updatedProjectIds = new Set<number>(
+        normalizedEntries
+          .map((entry) => entry.projectId)
+          .filter((id): id is number => id !== null),
+      );
+      const updatesNullProject = normalizedEntries.some(
+        (entry) => entry.projectId === null,
+      );
+
+      const untouchedExistingHours = existingEntries.reduce((acc, entry) => {
+        const isNullProject = entry.projectId === null;
+        const existingProjectId = entry.projectId;
+        const isUpdatedProject = isNullProject
+          ? updatesNullProject
+          : existingProjectId !== null && updatedProjectIds.has(existingProjectId);
+
+        if (isUpdatedProject) {
+          return acc;
+        }
+
+        return acc + (Number(entry.hoursDecimal) || 0);
+      }, 0);
+
+      const combinedHours =
+        untouchedExistingHours +
+        entriesToSave.reduce((acc, entry) => acc + entry.hours, 0);
       if (combinedHours > MAX_HOURS_PER_DAY) {
         throw new BadRequestException(
           `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day (total: ${combinedHours}h)`
@@ -3370,112 +3397,258 @@ export class TimesheetsService {
     orgId: number,
     actor?: AuthenticatedUser,
   ) {
-    const db = this.database.connection;
-    const now = new Date();
+    try {
+      const db = this.database.connection;
+      const now = new Date();
 
-    // Check if the entry exists and belongs to the specified user
-    const [existingEntry] = await db
-      .select({
-        id: timesheetEntriesTable.id,
-        timesheetId: timesheetEntriesTable.timesheetId,
-        projectId: timesheetEntriesTable.projectId,
-        hoursDecimal: timesheetEntriesTable.hoursDecimal,
-        taskDescription: timesheetEntriesTable.taskDescription,
-      })
-      .from(timesheetEntriesTable)
-      .innerJoin(
-        timesheetsTable,
-        eq(timesheetEntriesTable.timesheetId, timesheetsTable.id),
-      )
-      .where(
-        and(
-          eq(timesheetEntriesTable.id, entryId),
-          eq(timesheetEntriesTable.orgId, orgId),
-          eq(timesheetsTable.userId, targetUserId),
-        ),
-      );
+      // Check if the entry exists and belongs to the specified user
+      const [existingEntry] = await db
+        .select({
+          id: timesheetEntriesTable.id,
+          timesheetId: timesheetEntriesTable.timesheetId,
+          projectId: timesheetEntriesTable.projectId,
+          hoursDecimal: timesheetEntriesTable.hoursDecimal,
+          taskDescription: timesheetEntriesTable.taskDescription,
+          status: timesheetEntriesTable.status,
+        })
+        .from(timesheetEntriesTable)
+        .innerJoin(
+          timesheetsTable,
+          eq(timesheetEntriesTable.timesheetId, timesheetsTable.id),
+        )
+        .where(
+          and(
+            eq(timesheetEntriesTable.id, entryId),
+            eq(timesheetEntriesTable.orgId, orgId),
+            eq(timesheetsTable.userId, targetUserId),
+          ),
+        );
 
-    if (!existingEntry) {
-      throw new NotFoundException(
-        `Timesheet entry with ID ${entryId} for user ${targetUserId} not found`,
-      );
-    }
+      if (!existingEntry) {
+        return {
+          success: false,
+          message: `Timesheet entry with ID ${entryId} for user ${targetUserId} not found.`,
+          entryId,
+          targetUserId,
+        };
+      }
 
-    const timesheetId = existingEntry.timesheetId;
+      const timesheetId = existingEntry.timesheetId;
+      const hoursToDelete = Number(existingEntry.hoursDecimal ?? 0);
 
-    // Soft delete: update status to 'rejected' instead of permanent deletion
-    await db
-      .update(timesheetEntriesTable)
-      .set({
-        status: 'rejected',
-        updatedAt: new Date(),
-      })
-      .where(eq(timesheetEntriesTable.id, entryId));
+      // Permanently delete the timesheet entry
+      try {
+        const deleteResult = await db
+          .delete(timesheetEntriesTable)
+          .where(eq(timesheetEntriesTable.id, entryId));
 
-    // Recalculate total hours for the affected timesheet (excluding rejected entries)
-    const [{ totalHours }] = await db
-      .select({
-        totalHours: sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
-      })
-      .from(timesheetEntriesTable)
-      .where(
-        and(
-          eq(timesheetEntriesTable.timesheetId, timesheetId),
-          eq(timesheetEntriesTable.status, 'approved'),
-        ),
-      );
+        if (!deleteResult) {
+          return {
+            success: false,
+            message: `Failed to delete timesheet entry with ID ${entryId}. Entry may have already been deleted or no longer exists.`,
+            entryId,
+            targetUserId,
+          };
+        }
+      } catch (deleteError) {
+        const errorMsg = deleteError instanceof Error ? deleteError.message : 'Unknown error';
+        this.logger.error(`Database error while deleting entry ${entryId}:`, deleteError);
+        return {
+          success: false,
+          message: `Failed to delete timesheet entry from database. Error: ${errorMsg}`,
+          entryId,
+          targetUserId,
+          error: errorMsg,
+        };
+      }
 
-    await db
-      .update(timesheetsTable)
-      .set({
-        totalHours: String(totalHours ?? 0),
-        updatedAt: now,
-      })
-      .where(eq(timesheetsTable.id, timesheetId));
+      // Recalculate total hours for the affected timesheet (sum all approved entries)
+      let totalHours: number;
+      try {
+        const [result] = await db
+          .select({
+            totalHours: sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
+          })
+          .from(timesheetEntriesTable)
+          .where(
+            and(
+              eq(timesheetEntriesTable.timesheetId, timesheetId),
+              eq(timesheetEntriesTable.status, 'approved'),
+            ),
+          );
 
-    const [timesheet] = await db
-      .select({
-        workDate: timesheetsTable.workDate,
-      })
-      .from(timesheetsTable)
-      .where(eq(timesheetsTable.id, timesheetId))
-      .limit(1);
+        totalHours = Number(result?.totalHours ?? 0);
+      } catch (recalcError) {
+        const errorMsg = recalcError instanceof Error ? recalcError.message : 'Unknown error';
+        this.logger.error(`Failed to recalculate hours for timesheet ${timesheetId}:`, recalcError);
+        return {
+          success: false,
+          message: `Timesheet entry was deleted, but failed to recalculate total hours. Error: ${errorMsg}`,
+          entryId,
+          targetUserId,
+          error: errorMsg,
+        };
+      }
 
-    if (timesheet) {
-      const cycleRange = this.getCycleRangeForWorkDate(new Date(timesheet.workDate));
-      await this.recalculateAndPersistPayableDaysForCycle(
-        db,
-        orgId,
+      const totalHoursNum = Number(totalHours ?? 0);
+
+      // Get timesheet info before updating
+      const [timesheet] = await db
+        .select({
+          workDate: timesheetsTable.workDate,
+        })
+        .from(timesheetsTable)
+        .where(eq(timesheetsTable.id, timesheetId))
+        .limit(1);
+
+      if (!timesheet) {
+        return {
+          success: false,
+          message: `Timesheet with ID ${timesheetId} not found after entry deletion.`,
+          entryId,
+          targetUserId,
+        };
+      }
+
+      // If no approved entries remain, delete the timesheet; otherwise update total hours
+      try {
+        if (totalHoursNum === 0) {
+          // Permanently delete the timesheet if it has no entries
+          const deleteResult = await db
+            .delete(timesheetsTable)
+            .where(eq(timesheetsTable.id, timesheetId));
+
+          if (!deleteResult) {
+            return {
+              success: false,
+              message: `Failed to delete empty timesheet with ID ${timesheetId}. Timesheet entry was deleted but timesheet deletion failed.`,
+              entryId,
+              targetUserId,
+              timesheetId,
+            };
+          }
+        } else {
+          // Update timesheet with recalculated total hours
+          const updateResult = await db
+            .update(timesheetsTable)
+            .set({
+              totalHours: String(totalHoursNum),
+              updatedAt: now,
+            })
+            .where(eq(timesheetsTable.id, timesheetId));
+
+          if (!updateResult) {
+            return {
+              success: false,
+              message: `Failed to update timesheet total hours after entry deletion. Entry was deleted but timesheet update failed.`,
+              entryId,
+              targetUserId,
+              timesheetId,
+            };
+          }
+        }
+      } catch (timesheetError) {
+        const errorMsg = timesheetError instanceof Error ? timesheetError.message : 'Unknown error';
+        this.logger.error(`Failed to update/delete timesheet ${timesheetId}:`, timesheetError);
+        return {
+          success: false,
+          message: `Timesheet entry was deleted, but failed to update/delete timesheet. Error: ${errorMsg}`,
+          entryId,
+          targetUserId,
+          timesheetId,
+          error: errorMsg,
+        };
+      }
+
+      // Recalculate payable days for the cycle after deletion
+      try {
+        const cycleRange = this.getCycleRangeForWorkDate(new Date(timesheet.workDate));
+        await this.recalculateAndPersistPayableDaysForCycle(
+          db,
+          orgId,
+          targetUserId,
+          cycleRange.cycleStart,
+          cycleRange.cycleEnd,
+          cycleRange.cycleKey,
+          now,
+        );
+      } catch (payableDaysError) {
+        const errorMsg = payableDaysError instanceof Error ? payableDaysError.message : 'Unknown error';
+        this.logger.error(`Failed to recalculate payable days for user ${targetUserId}:`, payableDaysError);
+        return {
+          success: false,
+          message: `Timesheet entry and record were deleted, but failed to recalculate payable days. Error: ${errorMsg}`,
+          entryId,
+          targetUserId,
+          error: errorMsg,
+          warning: 'Entry was deleted successfully. Please contact support to recalculate payable days.',
+        };
+      }
+
+      // Try to reconcile comp-off credits after deletion
+      if (totalHoursNum >= 0) {
+        try {
+          await this.leavesService.tryProcessCompOffForTimesheet(
+            orgId,
+            targetUserId,
+            new Date(timesheet.workDate),
+            timesheetId,
+            totalHoursNum,
+          );
+        } catch (error) {
+          // Log but don't fail the deletion if comp-off processing fails
+          this.logger.warn(
+            `Failed to auto-process comp off after deletion for timesheet ${timesheetId}:`,
+            error,
+          );
+        }
+      }
+
+      const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
+      if (actorRole) {
+        try {
+          await this.auditService.createLog({
+            orgId,
+            actorUserId: actor?.id,
+            actorRole,
+            action: 'timesheet_deleted',
+            subjectType: 'timesheet_deleted',
+            targetUserId,
+            prev: {
+              projectId: existingEntry.projectId,
+              hours: hoursToDelete,
+              activities: existingEntry.taskDescription ?? null,
+              status: existingEntry.status,
+            },
+            next: {
+              status: 'deleted',
+              remainingHours: totalHoursNum,
+            },
+          });
+        } catch (auditError) {
+          this.logger.warn(`Failed to create audit log for timesheet deletion:`, auditError);
+          // Don't throw - deletion already succeeded
+        }
+      }
+
+      return {
+        success: true,
+        message: 'Timesheet entry deleted permanently',
+        timesheetDeleted: totalHoursNum === 0,
+        remainingHours: totalHoursNum,
+      };
+    } catch (error) {
+      // Catch any unexpected errors
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error occurred';
+      this.logger.error(`Unexpected error deleting timesheet entry ${entryId}:`, error);
+      return {
+        success: false,
+        message: `An unexpected error occurred while deleting the timesheet entry. Error: ${errorMsg}`,
+        entryId,
         targetUserId,
-        cycleRange.cycleStart,
-        cycleRange.cycleEnd,
-        cycleRange.cycleKey,
-        now,
-      );
+        error: errorMsg,
+      };
     }
-
-    const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
-    if (actorRole) {
-      await this.auditService.createLog({
-        orgId,
-        actorUserId: actor?.id,
-        actorRole,
-        action: 'timesheet_deleted',
-        subjectType: 'timesheet_deleted',
-        targetUserId,
-        prev: {
-          projectId: existingEntry.projectId,
-          hours: Number(existingEntry.hoursDecimal ?? 0),
-          activities: existingEntry.taskDescription ?? null,
-          status: 'approved',
-        },
-        next: {
-          status: 'rejected',
-        },
-      });
-    }
-
-    return { success: true, message: 'Timesheet entry deleted successfully' };
   }
 
   private getPrivilegedActorRole(roles: string[]): 'super_admin' | 'admin' | null {
