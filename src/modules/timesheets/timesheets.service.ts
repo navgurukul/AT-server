@@ -36,6 +36,7 @@ interface ListTimesheetParams {
 const DEFAULT_BACKFILL_PER_MONTH = 3;
 const BACKFILL_CUTOFF_DAY = 25;
 const MAX_HOURS_PER_DAY = 12;
+const HALF_DAY_MAX_HOURS = 5.5;
 const HOURS_PER_WORKING_DAY = 8;
 const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 
@@ -55,6 +56,49 @@ export class TimesheetsService {
     private readonly leavesService: LeavesService,
     private readonly auditService: AuditService,
   ) {}
+
+  private async enforceLeaveBasedDailyHoursLimit(
+    userId: number,
+    workDate: Date,
+    totalHoursForDay: number,
+  ) {
+    const db = this.database.connection;
+
+    const leavesOnWorkDate = await db
+      .select({
+        durationType: leaveRequestsTable.durationType,
+      })
+      .from(leaveRequestsTable)
+      .where(
+        and(
+          eq(leaveRequestsTable.userId, userId),
+          or(
+            eq(leaveRequestsTable.state, 'approved'),
+            eq(leaveRequestsTable.state, 'pending'),
+          ),
+          lte(leaveRequestsTable.startDate, workDate),
+          gte(leaveRequestsTable.endDate, workDate),
+        ),
+      );
+
+    const hasFullDayLeave = leavesOnWorkDate.some(
+      (leave) => leave.durationType === 'full_day',
+    );
+    if (hasFullDayLeave) {
+      throw new BadRequestException(
+        'You cannot submit a timesheet on a full-day leave.',
+      );
+    }
+
+    const hasHalfDayLeave = leavesOnWorkDate.some(
+      (leave) => leave.durationType === 'half_day',
+    );
+    if (hasHalfDayLeave && totalHoursForDay > HALF_DAY_MAX_HOURS) {
+      throw new BadRequestException(
+        `On a half-day leave, you cannot log more than ${HALF_DAY_MAX_HOURS} hours.`,
+      );
+    }
+  }
 
   async listTimesheets(params: ListTimesheetParams) {
     const db = this.database.connection;
@@ -252,10 +296,21 @@ export class TimesheetsService {
       const existing = normalizedEntriesMap.get(key);
 
       if (existing) {
-        // Accumulate hours for the same project, keep the first entry's other properties
+        // Accumulate hours for the same project
         existing.hours += hours;
         // Merge tags
         existing.tags = Array.from(new Set([...existing.tags, ...tags]));
+        // Merge descriptions: append new descriptions to existing ones
+        if (taskDescription) {
+          if (existing.taskDescription) {
+            // Only add if not already present (case-insensitive)
+            if (!existing.taskDescription.toLowerCase().includes(taskDescription.toLowerCase())) {
+              existing.taskDescription = existing.taskDescription + ', ' + taskDescription;
+            }
+          } else {
+            existing.taskDescription = taskDescription;
+          }
+        }
       } else {
         const normalized = {
           projectId,
@@ -278,41 +333,6 @@ export class TimesheetsService {
       throw new BadRequestException(
         `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day`
       );
-    }
-
-    const [leaveOnWorkDate] = await db
-      .select({
-        id: leaveRequestsTable.id,
-        durationType: leaveRequestsTable.durationType,
-      })
-      .from(leaveRequestsTable)
-      .where(
-        and(
-          eq(leaveRequestsTable.userId, userId),
-          or(
-            eq(leaveRequestsTable.state, 'approved'),
-            eq(leaveRequestsTable.state, 'pending')
-          ),
-          lte(leaveRequestsTable.startDate, workDate),
-          gte(leaveRequestsTable.endDate, workDate),
-        )
-      )
-      .limit(1);
-
-    if (leaveOnWorkDate) {
-      if (leaveOnWorkDate.durationType === 'full_day') {
-        throw new BadRequestException(
-          'You cannot submit a timesheet on a full-day leave.'
-        );
-      }
-      if (leaveOnWorkDate.durationType === 'half_day') {
-        const HALF_DAY_MAX_HOURS = 5.5;
-        if (totalHoursForDay > HALF_DAY_MAX_HOURS) {
-          throw new BadRequestException(
-            `On a half-day leave, you cannot log more than ${HALF_DAY_MAX_HOURS} hours.`
-          );
-        }
-      }
     }
 
     const projectIds = Array.from(
@@ -450,6 +470,7 @@ export class TimesheetsService {
 
     // Fetch existing entries for this timesheet to merge/accumulate with new entries
     let entriesToSave = [...normalizedEntries];
+    let finalTotalHoursForDay = totalHoursForDay;
     if (existing) {
       const existingEntries = await db
         .select({
@@ -537,7 +558,15 @@ export class TimesheetsService {
           `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day (total: ${combinedHours}h)`
         );
       }
+
+      finalTotalHoursForDay = combinedHours;
     }
+
+    await this.enforceLeaveBasedDailyHoursLimit(
+      userId,
+      workDate,
+      finalTotalHoursForDay,
+    );
 
     const notesToPersist = payload.notes ?? existing?.notes ?? null;
 
@@ -1572,6 +1601,7 @@ export class TimesheetsService {
         leaveTypeId: leaveRequestsTable.leaveTypeId,
         leaveTypeCode: leaveTypesTable.code,
         leaveTypeName: leaveTypesTable.name,
+        reason: leaveRequestsTable.reason,
       })
       .from(leaveRequestsTable)
       .innerJoin(
@@ -1599,6 +1629,7 @@ export class TimesheetsService {
           durationType: string;
           halfDaySegment: string | null;
           hours: number;
+          reason: string | null;
           leaveType: {
             id: number;
             code: string | null;
@@ -1715,6 +1746,7 @@ export class TimesheetsService {
               durationType: string;
               halfDaySegment: string | null;
               hours: number;
+              reason: string | null;
               leaveType: {
                 id: number;
                 code: string | null;
@@ -1735,6 +1767,7 @@ export class TimesheetsService {
           durationType: request.durationType,
           halfDaySegment: request.halfDaySegment ?? null,
           hours: request.durationType === 'half_day' ? HALF_DAY_HOURS : HOURS_PER_WORKING_DAY,
+          reason: request.reason ?? null,
           leaveType: {
             id: request.leaveTypeId,
             code: request.leaveTypeCode ?? null,
@@ -3328,6 +3361,7 @@ export class TimesheetsService {
 
     // If date is being updated, we need to check if the target timesheet exists or create it
     let targetTimesheetId = existingEntry.timesheetId;
+    let targetWorkDate = normalizeDate(existingEntry.workDate);
     if (updateData.date) {
       const workDate = normalizeDate(new Date(updateData.date));
 
@@ -3367,6 +3401,7 @@ export class TimesheetsService {
       }
 
       updatePayload.timesheetId = targetTimesheetId;
+      targetWorkDate = workDate;
     }
 
     const updatedEntryHours =
@@ -3395,6 +3430,12 @@ export class TimesheetsService {
         `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day`,
       );
     }
+
+    await this.enforceLeaveBasedDailyHoursLimit(
+      targetUserId,
+      targetWorkDate,
+      totalHoursForDayAfterUpdate,
+    );
 
     // Update the entry
     const [updatedEntry] = await db
