@@ -1568,8 +1568,7 @@ export class LeavesService {
         }
       }
 
-      const expiresAt = new Date(workDate);
-      expiresAt.setUTCDate(expiresAt.getUTCDate() + COMP_OFF_EXPIRY_DAYS);
+      const expiresAt = this.calculateCompOffExpiryAt(workDate);
 
       // Create comp-off request in pending state. Balance will be updated only after timesheet is filled.
       const [workRequest] = await tx
@@ -2077,8 +2076,9 @@ export class LeavesService {
       allocatedHours: finalCreditedHours,
     });
 
-    const grantExpiresAt = new Date(request.workDate as unknown as string | Date);
-    grantExpiresAt.setUTCDate(grantExpiresAt.getUTCDate() + COMP_OFF_EXPIRY_DAYS);
+    const grantExpiresAt = this.calculateCompOffExpiryAt(
+      request.workDate as unknown as string | Date
+    );
 
     await tx
       .update(compOffCreditsTable)
@@ -3316,6 +3316,14 @@ export class LeavesService {
     return new Date(
       Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
     );
+  }
+
+  private calculateCompOffExpiryAt(workDate: Date | string): Date {
+    const expiry = new Date(workDate);
+    expiry.setUTCDate(expiry.getUTCDate() + COMP_OFF_EXPIRY_DAYS);
+    // Expire at the end of the expiry date, not at the start.
+    expiry.setUTCHours(23, 59, 59, 999);
+    return expiry;
   }
 
   private formatDateKey(date: Date): string {

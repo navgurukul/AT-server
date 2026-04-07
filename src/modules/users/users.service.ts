@@ -163,6 +163,37 @@ export class UsersService {
 
     const users = await usersQuery.limit(limit).offset(offset);
 
+    const managerIds = Array.from(
+      new Set(
+        users
+          .map((user) => user.managerId)
+          .filter((id): id is number => id !== null && id !== undefined),
+      ),
+    );
+
+    const managers =
+      managerIds.length === 0
+        ? []
+        : await db
+            .select({
+              id: usersTable.id,
+              name: usersTable.name,
+              email: usersTable.email,
+            })
+            .from(usersTable)
+            .where(inArray(usersTable.id, managerIds));
+
+    const managersById = managers.reduce<
+      Record<number, { id: number; name: string; email: string }>
+    >((acc, curr) => {
+      acc[curr.id] = {
+        id: Number(curr.id),
+        name: curr.name,
+        email: curr.email,
+      };
+      return acc;
+    }, {});
+
     const totalResultQuery = db
       .select({ value: count(usersTable.id) })
       .from(usersTable);
@@ -278,6 +309,7 @@ export class UsersService {
         id: usersTable.id,
         name: usersTable.name,
         email: usersTable.email,
+        managerId: usersTable.managerId,
         employeeDepartmentId: usersTable.employeeDepartmentId,
       })
       .from(usersTable);
@@ -287,6 +319,37 @@ export class UsersService {
       : baseUsersQuery;
 
     const users = await usersQuery.limit(limit).offset(offset);
+
+    const managerIds = Array.from(
+      new Set(
+        users
+          .map((user) => user.managerId)
+          .filter((id): id is number => id !== null && id !== undefined),
+      ),
+    );
+
+    const managers =
+      managerIds.length === 0
+        ? []
+        : await db
+            .select({
+              id: usersTable.id,
+              name: usersTable.name,
+              email: usersTable.email,
+            })
+            .from(usersTable)
+            .where(inArray(usersTable.id, managerIds));
+
+    const managersById = managers.reduce<
+      Record<number, { id: number; name: string; email: string }>
+    >((acc, curr) => {
+      acc[curr.id] = {
+        id: Number(curr.id),
+        name: curr.name,
+        email: curr.email,
+      };
+      return acc;
+    }, {});
 
     const totalResultQuery = db
       .select({ value: count(usersTable.id) })
@@ -351,6 +414,7 @@ export class UsersService {
       const role = assignedRoles[0] ?? null;
 
       return {
+        userId: Number(user.id),
         name: user.name,
         email: user.email,
         department:
@@ -358,6 +422,10 @@ export class UsersService {
             ? departmentsById[user.employeeDepartmentId] ?? null
             : null,
         role,
+        reportingManager:
+          user.managerId !== null && user.managerId !== undefined
+            ? managersById[user.managerId]?.email ?? null
+            : null,
       };
     });
 
