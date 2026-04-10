@@ -92,6 +92,107 @@ export class LeavesService {
     private readonly auditService: AuditService,
   ) {}
 
+  private async consumeCompOffCredits(
+    tx: DatabaseService['connection'],
+    userId: number,
+    hoursToConsume: number,
+  ) {
+    const credits = await tx
+      .select()
+      .from(compOffCreditsTable)
+      .where(
+        and(
+          eq(compOffCreditsTable.userId, userId),
+          inArray(compOffCreditsTable.status, ['granted', 'partial_availed']),
+        ),
+      )
+      .orderBy(compOffCreditsTable.workDate);
+
+    let remainingHoursToConsume = hoursToConsume;
+
+    for (const credit of credits) {
+      if (remainingHoursToConsume <= 0) {
+        break;
+      }
+
+      const availableHours = Number(credit.creditedHours) - Number(credit.availedHours);
+      const hoursToTake = Math.min(remainingHoursToConsume, availableHours);
+
+      if (hoursToTake > 0) {
+        const newAvailedHours = Number(credit.availedHours) + hoursToTake;
+        const newStatus =
+          newAvailedHours >= Number(credit.creditedHours)
+            ? 'availed'
+            : 'partial_availed';
+
+        await tx
+          .update(compOffCreditsTable)
+          .set({
+            availedHours: newAvailedHours.toString(),
+            status: newStatus,
+          })
+          .where(eq(compOffCreditsTable.id, credit.id));
+
+        remainingHoursToConsume -= hoursToTake;
+      }
+    }
+
+    if (remainingHoursToConsume > 0) {
+      throw new Error('Insufficient comp-off credits to consume');
+    }
+  }
+
+  private async revertCompOffCredit(
+    tx: DatabaseService['connection'],
+    compOffCreditId: number,
+    leaveTypeId: number,
+    userId: number,
+  ): Promise<boolean> {
+    const [grantedCredit] = await tx
+      .select({
+        id: compOffCreditsTable.id,
+        creditedHours: compOffCreditsTable.creditedHours,
+        userId: compOffCreditsTable.userId,
+      })
+      .from(compOffCreditsTable)
+      .where(
+        and(
+          eq(compOffCreditsTable.id, compOffCreditId),
+          eq(compOffCreditsTable.status, 'granted'),
+        ),
+      )
+      .limit(1);
+
+    if (!grantedCredit) {
+      return false;
+    }
+
+    const hoursToRevert = Number(grantedCredit.creditedHours ?? 0);
+    if (hoursToRevert <= 0) {
+      return false;
+    }
+
+    const balanceSnapshot = await this.fetchLeaveBalanceSnapshot(
+      tx,
+      userId,
+      leaveTypeId,
+    );
+
+    await this.updateLeaveBalanceFromSnapshot(tx, balanceSnapshot, {
+      balanceHours: -hoursToRevert,
+      allocatedHours: -hoursToRevert,
+    });
+
+    await tx
+    .update(compOffCreditsTable)
+    .set({
+      status: 'pending',
+      timesheetId: null,
+    })
+    .where(eq(compOffCreditsTable.id, grantedCredit.id));
+    return true;
+  }
+
   async listBalances(userId: number) {
     const db = this.database.connection;
 
@@ -657,59 +758,21 @@ export class LeavesService {
           halfDaySegment: requestedHalfDaySegment,
           hours: requestedHours.toString(),
           reason: payload.reason ?? null,
-          state: requiresApproval ? "pending" : "approved",
+          state: "pending",
           requestedAt: new Date(),
         })
         .returning();
 
-      if (requiresApproval) {
-        if (isPaidLeave) {
-          if (!balanceSnapshot) {
-            throw new BadRequestException(
-              "Leave balance not found for user and leave type"
-            );
-          }
-
-          balanceSnapshot = await this.updateLeaveBalanceFromSnapshot(
-            tx,
-            balanceSnapshot,
-            {
-              balanceHours: -requestedHours,
-              pendingHours: requestedHours,
-            }
-          );
-        }
-
-        const [user] = await tx
-          .select({
-            managerId: usersTable.managerId,
-          })
-          .from(usersTable)
-          .where(eq(usersTable.id, userId))
-          .limit(1);
-
-        if (user?.managerId) {
-          await tx
-            .insert(approvalsTable)
-            .values({
-              orgId,
-              subjectType: "leave_request",
-              subjectId: request.id,
-              approverId: user.managerId,
-              decision: "pending",
-            })
-            .onConflictDoNothing();
-        }
-      } else if (isPaidLeave) {
+      if (isPaidLeave) {
         if (!balanceSnapshot) {
           throw new BadRequestException(
-            "Leave balance not found for user and leave type"
+            "Leave balance not found for user and leave type",
           );
         }
-
+        // For all paid leaves, move from balance to pending
         await this.updateLeaveBalanceFromSnapshot(tx, balanceSnapshot, {
           balanceHours: -requestedHours,
-          bookedHours: requestedHours,
+          pendingHours: requestedHours,
         });
       }
 
@@ -803,7 +866,12 @@ export class LeavesService {
     }
 
     // Create leave request for the target user
-    return this.createLeaveRequest(payload.userId, targetUser.orgId, payload, actor);
+    return this.createLeaveRequest(
+      payload.userId,
+      targetUser.orgId,
+      payload,
+      actor,
+    );
   }
 
   async adminEditLeaveRequest(
@@ -2081,6 +2149,44 @@ export class LeavesService {
   }
 
   /**
+   * Expire pending comp-off requests that are older than a certain threshold
+   * and for which no timesheet has been filed.
+   */
+  private async expireStalePendingCompOffRequests(
+    tx: DatabaseService["connection"],
+    orgId: number,
+    userId: number,
+    now: Date
+  ) {
+    const staleThreshold = new Date(now);
+    staleThreshold.setDate(now.getDate() - 7); // 7 days threshold
+
+    const staleRequests = await tx
+      .select({ id: compOffCreditsTable.id })
+      .from(compOffCreditsTable)
+      .where(
+        and(
+          eq(compOffCreditsTable.orgId, orgId),
+          eq(compOffCreditsTable.userId, userId),
+          eq(compOffCreditsTable.status, "pending"),
+          lt(compOffCreditsTable.workDate, sql`CAST(${staleThreshold.toISOString()} AS date)`)
+        )
+      );
+
+    if (staleRequests.length > 0) {
+      const staleRequestIds = staleRequests.map((r) => r.id);
+      await tx
+        .update(compOffCreditsTable)
+        .set({
+          status: "expired",
+          notes: "Expired due to no timesheet being filed within the timeframe.",
+          updatedAt: now,
+        })
+        .where(inArray(compOffCreditsTable.id, staleRequestIds));
+    }
+  }
+
+  /**
    * Public method to trigger comp off processing for a specific date
    * Can be called by timesheet service when a timesheet is created/updated
    */
@@ -2095,6 +2201,38 @@ export class LeavesService {
     const workDateKey = this.formatDateKey(workDate);
 
     return db.transaction(async (tx) => {
+      await this.expireStalePendingCompOffRequests(tx, orgId, userId, new Date());
+
+      const eligibility = this.calculateCompOffEligibility(timesheetHours);
+      const eligibilityHours = Number(eligibility.creditedHours ?? 0);
+
+      // If timesheet hours are insufficient, revert any granted comp-off for this date.
+      if (eligibilityHours < HOURS_NEGATIVE_TOLERANCE) {
+        const grantedCredits = await tx
+          .select({ id: compOffCreditsTable.id })
+          .from(compOffCreditsTable)
+          .where(
+            and(
+              eq(compOffCreditsTable.orgId, orgId),
+              eq(compOffCreditsTable.userId, userId),
+              or(
+                eq(compOffCreditsTable.workDate, sql`CAST(${workDateKey} AS date)`),
+                eq(compOffCreditsTable.timesheetId, timesheetId),
+              ),
+              eq(compOffCreditsTable.status, "granted")
+            )
+          );
+
+        if (grantedCredits.length > 0) {
+          const leaveTypeId = await this.ensureCompOffLeaveType(tx, orgId);
+          for (const credit of grantedCredits) {
+            await this.revertCompOffCredit(tx, credit.id, leaveTypeId, userId);
+          }
+          return true; // Reverted successfully
+        }
+        return false; // Nothing to revert
+      }
+
       // Process pending comp-off request(s) for this user/date
       const pendingRequests = await tx
         .select({
@@ -2123,9 +2261,6 @@ export class LeavesService {
         );
         processed = processed || granted;
       }
-
-      const eligibility = this.calculateCompOffEligibility(timesheetHours);
-      const eligibilityHours = Number(eligibility.creditedHours ?? 0);
 
       // Reconcile already granted credits for this work date when timesheet hours increase.
       // This prevents stale comp-off values after admin edits to timesheet entries.
@@ -2241,6 +2376,7 @@ export class LeavesService {
           managerId: usersTable.managerId,
           leaveTypeId: leaveRequestsTable.leaveTypeId,
           leaveTypePaid: leaveTypesTable.paid,
+          leaveTypeCode: leaveTypesTable.code,
         })
         .from(leaveRequestsTable)
         .innerJoin(
@@ -2356,6 +2492,9 @@ export class LeavesService {
 
       if (isPaidLeave) {
         if (action === "approve") {
+          if (request.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
+            await this.consumeCompOffCredits(tx, request.userId, requestedHours);
+          }
           await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
             pendingHours: -requestedHours,
             bookedHours: requestedHours,
@@ -2501,6 +2640,7 @@ export class LeavesService {
           managerId: usersTable.managerId,
           leaveTypeId: leaveRequestsTable.leaveTypeId,
           leaveTypePaid: leaveTypesTable.paid,
+          leaveTypeCode: leaveTypesTable.code,
         })
         .from(leaveRequestsTable)
         .innerJoin(
@@ -2965,7 +3105,7 @@ export class LeavesService {
       return; // No valid working date found
     }
 
-    // Get ALL projects from that last valid working date (excluding filtered projects)
+    // Get ALL projects from that last valid working day (excluding filtered projects)
     const validProjects = projects.filter(project => {
       const workDate = new Date(project.workDate);
       
