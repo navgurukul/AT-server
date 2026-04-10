@@ -60,6 +60,8 @@ export const compOffStatusEnum = pgEnum("comp_off_status", [
   "granted",
   "expired",
   "revoked",
+  "availed",
+  "partial_availed",
 ]);
 
 export const decisionEnum = pgEnum("decision", [
@@ -426,6 +428,9 @@ export const compOffCredits = pgTable("comp_off_credits", {
   notes: text("notes"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+  availedHours: numeric("availed_hours", { precision: 5, scale: 2 })
+    .notNull()
+    .default("0"),
 });
 
 export const approvals = pgTable("approvals", {

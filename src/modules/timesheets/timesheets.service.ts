@@ -19,7 +19,7 @@ import {
 import { SalaryCycleUtil } from '../../common/utils/salary-cycle.util';
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { DatabaseService } from '../../database/database.service';
-import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, notificationsTable, payableDaysTable, projectsTable, timesheetEntriesTable, timesheetsTable, usersTable } from '../../db/schema';
+import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, notificationsTable, payableDaysTable, projectsTable, rolesTable, timesheetEntriesTable, timesheetsTable, userRolesTable, usersTable } from '../../db/schema';
 import { AuditService } from '../audit/audit.service';
 import { CalendarService } from '../calendar/calendar.service';
 import { LeavesService } from '../leaves/leaves.service';
@@ -228,12 +228,15 @@ export class TimesheetsService {
     const enforceCurrentSalaryCycle = options?.enforceCurrentSalaryCycle ?? true;
 
     const [userInfo] = await db
-      .select({ 
+      .select({
         name: usersTable.name,
         email: usersTable.email,
         slackId: usersTable.slackId,
+        role: rolesTable.key,
       })
       .from(usersTable)
+      .leftJoin(userRolesTable, eq(usersTable.id, userRolesTable.userId))
+      .leftJoin(rolesTable, eq(userRolesTable.roleId, rolesTable.id))
       .where(eq(usersTable.id, userId))
       .limit(1);
 
@@ -413,10 +416,10 @@ export class TimesheetsService {
 
     const isBackfill = workDate < today && !(isYesterday && isBefore7AMIST);
 
-    if (isBackfill) {
+    if (isBackfill && userInfo.role !== 'super_admin' && userInfo.role !== 'admin') {
       const workingDaysPast = await this.calendarService.getWorkingDaysBetween(workDate, today);
       const ALLOWED_PAST_WORKING_DAYS = 5;
-      if (workingDaysPast > ALLOWED_PAST_WORKING_DAYS) {
+      if (workingDaysPast >= ALLOWED_PAST_WORKING_DAYS) {
         throw new BadRequestException(
           `Entry is too old. You can only fill timesheets for up to ${ALLOWED_PAST_WORKING_DAYS} past working days.`
         );
@@ -3317,6 +3320,8 @@ export class TimesheetsService {
       );
     }
 
+    const oldWorkDate = existingEntry.workDate;
+
     const updatePayload: any = {
       updatedAt: now,
     };
@@ -3492,6 +3497,71 @@ export class TimesheetsService {
           updatedAt: now,
         })
         .where(eq(timesheetsTable.id, timesheetId));
+    }
+
+    const dateChanged =
+      updateData.date &&
+      normalizeDate(new Date(updateData.date as string)).getTime() !==
+        new Date(oldWorkDate).getTime();
+
+    if (dateChanged) {
+      const newWorkDate = normalizeDate(new Date(updateData.date as string));
+
+      // Re-evaluate comp-off for the old date
+      const [oldTimesheet] = await db
+        .select({ totalHours: timesheetsTable.totalHours })
+        .from(timesheetsTable)
+        .where(eq(timesheetsTable.id, existingEntry.timesheetId));
+
+      if (oldTimesheet) {
+        await this.leavesService.tryProcessCompOffForTimesheet(
+          orgId,
+          targetUserId,
+          new Date(oldWorkDate),
+          existingEntry.timesheetId,
+          Number(oldTimesheet.totalHours ?? 0),
+        );
+      }
+
+      // Trigger comp-off for the new date
+      const [newTimesheet] = await db
+        .select({ totalHours: timesheetsTable.totalHours })
+        .from(timesheetsTable)
+        .where(eq(timesheetsTable.id, targetTimesheetId));
+
+      if (newTimesheet) {
+        await this.leavesService.tryProcessCompOffForTimesheet(
+          orgId,
+          targetUserId,
+          newWorkDate,
+          targetTimesheetId,
+          Number(newTimesheet.totalHours ?? 0),
+        );
+      }
+    } else {
+      // If only hours changed (but not date), still trigger comp-off validation
+      const oldHours = Number(existingEntry.hoursDecimal ?? 0);
+      const newHours =
+        updateData.hours !== undefined
+          ? Number(updateData.hours)
+          : oldHours;
+
+      if (newHours !== oldHours) {
+        const [timesheet] = await db
+          .select({ totalHours: timesheetsTable.totalHours })
+          .from(timesheetsTable)
+          .where(eq(timesheetsTable.id, targetTimesheetId));
+
+        if (timesheet) {
+          await this.leavesService.tryProcessCompOffForTimesheet(
+            orgId,
+            targetUserId,
+            new Date(oldWorkDate),
+            targetTimesheetId,
+            Number(timesheet.totalHours ?? 0),
+          );
+        }
+      }
     }
 
     const cycleKeysToRecalculate = new Set<string>();
