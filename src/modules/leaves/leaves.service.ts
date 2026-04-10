@@ -102,7 +102,7 @@ export class LeavesService {
       .limit(1);
 
     if (userOrg?.orgId) {
-      await this.expireCompOffForUserIfNeeded(
+      await this.expireGrantedCompOffForUserIfNeeded(
         db,
         userId,
         Number(userOrg.orgId)
@@ -1491,13 +1491,6 @@ export class LeavesService {
         );
       }
 
-      await this.expireStalePendingCompOffRequests(
-        tx,
-        actor.orgId,
-        payload.userId,
-        now
-      );
-
       // Prevent duplicate pending request for the same user/date.
       // Multiple granted credits on the same date are allowed while eligibility remains.
       const [existingRequest] = await tx
@@ -1568,8 +1561,7 @@ export class LeavesService {
         }
       }
 
-      const expiresAt = new Date(workDate);
-      expiresAt.setUTCDate(expiresAt.getUTCDate() + COMP_OFF_EXPIRY_DAYS);
+      const expiresAt = this.calculateCompOffExpiryAt(workDate);
 
       // Create comp-off request in pending state. Balance will be updated only after timesheet is filled.
       const [workRequest] = await tx
@@ -1761,8 +1753,6 @@ export class LeavesService {
         "You do not have permission to view comp-off credits for this user"
       );
     }
-
-    await this.expireCompOffForUserIfNeeded(db, targetUser.id, actor.orgId);
 
     const filters = [
       eq(compOffCreditsTable.orgId, actor.orgId),
@@ -2011,10 +2001,6 @@ export class LeavesService {
     const workDateKey = this.formatDateKey(this.normalizeDateUTC(new Date(request.workDate)));
 
     if (new Date(request.expiresAt) < new Date()) {
-      await tx
-        .update(compOffCreditsTable)
-        .set({ status: "expired", updatedAt: new Date() })
-        .where(eq(compOffCreditsTable.id, request.id));
       return false;
     }
 
@@ -2067,9 +2053,6 @@ export class LeavesService {
     const leaveTypeId = await this.ensureCompOffLeaveType(tx, request.orgId);
     await this.ensureLeaveBalanceRow(tx, request.userId, leaveTypeId);
 
-    const now = new Date();
-    await this.expireStaleCompOffCredits(tx, request.orgId, request.userId, leaveTypeId, now);
-
     let snapshot = await this.fetchLeaveBalanceSnapshot(tx, request.userId, leaveTypeId);
 
     snapshot = await this.updateLeaveBalanceFromSnapshot(tx, snapshot, {
@@ -2077,8 +2060,10 @@ export class LeavesService {
       allocatedHours: finalCreditedHours,
     });
 
-    const grantExpiresAt = new Date(request.workDate as unknown as string | Date);
-    grantExpiresAt.setUTCDate(grantExpiresAt.getUTCDate() + COMP_OFF_EXPIRY_DAYS);
+    const now = new Date();
+    const grantExpiresAt = this.calculateCompOffExpiryAt(
+      request.workDate as unknown as string | Date
+    );
 
     await tx
       .update(compOffCreditsTable)
@@ -2110,8 +2095,6 @@ export class LeavesService {
     const workDateKey = this.formatDateKey(workDate);
 
     return db.transaction(async (tx) => {
-      await this.expireStalePendingCompOffRequests(tx, orgId, userId, new Date());
-
       // Process pending comp-off request(s) for this user/date
       const pendingRequests = await tx
         .select({
@@ -2179,7 +2162,6 @@ export class LeavesService {
           await this.ensureLeaveBalanceRow(tx, userId, leaveTypeId);
 
           const now = new Date();
-          await this.expireStaleCompOffCredits(tx, orgId, userId, leaveTypeId, now);
 
           let snapshot = await this.fetchLeaveBalanceSnapshot(tx, userId, leaveTypeId);
 
@@ -3206,13 +3188,11 @@ export class LeavesService {
     }
   }
 
-  private async expireCompOffForUserIfNeeded(
+  private async expireGrantedCompOffForUserIfNeeded(
     tx: DatabaseService["connection"],
     userId: number,
     orgId: number
   ) {
-    await this.expireStalePendingCompOffRequests(tx, orgId, userId, new Date());
-
     const leaveTypeId = await this.findCompOffLeaveTypeId(tx, orgId);
     if (!leaveTypeId) {
       return;
@@ -3234,28 +3214,6 @@ export class LeavesService {
     }
 
     await this.expireStaleCompOffCredits(tx, orgId, userId, leaveTypeId, new Date());
-  }
-
-  private async expireStalePendingCompOffRequests(
-    tx: DatabaseService["connection"],
-    orgId: number,
-    userId: number,
-    referenceDate: Date
-  ) {
-    await tx
-      .update(compOffCreditsTable)
-      .set({
-        status: "expired",
-        updatedAt: referenceDate,
-      })
-      .where(
-        and(
-          eq(compOffCreditsTable.orgId, orgId),
-          eq(compOffCreditsTable.userId, userId),
-          eq(compOffCreditsTable.status, "pending"),
-          lt(compOffCreditsTable.expiresAt, referenceDate)
-        )
-      );
   }
 
   private async expireStaleCompOffCredits(
@@ -3316,6 +3274,14 @@ export class LeavesService {
     return new Date(
       Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
     );
+  }
+
+  private calculateCompOffExpiryAt(workDate: Date | string): Date {
+    const expiry = new Date(workDate);
+    expiry.setUTCDate(expiry.getUTCDate() + COMP_OFF_EXPIRY_DAYS);
+    // Expire at the end of the expiry date, not at the start.
+    expiry.setUTCHours(23, 59, 59, 999);
+    return expiry;
   }
 
   private formatDateKey(date: Date): string {
