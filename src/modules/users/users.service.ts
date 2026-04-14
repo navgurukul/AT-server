@@ -2,13 +2,14 @@ import { BadRequestException, ForbiddenException, Injectable, NotFoundException 
 import { Cron } from '@nestjs/schedule';
 import { JWT } from 'google-auth-library';
 import { createHash } from 'crypto';
-import { and, count, eq, ilike, inArray, isNotNull, isNull, or } from 'drizzle-orm';
+import { and, asc, count, desc, eq, ilike, inArray, isNotNull, isNull, or } from 'drizzle-orm';
 
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { DatabaseService } from '../../database/database.service';
 import { AuditService } from '../audit/audit.service';
 import { TimesheetsService } from '../timesheets/timesheets.service';
 import {
+  auditLogsTable,
   employeeDepartmentsTable,
   permissionsTable,
   rolePermissionsTable,
@@ -158,8 +159,8 @@ export class UsersService {
       .from(usersTable);
 
     const usersQuery = whereClause
-      ? baseUsersQuery.where(whereClause)
-      : baseUsersQuery;
+      ? baseUsersQuery.where(whereClause).orderBy(asc(usersTable.email))
+      : baseUsersQuery.orderBy(asc(usersTable.email));
 
     const users = await usersQuery.limit(limit).offset(offset);
 
@@ -315,8 +316,8 @@ export class UsersService {
       .from(usersTable);
 
     const usersQuery = whereClause
-      ? baseUsersQuery.where(whereClause)
-      : baseUsersQuery;
+      ? baseUsersQuery.where(whereClause).orderBy(asc(usersTable.email))
+      : baseUsersQuery.orderBy(asc(usersTable.email));
 
     const users = await usersQuery.limit(limit).offset(offset);
 
@@ -409,9 +410,68 @@ export class UsersService {
       {},
     );
 
+    const auditLogs = await db
+      .select({
+        targetUserId: auditLogsTable.targetUserId,
+        actorUserId: auditLogsTable.actorUserId,
+        createdAt: auditLogsTable.createdAt,
+      })
+      .from(auditLogsTable)
+      .where(
+        and(
+          eq(auditLogsTable.subjectType, 'user_role'),
+          inArray(auditLogsTable.targetUserId, userIds.filter((id): id is number => id !== null))
+        )
+      )
+      .orderBy(desc(auditLogsTable.createdAt), desc(auditLogsTable.id));
+
+    const mostRecentAuditByUser = auditLogs.reduce<
+      Record<number, { actorUserId: number | null; createdAt: Date }>
+    >((acc, log) => {
+      if (log.targetUserId && !acc[log.targetUserId]) {
+        acc[log.targetUserId] = {
+          actorUserId: log.actorUserId,
+          createdAt: log.createdAt,
+        };
+      }
+      return acc;
+    }, {});
+
+    const actorUserIds = Array.from(
+      new Set(
+        Object.values(mostRecentAuditByUser)
+          .map((log) => log.actorUserId)
+          .filter((id): id is number => id !== null && id !== undefined),
+      ),
+    );
+
+    const actorUsers =
+      actorUserIds.length === 0
+        ? []
+        : await db
+            .select({
+              id: usersTable.id,
+              email: usersTable.email,
+            })
+            .from(usersTable)
+            .where(inArray(usersTable.id, actorUserIds));
+
+    const actorEmailsById = actorUsers.reduce<Record<number, string>>(
+      (acc, curr) => {
+        acc[curr.id] = curr.email;
+        return acc;
+      },
+      {},
+    );
+
     const data = users.map((user) => {
       const assignedRoles = rolesByUser[user.id] ?? [];
       const role = assignedRoles[0] ?? null;
+      const auditLog = user.id ? mostRecentAuditByUser[user.id] : undefined;
+      const assignedByEmail =
+        auditLog && auditLog.actorUserId
+          ? actorEmailsById[auditLog.actorUserId] ?? null
+          : null;
 
       return {
         userId: Number(user.id),
@@ -426,6 +486,8 @@ export class UsersService {
           user.managerId !== null && user.managerId !== undefined
             ? managersById[user.managerId]?.email ?? null
             : null,
+        assignedBy: assignedByEmail,
+        lastUpdated: auditLog ? auditLog.createdAt : null,
       };
     });
 
@@ -1312,9 +1374,12 @@ async syncManagerRolesCron() {
     const isSuperAdmin = actor.roles.includes('super_admin');
     const isAdmin = actor.roles.includes('admin');
 
-    // Self-role protection: no user can modify their own role
     if (actor.id === userId) {
       throw new ForbiddenException('You cannot modify your own role');
+    }
+
+    if (!isSuperAdmin && !isAdmin) {
+      throw new ForbiddenException('Employees cannot assign or revoke roles');
     }
 
     const db = this.database.connection;
@@ -1340,18 +1405,40 @@ async syncManagerRolesCron() {
 
     const currentRole = currentRoleRow?.roleKey ?? null;
 
-    // Admin-specific restrictions (admins cannot act on or assign privileged roles)
+    if (!currentRole) {
+      throw new BadRequestException('Target user does not have an assigned role');
+    }
+
+    // Admins can only manage the employee role.
     if (isAdmin && !isSuperAdmin) {
-      // Admin cannot modify a super_admin or another admin
-      if (currentRole === 'super_admin' || currentRole === 'admin') {
+      if (currentRole !== 'employee' || role !== 'employee') {
         throw new ForbiddenException(
-          'Admins can only modify users with the Employee role',
+          'Admins can only assign or revoke the Employee role',
         );
       }
-      // Admin can only assign the employee role
-      if (role !== 'employee') {
-        throw new ForbiddenException(
-          'Admins can only assign the Employee role',
+    }
+
+    // A super admin cannot remove their own super admin role if they are the last one in the org.
+    if (
+      isSuperAdmin &&
+      actor.id === userId &&
+      currentRole === 'super_admin' &&
+      role !== 'super_admin'
+    ) {
+      const [superAdminCountRow] = await db
+        .select({ value: count(usersTable.id) })
+        .from(usersTable)
+        .where(
+          and(
+            eq(usersTable.orgId, Number(user.orgId)),
+            eq(usersTable.rolePrimary, 'super_admin'),
+          ),
+        );
+
+      const superAdminCount = Number(superAdminCountRow?.value ?? 0);
+      if (superAdminCount <= 1) {
+        throw new BadRequestException(
+          'At least one Super Admin must exist. You cannot remove this role.',
         );
       }
     }
