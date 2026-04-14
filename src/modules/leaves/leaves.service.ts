@@ -3367,6 +3367,7 @@ export class LeavesService {
       .select({
         id: compOffCreditsTable.id,
         creditedHours: compOffCreditsTable.creditedHours,
+        availedHours: compOffCreditsTable.availedHours,
         status: compOffCreditsTable.status,
       })
       .from(compOffCreditsTable)
@@ -3374,7 +3375,7 @@ export class LeavesService {
         and(
           eq(compOffCreditsTable.orgId, orgId),
           eq(compOffCreditsTable.userId, userId),
-          eq(compOffCreditsTable.status, "granted"),
+          inArray(compOffCreditsTable.status, ["granted", "partial_availed"]),
           lt(compOffCreditsTable.expiresAt, referenceDate)
         )
       );
@@ -3390,9 +3391,12 @@ export class LeavesService {
     );
 
     for (const credit of credits) {
-      const creditHours = Number(credit.creditedHours ?? 0);
-      if (creditHours > 0 && snapshot.balanceHours > 0) {
-        const deduction = Math.min(snapshot.balanceHours, creditHours);
+      const creditedHours = Number(credit.creditedHours ?? 0);
+      const availedHours = Number(credit.availedHours ?? 0);
+      const remainingHours = Math.max(0, creditedHours - availedHours);
+
+      if (remainingHours > 0 && snapshot.balanceHours > 0) {
+        const deduction = Math.min(snapshot.balanceHours, remainingHours);
         if (deduction > 0) {
           snapshot = await this.updateLeaveBalanceFromSnapshot(tx, snapshot, {
             balanceHours: -deduction,
