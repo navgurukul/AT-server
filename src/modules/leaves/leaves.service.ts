@@ -1544,10 +1544,16 @@ export class LeavesService {
           ? Number(targetUser.managerId)
           : null;
 
-      // Admin/SuperAdmin can raise for all employees; managers only for direct reports
-      if (!this.canGrantCompOffForUser(actor, targetUser)) {
+      const isAuthorized = await this.isManagerInHierarchy(
+        tx,
+        targetUser.id,
+        actor.id,
+      );
+
+      // Admin/SuperAdmin can raise for all employees; managers only for their reports
+      if (!this.hasOrgWideCompOffAccess(actor) && !isAuthorized) {
         throw new ForbiddenException(
-          "Only administrators or the direct manager can authorize off-day work for an employee"
+          "Only administrators or a manager in the reporting chain can authorize off-day work for an employee",
         );
       }
 
@@ -2426,13 +2432,11 @@ export class LeavesService {
 
       // Admin and super_admin can approve any request (except their own)
       if (!isAdmin && !isSuperAdmin) {
-        console.log(`Checking hierarchy for approver: ${approverId} and requestor: ${request.userId}`);
         const isAuthorized = await this.isManagerInHierarchy(
           tx,
           request.userId,
           approverId,
         );
-        console.log(`Is authorized: ${isAuthorized}`);
 
         if (!isAuthorized) {
           throw new ForbiddenException(
@@ -3948,35 +3952,38 @@ export class LeavesService {
     requestorUserId: number,
     actionTakerUserId: number,
   ): Promise<boolean> {
-    console.log(
-      `Checking hierarchy for approver: ${actionTakerUserId} and requestor: ${requestorUserId}`,
-    );
-
     const result = await tx.execute(sql`
-      WITH RECURSIVE "ManagerHierarchy" AS (
-        -- Base case: Start with the requestor's direct manager
-        SELECT "manager_id"
+      WITH RECURSIVE "ManagerChain" AS (
+        -- 1. Base Case: Start with the employee (requestor)
+        SELECT
+            "id",
+            "manager_id",
+            1 AS level
         FROM "users"
-        WHERE "id" = ${requestorUserId} AND "manager_id" IS NOT NULL
+        WHERE "id" = ${requestorUserId}
 
         UNION ALL
 
-        -- Recursive step: Find the manager of the current manager
-        SELECT "u"."manager_id"
+        -- 2. Recursive Step: Move up the hierarchy
+        SELECT
+            "u"."id",
+            "u"."manager_id",
+            "mc"."level" + 1
         FROM "users" "u"
-        INNER JOIN "ManagerHierarchy" "mh" ON "u"."id" = "mh"."manager_id"
-        WHERE "u"."manager_id" IS NOT NULL
+        INNER JOIN "ManagerChain" "mc"
+            ON "u"."id" = "mc"."manager_id"
       )
+      -- 3. Final Check: Is action-taker in this chain's list of managers?
+      -- We check the 'id' column because the chain includes the requestor themself.
       SELECT EXISTS (
-        SELECT 1
-        FROM "ManagerHierarchy"
-        WHERE "manager_id" = ${actionTakerUserId}
+          SELECT 1
+          FROM "ManagerChain"
+          WHERE "id" = ${actionTakerUserId}
       ) AS "is_authorized";
     `);
 
     const isAuthorized = (result.rows[0] as { is_authorized: boolean })
       .is_authorized;
-    console.log(`Is authorized: ${isAuthorized}`);
     return isAuthorized;
   }
 }
