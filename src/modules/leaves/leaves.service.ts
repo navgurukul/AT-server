@@ -2425,20 +2425,20 @@ export class LeavesService {
         : null;
 
       // Admin and super_admin can approve any request (except their own)
-      if (isAdmin || isSuperAdmin) {
-        // Allowed to proceed
-      } else if (isManager) {
-        // Manager can only approve requests from their direct reports
-        if (request.managerId !== approverId) {
+      if (!isAdmin && !isSuperAdmin) {
+        console.log(`Checking hierarchy for approver: ${approverId} and requestor: ${request.userId}`);
+        const isAuthorized = await this.isManagerInHierarchy(
+          tx,
+          request.userId,
+          approverId,
+        );
+        console.log(`Is authorized: ${isAuthorized}`);
+
+        if (!isAuthorized) {
           throw new ForbiddenException(
-            "You can only approve leave requests from your direct reports"
+            "You are not in the reporting chain for this employee",
           );
         }
-      } else {
-        // Regular employees cannot approve leave requests
-        throw new ForbiddenException(
-          "You do not have permission to review leave requests"
-        );
       }
 
 
@@ -3941,5 +3941,42 @@ export class LeavesService {
     const d1 = this.normalizeDateUTC(date1);
     const d2 = this.normalizeDateUTC(date2);
     return d1.getTime() === d2.getTime();
+  }
+
+  private async isManagerInHierarchy(
+    tx: DatabaseService["connection"],
+    requestorUserId: number,
+    actionTakerUserId: number,
+  ): Promise<boolean> {
+    console.log(
+      `Checking hierarchy for approver: ${actionTakerUserId} and requestor: ${requestorUserId}`,
+    );
+
+    const result = await tx.execute(sql`
+      WITH RECURSIVE "ManagerHierarchy" AS (
+        -- Base case: Start with the requestor's direct manager
+        SELECT "manager_id"
+        FROM "users"
+        WHERE "id" = ${requestorUserId} AND "manager_id" IS NOT NULL
+
+        UNION ALL
+
+        -- Recursive step: Find the manager of the current manager
+        SELECT "u"."manager_id"
+        FROM "users" "u"
+        INNER JOIN "ManagerHierarchy" "mh" ON "u"."id" = "mh"."manager_id"
+        WHERE "u"."manager_id" IS NOT NULL
+      )
+      SELECT EXISTS (
+        SELECT 1
+        FROM "ManagerHierarchy"
+        WHERE "manager_id" = ${actionTakerUserId}
+      ) AS "is_authorized";
+    `);
+
+    const isAuthorized = (result.rows[0] as { is_authorized: boolean })
+      .is_authorized;
+    console.log(`Is authorized: ${isAuthorized}`);
+    return isAuthorized;
   }
 }
