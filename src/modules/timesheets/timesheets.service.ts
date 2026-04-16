@@ -33,6 +33,25 @@ interface ListTimesheetParams {
   state?: string;
 }
 
+export interface PayableDaysSummaryRow {
+  userId: number;
+  email: string;
+  employmentType: string | null;
+  joiningDate: string | Date | null;
+  exitDate: string | Date | null;
+  status: string | null;
+  expectedAttendance: number | null;
+  cycle: string;
+  totalHours: number;
+  totalWorkingDays: number;
+  earnLeave: number;
+  specialLeave: number;
+  compOffLeaves: number;
+  weekOff: number;
+  totalPayableDays: number;
+  lwp: number;
+}
+
 const DEFAULT_BACKFILL_PER_MONTH = 3;
 const BACKFILL_CUTOFF_DAY = 25;
 const MAX_HOURS_PER_DAY = 12;
@@ -2348,35 +2367,52 @@ export class TimesheetsService {
     };
   }
 
-  async getAllUsersPayableDaysCSVByCycle(params: {
+  private resolvePayableDaysCycleRange(cycle?: string) {
+    const requestedCycle = cycle?.trim();
+
+    let cycleStart: Date;
+    let cycleEnd: Date;
+    let cycleKey: string;
+
+    if (!requestedCycle) {
+      const currentCycle = this.getCycleRangeForWorkDate(new Date());
+      cycleStart = currentCycle.cycleStart;
+      cycleEnd = currentCycle.cycleEnd;
+      cycleKey = currentCycle.cycleKey;
+    } else {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedCycle)) {
+        throw new BadRequestException('cycle must be in YYYY-MM-DD format');
+      }
+
+      const parsedCycle = new Date(`${requestedCycle}T00:00:00.000Z`);
+      if (Number.isNaN(parsedCycle.getTime())) {
+        throw new BadRequestException('cycle must be a valid date in YYYY-MM-DD format');
+      }
+
+      const cycleDate = this.normalizeDateUTC(parsedCycle);
+      const cycleDay = cycleDate.getUTCDate();
+
+      cycleEnd = new Date(cycleDate);
+      if (cycleDay >= 26) {
+        cycleEnd.setUTCMonth(cycleEnd.getUTCMonth() + 1, 25);
+      } else {
+        cycleEnd.setUTCDate(25);
+      }
+
+      cycleStart = new Date(cycleEnd);
+      cycleStart.setUTCMonth(cycleStart.getUTCMonth() - 1, 26);
+      cycleKey = this.formatDateKey(cycleEnd);
+    }
+
+    return { cycleStart, cycleEnd, cycleKey };
+  }
+
+  async getAllUsersPayableDaysByCycle(params: {
     orgId: number;
-    cycle: string;
+    cycle?: string;
   }) {
     const { orgId, cycle } = params;
-
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(cycle)) {
-      throw new BadRequestException('cycle must be in YYYY-MM-DD format');
-    }
-
-    const parsedCycle = new Date(`${cycle}T00:00:00.000Z`);
-    if (Number.isNaN(parsedCycle.getTime())) {
-      throw new BadRequestException('cycle must be a valid date in YYYY-MM-DD format');
-    }
-
-    const cycleDate = this.normalizeDateUTC(parsedCycle);
-    const cycleDay = cycleDate.getUTCDate();
-
-    const cycleEnd = new Date(cycleDate);
-    if (cycleDay >= 26) {
-      // If date is on/after 26th, cycle ends on 25th of next month.
-      cycleEnd.setUTCMonth(cycleEnd.getUTCMonth() + 1, 25);
-    } else {
-      // If date is before 26th, cycle ends on 25th of current month.
-      cycleEnd.setUTCDate(25);
-    }
-
-    const cycleStart = new Date(cycleEnd);
-    cycleStart.setUTCMonth(cycleStart.getUTCMonth() - 1, 26);
+    const { cycleStart, cycleEnd, cycleKey } = this.resolvePayableDaysCycleRange(cycle);
 
     const db = this.database.connection;
 
@@ -2416,7 +2452,184 @@ export class TimesheetsService {
             .from(payableDaysTable)
             .where(
               and(
-                eq(payableDaysTable.cycle, cycle),
+                eq(payableDaysTable.cycle, cycleKey),
+                inArray(payableDaysTable.userId, userIds),
+              ),
+            );
+
+    const cycleEndExclusive = new Date(cycleEnd);
+    cycleEndExclusive.setUTCDate(cycleEndExclusive.getUTCDate() + 1);
+
+    const cycleTimesheets =
+      userIds.length === 0
+        ? []
+        : await db
+            .select({
+              userId: timesheetsTable.userId,
+              totalHours: timesheetsTable.totalHours,
+            })
+            .from(timesheetsTable)
+            .where(
+              and(
+                eq(timesheetsTable.orgId, orgId),
+                inArray(timesheetsTable.userId, userIds),
+                gte(timesheetsTable.workDate, cycleStart),
+                lt(timesheetsTable.workDate, cycleEndExclusive),
+              ),
+            );
+
+    const totalTimesheetHoursByUserId = new Map<number, number>();
+    for (const row of cycleTimesheets) {
+      const userId = Number(row.userId);
+      const hours = Number(row.totalHours ?? 0);
+      if (!Number.isFinite(hours)) {
+        continue;
+      }
+
+      totalTimesheetHoursByUserId.set(
+        userId,
+        Number(((totalTimesheetHoursByUserId.get(userId) ?? 0) + hours).toFixed(2)),
+      );
+    }
+
+    const payableDaysByUserId = new Map(
+      payableDaysRows.map((row) => [Number(row.userId), row]),
+    );
+
+    const parseNumericValue = (value: unknown): number => {
+      const parsed = Number(value ?? 0);
+      if (!Number.isFinite(parsed)) {
+        return 0;
+      }
+      return parsed;
+    };
+
+    const workingDayInfo = await this.getWorkingDayInfo(orgId, cycleStart, cycleEnd);
+    const leaveBreakdownByUserId = await this.getApprovedLeaveBreakdownByUserForCycle({
+      userIds,
+      monthStart: cycleStart,
+      monthEnd: cycleEnd,
+      workingDayInfo,
+    });
+
+    const payableRows: PayableDaysSummaryRow[] = users.map((user) => {
+      const leaveBreakdown = leaveBreakdownByUserId.get(user.id) ?? {
+        earnLeave: 0,
+        specialLeave: 0,
+        compOffLeaves: 0,
+        lwp: 0,
+      };
+      const payableRow = payableDaysByUserId.get(user.id);
+
+      return {
+        userId: user.id,
+        email: user.email,
+        employmentType: user.employmentType,
+        joiningDate: user.joiningDate,
+        exitDate: user.exitDate,
+        status: user.status,
+        expectedAttendance: parseNumericValue(payableRow?.expectedAttendance),
+        cycle: cycleKey,
+        totalHours: Number((totalTimesheetHoursByUserId.get(user.id) ?? 0).toFixed(1)),
+        totalWorkingDays: Number(parseNumericValue(payableRow?.totalWorkingDays).toFixed(1)),
+        earnLeave: Number(leaveBreakdown.earnLeave.toFixed(1)),
+        specialLeave: Number(leaveBreakdown.specialLeave.toFixed(1)),
+        compOffLeaves: Number(leaveBreakdown.compOffLeaves.toFixed(1)),
+        weekOff: Number(parseNumericValue(payableRow?.weekOff).toFixed(1)),
+        totalPayableDays: Number(parseNumericValue(payableRow?.totalPayableDays).toFixed(1)),
+        lwp: Number(leaveBreakdown.lwp.toFixed(1)),
+      };
+    });
+
+    return {
+      rows: payableRows,
+      cycle: cycleKey,
+      count: payableRows.length,
+    };
+  }
+
+  async getAllUsersPayableDaysCSVByCycle(params: {
+    orgId: number;
+    cycle?: string;
+  }) {
+    const { orgId, cycle } = params;
+    const requestedCycle = cycle?.trim();
+
+    let cycleStart: Date;
+    let cycleEnd: Date;
+    let cycleKey: string;
+
+    if (!requestedCycle) {
+      const currentCycle = this.getCycleRangeForWorkDate(new Date());
+      cycleStart = currentCycle.cycleStart;
+      cycleEnd = currentCycle.cycleEnd;
+      cycleKey = currentCycle.cycleKey;
+    } else {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedCycle)) {
+        throw new BadRequestException('cycle must be in YYYY-MM-DD format');
+      }
+
+      const parsedCycle = new Date(`${requestedCycle}T00:00:00.000Z`);
+      if (Number.isNaN(parsedCycle.getTime())) {
+        throw new BadRequestException('cycle must be a valid date in YYYY-MM-DD format');
+      }
+
+      const cycleDate = this.normalizeDateUTC(parsedCycle);
+      const cycleDay = cycleDate.getUTCDate();
+
+      cycleEnd = new Date(cycleDate);
+      if (cycleDay >= 26) {
+        // If date is on/after 26th, cycle ends on 25th of next month.
+        cycleEnd.setUTCMonth(cycleEnd.getUTCMonth() + 1, 25);
+      } else {
+        // If date is before 26th, cycle ends on 25th of current month.
+        cycleEnd.setUTCDate(25);
+      }
+
+      cycleStart = new Date(cycleEnd);
+      cycleStart.setUTCMonth(cycleStart.getUTCMonth() - 1, 26);
+      cycleKey = this.formatDateKey(cycleEnd);
+    }
+
+    const db = this.database.connection;
+
+    const users = await db
+      .select({
+        id: usersTable.id,
+        email: usersTable.email,
+        employmentType: usersTable.employmentType,
+        joiningDate: usersTable.dateOfJoining,
+        exitDate: usersTable.dateOfExit,
+        status: usersTable.employmentStatus,
+      })
+      .from(usersTable)
+      .where(
+        and(
+          eq(usersTable.orgId, orgId),
+          or(
+            isNull(usersTable.employmentStatus),
+            not(eq(usersTable.employmentStatus, 'inactive')),
+          ),
+        ),
+      )
+      .orderBy(asc(usersTable.id));
+
+    const userIds = users.map((user) => user.id);
+    const payableDaysRows =
+      userIds.length === 0
+        ? []
+        : await db
+            .select({
+              userId: payableDaysTable.userId,
+              expectedAttendance: payableDaysTable.expectedAttendance,
+              totalWorkingDays: payableDaysTable.totalWorkingDays,
+              weekOff: payableDaysTable.weekOff,
+              totalPayableDays: payableDaysTable.totalPayableDays,
+            })
+            .from(payableDaysTable)
+            .where(
+              and(
+                eq(payableDaysTable.cycle, cycleKey),
                 inArray(payableDaysTable.userId, userIds),
               ),
             );
@@ -2493,7 +2706,7 @@ export class TimesheetsService {
           exitDate: user.exitDate,
           status: user.status,
           expectedAttendance: parseNumericValue(payableRow?.expectedAttendance),
-          cycle,
+          cycle: cycleKey,
           totalHours: Number(
             (totalTimesheetHoursByUserId.get(user.id) ?? 0).toFixed(1),
           ),
@@ -2515,7 +2728,7 @@ export class TimesheetsService {
 
     return {
       csv,
-      cycle,
+      cycle: cycleKey,
       count: payableRows.length,
     };
   }

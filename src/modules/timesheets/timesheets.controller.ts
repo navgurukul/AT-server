@@ -23,7 +23,7 @@ import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 import { CreateTimesheetAdminDto } from './dto/create-timesheet-admin.dto';
 import { UpdateBackfillLimitDto } from './dto/update-backfill-limit.dto';
 import { UpdateTimesheetEntryDto } from './dto/update-timesheet-entry.dto';
-import { TimesheetsService } from './timesheets.service';
+import { PayableDaysSummaryRow, TimesheetsService } from './timesheets.service';
 
 @ApiTags('timesheets')
 @Controller('timesheets')
@@ -90,39 +90,37 @@ export class TimesheetsController {
   }
 
   @Get('salary-summary')
-  @ApiQuery({ name: 'startDate', required: false, description: 'Start date in ISO format (YYYY-MM-DD). If not provided, uses current salary cycle start (26th)' })
-  @ApiQuery({ name: 'endDate', required: false, description: 'End date in ISO format (YYYY-MM-DD). If not provided, uses current salary cycle end (25th)' })
+  @ApiQuery({
+    name: 'cycle',
+    required: false,
+    description:
+      'Salary cycle end date in YYYY-MM-DD format. If not provided, the current salary cycle will be used.',
+  })
   @Permissions('timesheet:view')
   async getSalarySummary(
-    @Query('startDate') startDate: string | undefined,
-    @Query('endDate') endDate: string | undefined,
+    @Query('cycle') cycle: string | undefined,
     @CurrentUser() user: AuthenticatedUser | undefined,
-    @Res({ passthrough: true }) res: Response,
-  ) {
+  ): Promise<{ rows: PayableDaysSummaryRow[]; cycle: string; count: number } | null> {
     if (!user) {
       return null;
     }
 
-    const result = await this.timesheetsService.getAllUsersSalarySummaryCSV({
+    return this.timesheetsService.getAllUsersPayableDaysByCycle({
       orgId: user.orgId,
-      startDate,
-      endDate,
+      cycle,
     });
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="salary-summary-${result.startDate}-to-${result.endDate}.csv"`);
-    return result.csv;
   }
 
   @Get('payable-days/csv')
   @ApiQuery({
     name: 'cycle',
-    required: true,
-    description: 'Salary cycle end date in YYYY-MM-DD format',
+    required: false,
+    description:
+      'Salary cycle end date in YYYY-MM-DD format. If not provided, the current salary cycle will be used.',
   })
   @Permissions('timesheet:view')
   async getPayableDaysCSV(
-    @Query('cycle') cycle: string,
+    @Query('cycle') cycle: string | undefined,
     @CurrentUser() user: AuthenticatedUser | undefined,
     @Res({ passthrough: true }) res: Response,
   ) {
