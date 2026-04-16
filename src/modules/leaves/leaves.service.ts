@@ -1544,10 +1544,16 @@ export class LeavesService {
           ? Number(targetUser.managerId)
           : null;
 
-      // Admin/SuperAdmin can raise for all employees; managers only for direct reports
-      if (!this.canGrantCompOffForUser(actor, targetUser)) {
+      const isAuthorized = await this.isManagerInHierarchy(
+        tx,
+        targetUser.id,
+        actor.id,
+      );
+
+      // Admin/SuperAdmin can raise for all employees; managers only for their reports
+      if (!this.hasOrgWideCompOffAccess(actor) && !isAuthorized) {
         throw new ForbiddenException(
-          "Only administrators or the direct manager can authorize off-day work for an employee"
+          "Only administrators or a manager in the reporting chain can authorize off-day work for an employee",
         );
       }
 
@@ -2425,20 +2431,18 @@ export class LeavesService {
         : null;
 
       // Admin and super_admin can approve any request (except their own)
-      if (isAdmin || isSuperAdmin) {
-        // Allowed to proceed
-      } else if (isManager) {
-        // Manager can only approve requests from their direct reports
-        if (request.managerId !== approverId) {
+      if (!isAdmin && !isSuperAdmin) {
+        const isAuthorized = await this.isManagerInHierarchy(
+          tx,
+          request.userId,
+          approverId,
+        );
+
+        if (!isAuthorized) {
           throw new ForbiddenException(
-            "You can only approve leave requests from your direct reports"
+            "You are not in the reporting chain for this employee",
           );
         }
-      } else {
-        // Regular employees cannot approve leave requests
-        throw new ForbiddenException(
-          "You do not have permission to review leave requests"
-        );
       }
 
 
@@ -3941,5 +3945,45 @@ export class LeavesService {
     const d1 = this.normalizeDateUTC(date1);
     const d2 = this.normalizeDateUTC(date2);
     return d1.getTime() === d2.getTime();
+  }
+
+  private async isManagerInHierarchy(
+    tx: DatabaseService["connection"],
+    requestorUserId: number,
+    actionTakerUserId: number,
+  ): Promise<boolean> {
+    const result = await tx.execute(sql`
+      WITH RECURSIVE "ManagerChain" AS (
+        -- 1. Base Case: Start with the employee (requestor)
+        SELECT
+            "id",
+            "manager_id",
+            1 AS level
+        FROM "users"
+        WHERE "id" = ${requestorUserId}
+
+        UNION ALL
+
+        -- 2. Recursive Step: Move up the hierarchy
+        SELECT
+            "u"."id",
+            "u"."manager_id",
+            "mc"."level" + 1
+        FROM "users" "u"
+        INNER JOIN "ManagerChain" "mc"
+            ON "u"."id" = "mc"."manager_id"
+      )
+      -- 3. Final Check: Is action-taker in this chain's list of managers?
+      -- We check the 'id' column because the chain includes the requestor themself.
+      SELECT EXISTS (
+          SELECT 1
+          FROM "ManagerChain"
+          WHERE "id" = ${actionTakerUserId}
+      ) AS "is_authorized";
+    `);
+
+    const isAuthorized = (result.rows[0] as { is_authorized: boolean })
+      .is_authorized;
+    return isAuthorized;
   }
 }
