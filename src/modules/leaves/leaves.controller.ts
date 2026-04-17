@@ -167,11 +167,14 @@ export class LeavesController {
     @Body() payload: ReviewLeaveRequestDto,
     @CurrentUser() user: AuthenticatedUser | undefined
   ) {
+    if (!user) {
+      return null;
+    }
     return this.leavesService.reviewLeaveRequest(
       requestId,
       "approve",
       payload,
-      user?.id ?? 0
+      user
     );
   }
 
@@ -182,11 +185,14 @@ export class LeavesController {
     @Body() payload: ReviewLeaveRequestDto,
     @CurrentUser() user: AuthenticatedUser | undefined
   ) {
+    if (!user) {
+      return null;
+    }
     return this.leavesService.reviewLeaveRequest(
       requestId,
       "reject",
       payload,
-      user?.id ?? 0
+      user
     );
   }
 
@@ -198,10 +204,13 @@ export class LeavesController {
     payload: BulkReviewLeaveIdsDto,
     @CurrentUser() user: AuthenticatedUser | undefined
   ) {
+    if (!user) {
+      return null;
+    }
     return this.leavesService.bulkReviewLeaveRequests(
       payload,
       "approve",
-      user?.id ?? 0
+      user
     );
   }
 
@@ -212,10 +221,13 @@ export class LeavesController {
     payload: BulkReviewLeaveIdsDto,
     @CurrentUser() user: AuthenticatedUser | undefined
   ) {
+    if (!user) {
+      return null;
+    }
     return this.leavesService.bulkReviewLeaveRequests(
       payload,
       "reject",
-      user?.id ?? 0
+      user
     );
   }
 

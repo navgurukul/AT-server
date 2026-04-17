@@ -25,6 +25,7 @@ import { CalendarService } from '../calendar/calendar.service';
 import { LeavesService } from '../leaves/leaves.service';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 import { CreateTimesheetAdminDto } from './dto/create-timesheet-admin.dto';
+import { checkAdminSelfAction } from '../../common/utils/self-action.utils';
 
 interface ListTimesheetParams {
   userId?: number;
@@ -435,7 +436,7 @@ export class TimesheetsService {
 
     const isBackfill = workDate < today && !(isYesterday && isBefore7AMIST);
 
-    if (isBackfill && userInfo.role !== 'super_admin' && userInfo.role !== 'admin') {
+    if (enforceCurrentSalaryCycle && isBackfill && userInfo.role !== 'super_admin' && userInfo.role !== 'admin') {
       const workingDaysPast = await this.calendarService.getWorkingDaysBetween(workDate, today);
       const ALLOWED_PAST_WORKING_DAYS = 5;
       if (workingDaysPast >= ALLOWED_PAST_WORKING_DAYS) {
@@ -1119,11 +1120,10 @@ export class TimesheetsService {
 
   async createOrUpsertByAdmin(
     payload: CreateTimesheetAdminDto,
-    adminId: number,
-    orgId: number,
-    actorRoles: string[] = [],
+    actor: AuthenticatedUser,
   ) {
     const db = this.database.connection;
+    checkAdminSelfAction(actor, payload.userId.toString());
 
     // Verify that the target user exists and belongs to the same organization
     const [targetUser] = await db
@@ -1137,7 +1137,7 @@ export class TimesheetsService {
       .where(
         and(
           eq(usersTable.id, payload.userId),
-          eq(usersTable.orgId, orgId)
+          eq(usersTable.orgId, actor.orgId)
         )
       )
       .limit(1);
@@ -1156,16 +1156,16 @@ export class TimesheetsService {
     };
 
     // Call the existing createOrUpsert method with the target user ID
-    const result = await this.createOrUpsert(timesheetDto, payload.userId, orgId, {
+    const result = await this.createOrUpsert(timesheetDto, payload.userId, actor.orgId, {
       skipBackfillDeduction: true,
       enforceCurrentSalaryCycle: false,
     });
 
-    const actorRole = this.getPrivilegedActorRole(actorRoles);
+    const actorRole = this.getPrivilegedActorRole(actor.roles);
     if (actorRole) {
       await this.auditService.createLog({
-        orgId,
-        actorUserId: adminId,
+        orgId: actor.orgId,
+        actorUserId: actor.id,
         actorRole,
         action: 'timesheet_created',
         subjectType: 'timesheet_created',
@@ -1238,6 +1238,9 @@ export class TimesheetsService {
     actor?: AuthenticatedUser;
   }) {
     const { orgId, userId, year, month, limit, actor } = payload;
+    if (actor) {
+      checkAdminSelfAction(actor, userId.toString());
+    }
     const db = this.database.connection;
     const now = new Date();
 
@@ -1855,7 +1858,8 @@ export class TimesheetsService {
       cursorForWeekOff.setUTCDate(cursorForWeekOff.getUTCDate() + 1);
     }
 
-    // Calculate total payable days using new logic: week off days + payable days from timesheets (based on hours) + paid leaves + comp-off - LWP
+    // Calculate total payable days
+    // Week off days are automatically payable + payable days from timesheets (based on hours) + paid leaves + comp-off - LWP
     const totalPayableDays = weekOffDays + totalPayableDaysFromTimesheets + paidLeaves + totalCompOffLeaveTaken - lwpDays;
     const parseNumeric = (value: unknown) => {
       const parsed = Number(value);
@@ -3503,6 +3507,9 @@ export class TimesheetsService {
   ) {
     const db = this.database.connection;
     const now = new Date();
+    if (actor) {
+      checkAdminSelfAction(actor, targetUserId.toString());
+    }
 
     // Check if the entry exists and belongs to the specified user
     const [existingEntry] = await db
@@ -3817,6 +3824,9 @@ export class TimesheetsService {
     try {
       const db = this.database.connection;
       const now = new Date();
+      if (actor) {
+        checkAdminSelfAction(actor, targetUserId.toString());
+      }
 
       // Check if the entry exists and belongs to the specified user
       const [existingEntry] = await db

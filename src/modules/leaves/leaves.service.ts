@@ -48,6 +48,7 @@ import { RevokeCompOffDto } from "./dto/revoke-comp-off.dto";
 import { UpdateAllocatedLeaveDto } from "./dto/update-allocated-leave.dto";
 import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
 import { SalaryCycleUtil } from "../../common/utils/salary-cycle.util";
+import { checkAdminSelfAction } from '../../common/utils/self-action.utils';
 
 interface ListLeaveRequestsParams {
   actor?: AuthenticatedUser;
@@ -844,6 +845,7 @@ export class LeavesService {
     payload: CreateLeaveForUserDto
   ) {
     const db = this.database.connection;
+    checkAdminSelfAction(actor, payload.userId.toString());
 
     // Verify the target user exists and belongs to the same organization
     const [targetUser] = await db
@@ -887,7 +889,6 @@ export class LeavesService {
         "Only admin and super_admin can edit leave applications"
       );
     }
-
     const db = this.database.connection;
     const startDate = new Date(payload.startDate);
     const endDate = new Date(payload.endDate);
@@ -925,6 +926,7 @@ export class LeavesService {
       if (!existingRequest) {
         throw new NotFoundException("Leave request not found");
       }
+      checkAdminSelfAction(actor, existingRequest.userId.toString());
 
       if (Number(existingRequest.orgId) !== actor.orgId) {
         throw new ForbiddenException(
@@ -1280,6 +1282,7 @@ export class LeavesService {
       if (!existingRequest) {
         throw new NotFoundException("Leave request not found");
       }
+      checkAdminSelfAction(actor, existingRequest.userId.toString());
 
       if (Number(existingRequest.orgId) !== actor.orgId) {
         throw new ForbiddenException(
@@ -1399,6 +1402,7 @@ export class LeavesService {
         "Only admin and super_admin can update allocated leave"
       );
     }
+    checkAdminSelfAction(actor, payload.userId.toString());
 
     const db = this.database.connection;
 
@@ -1523,6 +1527,7 @@ export class LeavesService {
     const today = this.normalizeDateUTC(new Date());
     const now = new Date();
 
+    checkAdminSelfAction(actor, payload.userId.toString());
     return db.transaction(async (tx) => {
       // Validate user exists and actor has permission
       const [targetUser] = await tx
@@ -1907,6 +1912,7 @@ export class LeavesService {
       if (!credit || Number(credit.orgId) !== actor.orgId) {
         throw new NotFoundException("Comp-off credit not found");
       }
+      checkAdminSelfAction(actor, credit.userId.toString());
 
       if (credit.status !== "granted" && credit.status !== "pending") {
         throw new BadRequestException(
@@ -2366,7 +2372,7 @@ export class LeavesService {
     requestId: number,
     action: "approve" | "reject",
     payload: ReviewLeaveRequestDto,
-    approverId: number
+    approver: AuthenticatedUser
   ) {
     const db = this.database.connection;
     return await db.transaction(async (tx) => {
@@ -2400,14 +2406,14 @@ export class LeavesService {
         throw new NotFoundException("Leave request not found");
       }
 
-      if (!approverId) {
+      if (!approver) {
         throw new ForbiddenException(
           "You are not authorized to review this leave request"
         );
       }
-
+      checkAdminSelfAction(approver, request.userId.toString());
       // Prevent users from approving/rejecting their own leave requests
-      if (request.userId === approverId) {
+      if (request.userId === approver.id) {
         throw new ForbiddenException(
           "You cannot approve or reject your own leave request"
         );
@@ -2418,7 +2424,7 @@ export class LeavesService {
         .select({ roleKey: rolesTable.key })
         .from(userRoles)
         .innerJoin(rolesTable, eq(userRoles.roleId, rolesTable.id))
-        .where(eq(userRoles.userId, approverId));
+        .where(eq(userRoles.userId, approver.id));
 
       const roleKeys = approverRoles.map((r) => r.roleKey);
       const isAdmin = roleKeys.includes("admin");
@@ -2435,7 +2441,7 @@ export class LeavesService {
         const isAuthorized = await this.isManagerInHierarchy(
           tx,
           request.userId,
-          approverId,
+          approver.id,
         );
 
         if (!isAuthorized) {
@@ -2472,7 +2478,7 @@ export class LeavesService {
         .update(leaveRequestsTable)
         .set({
           state: newState,
-          decidedByUserId: approverId,
+          decidedByUserId: approver.id,
           updatedAt: now,
         })
         .where(eq(leaveRequestsTable.id, requestId))
@@ -2520,7 +2526,7 @@ export class LeavesService {
         await this.auditService.createLog({
           tx,
           orgId: request.orgId,
-          actorUserId: approverId,
+          actorUserId: approver.id,
           actorRole,
           action: 'leave_modified',
           subjectType: 'leave_modified',
@@ -2557,7 +2563,7 @@ export class LeavesService {
   async bulkReviewLeaveRequests(
     payload: BulkReviewLeaveIdsDto,
     action: "approve" | "reject",
-    approverId: number
+    approver: AuthenticatedUser
   ) {
     const hasExplicitIds = payload.requestIds && payload.requestIds.length > 0;
     const hasRange = payload.month !== undefined && payload.year !== undefined;
@@ -2570,22 +2576,22 @@ export class LeavesService {
     const db = this.database.connection;
 
     return await db.transaction(async (tx) => {
-      if (!approverId) {
+      if (!approver) {
         throw new ForbiddenException(
           "You are not authorized to review these leave requests"
         );
       }
 
-      const [approver] = await tx
+      const [approverUser] = await tx
         .select({
           id: usersTable.id,
           role: usersTable.rolePrimary,
         })
         .from(usersTable)
-        .where(eq(usersTable.id, approverId))
+        .where(eq(usersTable.id, approver.id))
         .limit(1);
 
-      if (!approver) {
+      if (!approverUser) {
         throw new ForbiddenException(
           "You are not authorized to review these leave requests"
         );
@@ -2596,7 +2602,7 @@ export class LeavesService {
         .select({ roleKey: rolesTable.key })
         .from(userRoles)
         .innerJoin(rolesTable, eq(userRoles.roleId, rolesTable.id))
-        .where(eq(userRoles.userId, approverId));
+        .where(eq(userRoles.userId, approver.id));
 
       const roleKeys = approverRoles.map((r) => r.roleKey);
       const isAdmin = roleKeys.includes("admin");
@@ -2664,8 +2670,9 @@ export class LeavesService {
       }
 
       const managedCandidates = candidates.filter((candidate) => {
+        checkAdminSelfAction(approver, candidate.userId.toString());
         // Always exclude user's own leave requests
-        if (candidate.userId === approverId) {
+        if (candidate.userId === approver.id) {
           return false;
         }
 
@@ -2675,7 +2682,7 @@ export class LeavesService {
         }
 
         // Manager can only approve requests from their direct reports
-        if (isManager && candidate.managerId === approverId) {
+        if (isManager && candidate.managerId === approver.id) {
           return true;
         }
 
@@ -2710,7 +2717,7 @@ export class LeavesService {
         .update(leaveRequestsTable)
         .set({
           state: newState,
-          decidedByUserId: approverId,
+          decidedByUserId: approver.id,
           updatedAt: now,
         })
         .where(inArray(leaveRequestsTable.id, eligibleIds));
@@ -2783,7 +2790,7 @@ export class LeavesService {
           await this.auditService.createLog({
             tx,
             orgId: request.orgId,
-            actorUserId: approverId,
+            actorUserId: approver.id,
             actorRole,
             action: 'leave_modified',
             subjectType: 'leave_modified',
