@@ -26,6 +26,8 @@ import {
   timesheetsTable,
   usersTable,
 } from "../../db/schema";
+import { AuditService } from "../audit/audit.service";
+import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
 import { AssignMemberDto } from "./dto/assign-member.dto";
 import { CreateProjectDto } from "./dto/create-project.dto";
 import { UpdateProjectDto } from "./dto/update-project.dto";
@@ -71,9 +73,15 @@ const PROJECT_SELECTION = {
 
 @Injectable()
 export class ProjectsService {
-  constructor(private readonly database: DatabaseService) {}
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly auditService: AuditService
+  ) {}
 
-  async createProject(payload: CreateProjectDto) {
+  async createProject(
+    payload: CreateProjectDto,
+    actor?: AuthenticatedUser
+  ) {
     const db = this.database.connection;
 
     const existingCode = await db
@@ -163,6 +171,32 @@ export class ProjectsService {
       })
       .returning(PROJECT_SELECTION);
 
+    const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
+    if (actor?.id && project) {
+      await this.auditService.createLog({
+        orgId: Number(project.orgId),
+        actorUserId: actor?.id,
+        actorRole,
+        action: "project_created",
+        subjectType: "project",
+        next: {
+          projectId: project.id,
+          orgId: project.orgId,
+          departmentId: project.departmentId,
+          projectManagerId: project.projectManagerId,
+          name: project.name,
+          code: project.code,
+          status: project.status,
+          startDate: project.startDate,
+          endDate: project.endDate,
+          budgetCurrency: project.budgetCurrency,
+          budgetAmountMinor: project.budgetAmountMinor,
+          slackChannelId: project.slackChannelId,
+          discordChannelId: project.discordChannelId,
+        },
+      });
+    }
+
     const [hydrated] = await this.hydrateProjects(project ? [project] : []);
     return hydrated ?? project;
   }
@@ -236,7 +270,11 @@ export class ProjectsService {
     };
   }
 
-  async updateProject(id: number, payload: UpdateProjectDto) {
+  async updateProject(
+    id: number,
+    payload: UpdateProjectDto,
+    actor?: AuthenticatedUser
+  ) {
     const db = this.database.connection;
 
     const [existing] = await db
@@ -366,11 +404,63 @@ export class ProjectsService {
       if (updated) {
         resultingProject = updated;
       }
+
+      const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
+      if (actor?.id) {
+        await this.auditService.createLog({
+          orgId: Number(existing.orgId),
+          actorUserId: actor?.id,
+          actorRole,
+          action: "project_updated",
+          subjectType: "project",
+          prev: {
+            projectId: existing.id,
+            orgId: existing.orgId,
+            departmentId: existing.departmentId,
+            projectManagerId: existing.projectManagerId,
+            name: existing.name,
+            code: existing.code,
+            status: existing.status,
+            startDate: existing.startDate,
+            endDate: existing.endDate,
+            budgetCurrency: existing.budgetCurrency,
+            budgetAmountMinor: existing.budgetAmountMinor,
+            slackChannelId: existing.slackChannelId,
+            discordChannelId: existing.discordChannelId,
+          },
+          next: {
+            projectId: resultingProject.id,
+            orgId: resultingProject.orgId,
+            departmentId: resultingProject.departmentId,
+            projectManagerId: resultingProject.projectManagerId,
+            name: resultingProject.name,
+            code: resultingProject.code,
+            status: resultingProject.status,
+            startDate: resultingProject.startDate,
+            endDate: resultingProject.endDate,
+            budgetCurrency: resultingProject.budgetCurrency,
+            budgetAmountMinor: resultingProject.budgetAmountMinor,
+            slackChannelId: resultingProject.slackChannelId,
+            discordChannelId: resultingProject.discordChannelId,
+          },
+        });
+      }
     }
 
     const [hydrated] = await this.hydrateProjects([resultingProject]);
     return hydrated ?? resultingProject;
   }
+
+  private getPrivilegedActorRole(roles: string[]): "super_admin" | "admin" | null {
+    if (roles.includes("super_admin")) {
+      return "super_admin";
+    }
+    if (roles.includes("admin")) {
+      return "admin";
+    }
+    return null;
+  }
+
   async assignMember(projectId: number, payload: AssignMemberDto) {
     const db = this.database.connection;
 
