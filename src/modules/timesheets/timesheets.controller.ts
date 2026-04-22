@@ -165,9 +165,7 @@ export class TimesheetsController {
     }
     return this.timesheetsService.createOrUpsertByAdmin(
       payload,
-      user.id,
-      user.orgId,
-      user.roles,
+      user,
     );
   }
 
