@@ -2398,8 +2398,10 @@ export class TimesheetsService {
 
       cycleEnd = new Date(cycleDate);
       if (cycleDay >= 26) {
+        // If date is on/after 26th, cycle ends on 25th of next month.
         cycleEnd.setUTCMonth(cycleEnd.getUTCMonth() + 1, 25);
       } else {
+        // If date is before 26th, cycle ends on 25th of current month.
         cycleEnd.setUTCDate(25);
       }
 
@@ -2534,13 +2536,19 @@ export class TimesheetsService {
         status: user.status,
         expectedAttendance: parseNumericValue(payableRow?.expectedAttendance),
         cycle: cycleKey,
-        totalHours: Number((totalTimesheetHoursByUserId.get(user.id) ?? 0).toFixed(1)),
-        totalWorkingDays: Number(parseNumericValue(payableRow?.totalWorkingDays).toFixed(1)),
+        totalHours: Number(
+          (totalTimesheetHoursByUserId.get(user.id) ?? 0).toFixed(1),
+        ),
+        totalWorkingDays: Number(
+          parseNumericValue(payableRow?.totalWorkingDays).toFixed(1),
+        ),
         earnLeave: Number(leaveBreakdown.earnLeave.toFixed(1)),
         specialLeave: Number(leaveBreakdown.specialLeave.toFixed(1)),
         compOffLeaves: Number(leaveBreakdown.compOffLeaves.toFixed(1)),
         weekOff: Number(parseNumericValue(payableRow?.weekOff).toFixed(1)),
-        totalPayableDays: Number(parseNumericValue(payableRow?.totalPayableDays).toFixed(1)),
+        totalPayableDays: Number(
+          parseNumericValue(payableRow?.totalPayableDays).toFixed(1),
+        ),
         lwp: Number(leaveBreakdown.lwp.toFixed(1)),
       };
     });
@@ -3859,9 +3867,25 @@ export class TimesheetsService {
           targetUserId,
         };
       }
-
       const timesheetId = existingEntry.timesheetId;
       const hoursToDelete = Number(existingEntry.hoursDecimal ?? 0);
+
+      // Fetch workDate before deleting the entry
+      const [timesheetData] = await db
+        .select({ workDate: timesheetsTable.workDate })
+        .from(timesheetsTable)
+        .where(eq(timesheetsTable.id, timesheetId))
+        .limit(1);
+
+      if (!timesheetData) {
+        return {
+          success: false,
+          message: `Timesheet with ID ${timesheetId} not found.`,
+          entryId,
+          targetUserId,
+        };
+      }
+      const workDate = timesheetData.workDate;
 
       // Permanently delete the timesheet entry
       try {
@@ -3887,6 +3911,30 @@ export class TimesheetsService {
           targetUserId,
           error: errorMsg,
         };
+      }
+
+      // After deletion, check if this was the last entry for a comp-off date
+      const remainingEntries = await db
+        .select({ id: timesheetEntriesTable.id })
+        .from(timesheetEntriesTable)
+        .where(
+          and(
+            eq(timesheetEntriesTable.timesheetId, timesheetId),
+            eq(timesheetEntriesTable.status, 'approved'),
+          ),
+        )
+        .limit(1);
+
+      if (remainingEntries.length === 0) {
+        // If no entries are left, re-evaluate comp-off
+        // This will effectively revoke the comp-off if no other approved entries exist for this day
+        await this.leavesService.tryProcessCompOffForTimesheet(
+          orgId,
+          targetUserId,
+          workDate,
+          timesheetId,
+          0, // Pass 0 hours to indicate no work was done
+        );
       }
 
       // Recalculate total hours for the affected timesheet (sum all approved entries)
