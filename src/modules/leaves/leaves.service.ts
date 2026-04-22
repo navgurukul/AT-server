@@ -66,6 +66,7 @@ const HOURS_PER_WORKING_DAY = 8;
 const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 const HOURS_NEGATIVE_TOLERANCE = 1e-6;
 const COMP_OFF_LEAVE_CODE = "COMP_OFF";
+const LWP_LEAVE_CODE = "LWP";
 const COMP_OFF_FULL_DAY_HOURS = HOURS_PER_WORKING_DAY;
 const COMP_OFF_HALF_DAY_HOURS = COMP_OFF_FULL_DAY_HOURS / 2;
 const COMP_OFF_EXPIRY_DAYS = 30;
@@ -725,9 +726,15 @@ export class LeavesService {
           ? true
           : leaveType.requiresApproval;
       isPaidLeave = leaveType.paid ?? true;
+      
+      // Check if this is an LWP (Leave Without Pay) leave type
+      const isLWP = leaveType.code === LWP_LEAVE_CODE || 
+                    (leaveType.name?.toLowerCase().includes('without pay') ?? false);
 
       let balanceSnapshot: LeaveBalanceSnapshot | null = null;
-      if (isPaidLeave) {
+      // Track balance for both paid leaves and LWP
+      const shouldTrackBalance = isPaidLeave || isLWP;
+      if (shouldTrackBalance) {
         balanceSnapshot = await this.fetchLeaveBalanceSnapshot(
           tx,
           userId,
@@ -764,13 +771,13 @@ export class LeavesService {
         })
         .returning();
 
-      if (isPaidLeave) {
+      if (isPaidLeave || isLWP) {
         if (!balanceSnapshot) {
           throw new BadRequestException(
             "Leave balance not found for user and leave type",
           );
         }
-        // For all paid leaves, move from balance to pending
+        // For all paid leaves and LWP, move from balance to pending
         await this.updateLeaveBalanceFromSnapshot(tx, balanceSnapshot, {
           balanceHours: -requestedHours,
           pendingHours: requestedHours,
@@ -909,6 +916,8 @@ export class LeavesService {
           state: leaveRequestsTable.state,
           hours: leaveRequestsTable.hours,
           leaveTypePaid: leaveTypesTable.paid,
+          leaveTypeCode: leaveTypesTable.code,
+          leaveTypeName: leaveTypesTable.name,
           startDate: leaveRequestsTable.startDate,
           endDate: leaveRequestsTable.endDate,
           durationType: leaveRequestsTable.durationType,
@@ -944,6 +953,8 @@ export class LeavesService {
         .select({
           id: leaveTypesTable.id,
           paid: leaveTypesTable.paid,
+          code: leaveTypesTable.code,
+          name: leaveTypesTable.name,
         })
         .from(leaveTypesTable)
         .where(
@@ -1104,9 +1115,16 @@ export class LeavesService {
       const previousHours = Number(existingRequest.hours ?? 0);
       const previousLeaveTypeId = Number(existingRequest.leaveTypeId);
       const previousPaidLeave = existingRequest.leaveTypePaid ?? true;
+      const previousIsLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE || 
+                            (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+      const previousShouldTrackBalance = previousPaidLeave || previousIsLWP;
+      
       const nextPaidLeave = targetLeaveType.paid ?? true;
+      const nextIsLWP = targetLeaveType.code === LWP_LEAVE_CODE || 
+                        (targetLeaveType.name?.toLowerCase().includes('without pay') ?? false);
+      const nextShouldTrackBalance = nextPaidLeave || nextIsLWP;
 
-      if (previousPaidLeave) {
+      if (previousShouldTrackBalance) {
         await this.ensureLeaveBalanceRow(
           tx,
           existingRequest.userId,
@@ -1126,7 +1144,7 @@ export class LeavesService {
         }
       }
 
-      if (nextPaidLeave) {
+      if (nextShouldTrackBalance) {
         await this.ensureLeaveBalanceRow(
           tx,
           existingRequest.userId,
@@ -1265,6 +1283,8 @@ export class LeavesService {
           state: leaveRequestsTable.state,
           hours: leaveRequestsTable.hours,
           leaveTypePaid: leaveTypesTable.paid,
+          leaveTypeCode: leaveTypesTable.code,
+          leaveTypeName: leaveTypesTable.name,
           startDate: leaveRequestsTable.startDate,
           endDate: leaveRequestsTable.endDate,
           durationType: leaveRequestsTable.durationType,
@@ -1299,7 +1319,12 @@ export class LeavesService {
       const approvedHours = Number(existingRequest.hours ?? 0);
       let updatedBalance: LeaveBalanceSnapshot | null = null;
 
-      if (existingRequest.leaveTypePaid ?? true) {
+      const isPaidLeave = existingRequest.leaveTypePaid ?? true;
+      const isLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE || 
+                    (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+      const shouldRestoreBalance = isPaidLeave || isLWP;
+
+      if (shouldRestoreBalance) {
         await this.ensureLeaveBalanceRow(
           tx,
           existingRequest.userId,
@@ -2161,8 +2186,8 @@ export class LeavesService {
   }
 
   /**
-   * Expire pending comp-off requests that are older than a certain threshold
-   * and for which no timesheet has been filed.
+   * Expire pending comp-off requests once their configured expiry date passes
+   * and no eligible timesheet has been filed.
    */
   private async expireStalePendingCompOffRequests(
     tx: DatabaseService["connection"],
@@ -2170,9 +2195,6 @@ export class LeavesService {
     userId: number,
     now: Date
   ) {
-    const staleThreshold = new Date(now);
-    staleThreshold.setDate(now.getDate() - 7); // 7 days threshold
-
     const staleRequests = await tx
       .select({ id: compOffCreditsTable.id })
       .from(compOffCreditsTable)
@@ -2181,7 +2203,7 @@ export class LeavesService {
           eq(compOffCreditsTable.orgId, orgId),
           eq(compOffCreditsTable.userId, userId),
           eq(compOffCreditsTable.status, "pending"),
-          lt(compOffCreditsTable.workDate, sql`CAST(${staleThreshold.toISOString()} AS date)`)
+          lt(compOffCreditsTable.expiresAt, now)
         )
       );
 
@@ -2191,7 +2213,7 @@ export class LeavesService {
         .update(compOffCreditsTable)
         .set({
           status: "expired",
-          notes: "Expired due to no timesheet being filed within the timeframe.",
+          notes: "Expired because no eligible timesheet was filed before the comp-off expiry date.",
           updatedAt: now,
         })
         .where(inArray(compOffCreditsTable.id, staleRequestIds));
@@ -2389,6 +2411,7 @@ export class LeavesService {
           leaveTypeId: leaveRequestsTable.leaveTypeId,
           leaveTypePaid: leaveTypesTable.paid,
           leaveTypeCode: leaveTypesTable.code,
+          leaveTypeName: leaveTypesTable.name,
         })
         .from(leaveRequestsTable)
         .innerJoin(
@@ -2499,8 +2522,15 @@ export class LeavesService {
         );
 
       const isPaidLeave = request.leaveTypePaid ?? true;
+      
+      // Check if this is an LWP leave type
+      const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
+                    (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+      
+      // Handle balance adjustments for paid leaves and LWP
+      const shouldAdjustBalance = isPaidLeave || isLWP;
 
-      if (isPaidLeave) {
+      if (shouldAdjustBalance) {
         if (action === "approve") {
           if (request.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
             await this.consumeCompOffCredits(tx, request.userId, requestedHours);
@@ -2651,6 +2681,7 @@ export class LeavesService {
           leaveTypeId: leaveRequestsTable.leaveTypeId,
           leaveTypePaid: leaveTypesTable.paid,
           leaveTypeCode: leaveTypesTable.code,
+          leaveTypeName: leaveTypesTable.name,
         })
         .from(leaveRequestsTable)
         .innerJoin(
@@ -2739,7 +2770,11 @@ export class LeavesService {
       if (action === "approve") {
         for (const request of eligible) {
           const isPaidLeave = request.leaveTypePaid ?? true;
-          if (!isPaidLeave) {
+          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
+                        (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+          const shouldAdjustBalance = isPaidLeave || isLWP;
+          
+          if (!shouldAdjustBalance) {
             continue;
           }
           const hours = Number(request.hours ?? 0);
@@ -2756,7 +2791,11 @@ export class LeavesService {
       } else {
         for (const request of eligible) {
           const isPaidLeave = request.leaveTypePaid ?? true;
-          if (!isPaidLeave) {
+          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
+                        (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+          const shouldAdjustBalance = isPaidLeave || isLWP;
+          
+          if (!shouldAdjustBalance) {
             continue;
           }
 
