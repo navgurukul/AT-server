@@ -11,7 +11,9 @@ import {
 } from "@nestjs/common";
 import { ApiQuery, ApiTags } from "@nestjs/swagger";
 
+import { CurrentUser } from "../../common/decorators/current-user.decorator";
 import { Permissions } from "../../common/decorators/permissions.decorator";
+import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
 import { AssignMemberDto } from "./dto/assign-member.dto";
 import { CreateProjectDto } from "./dto/create-project.dto";
 import { UpdateProjectDto } from "./dto/update-project.dto";
@@ -24,8 +26,11 @@ export class ProjectsController {
 
   @Post()
   @Permissions("project:create")
-  createProject(@Body() payload: CreateProjectDto) {
-    return this.projectsService.createProject(payload);
+  createProject(
+    @Body() payload: CreateProjectDto,
+    @CurrentUser() actor: AuthenticatedUser | undefined
+  ) {
+    return this.projectsService.createProject(payload, actor);
   }
 
   @Get()
@@ -65,9 +70,10 @@ export class ProjectsController {
   @Permissions("project:manage")
   updateProject(
     @Param("id", ParseIntPipe) id: number,
-    @Body() payload: UpdateProjectDto
+    @Body() payload: UpdateProjectDto,
+    @CurrentUser() actor: AuthenticatedUser | undefined
   ) {
-    return this.projectsService.updateProject(id, payload);
+    return this.projectsService.updateProject(id, payload, actor);
   }
 
   @Post(":id/members")

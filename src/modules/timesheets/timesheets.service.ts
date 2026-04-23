@@ -25,12 +25,32 @@ import { CalendarService } from '../calendar/calendar.service';
 import { LeavesService } from '../leaves/leaves.service';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 import { CreateTimesheetAdminDto } from './dto/create-timesheet-admin.dto';
+import { checkAdminSelfAction } from '../../common/utils/self-action.utils';
 
 interface ListTimesheetParams {
   userId?: number;
   from?: string;
   to?: string;
   state?: string;
+}
+
+export interface PayableDaysSummaryRow {
+  userId: number;
+  email: string;
+  employmentType: string | null;
+  joiningDate: string | Date | null;
+  exitDate: string | Date | null;
+  status: string | null;
+  expectedAttendance: number | null;
+  cycle: string;
+  totalHours: number;
+  totalWorkingDays: number;
+  earnLeave: number;
+  specialLeave: number;
+  compOffLeaves: number;
+  weekOff: number;
+  totalPayableDays: number;
+  lwp: number;
 }
 
 const DEFAULT_BACKFILL_PER_MONTH = 3;
@@ -416,7 +436,7 @@ export class TimesheetsService {
 
     const isBackfill = workDate < today && !(isYesterday && isBefore7AMIST);
 
-    if (isBackfill && userInfo.role !== 'super_admin' && userInfo.role !== 'admin') {
+    if (enforceCurrentSalaryCycle && isBackfill && userInfo.role !== 'super_admin' && userInfo.role !== 'admin') {
       const workingDaysPast = await this.calendarService.getWorkingDaysBetween(workDate, today);
       const ALLOWED_PAST_WORKING_DAYS = 5;
       if (workingDaysPast >= ALLOWED_PAST_WORKING_DAYS) {
@@ -1100,11 +1120,10 @@ export class TimesheetsService {
 
   async createOrUpsertByAdmin(
     payload: CreateTimesheetAdminDto,
-    adminId: number,
-    orgId: number,
-    actorRoles: string[] = [],
+    actor: AuthenticatedUser,
   ) {
     const db = this.database.connection;
+    checkAdminSelfAction(actor, payload.userId.toString());
 
     // Verify that the target user exists and belongs to the same organization
     const [targetUser] = await db
@@ -1118,7 +1137,7 @@ export class TimesheetsService {
       .where(
         and(
           eq(usersTable.id, payload.userId),
-          eq(usersTable.orgId, orgId)
+          eq(usersTable.orgId, actor.orgId)
         )
       )
       .limit(1);
@@ -1137,16 +1156,16 @@ export class TimesheetsService {
     };
 
     // Call the existing createOrUpsert method with the target user ID
-    const result = await this.createOrUpsert(timesheetDto, payload.userId, orgId, {
+    const result = await this.createOrUpsert(timesheetDto, payload.userId, actor.orgId, {
       skipBackfillDeduction: true,
       enforceCurrentSalaryCycle: false,
     });
 
-    const actorRole = this.getPrivilegedActorRole(actorRoles);
+    const actorRole = this.getPrivilegedActorRole(actor.roles);
     if (actorRole) {
       await this.auditService.createLog({
-        orgId,
-        actorUserId: adminId,
+        orgId: actor.orgId,
+        actorUserId: actor.id,
         actorRole,
         action: 'timesheet_created',
         subjectType: 'timesheet_created',
@@ -1219,6 +1238,9 @@ export class TimesheetsService {
     actor?: AuthenticatedUser;
   }) {
     const { orgId, userId, year, month, limit, actor } = payload;
+    if (actor) {
+      checkAdminSelfAction(actor, userId.toString());
+    }
     const db = this.database.connection;
     const now = new Date();
 
@@ -1836,7 +1858,8 @@ export class TimesheetsService {
       cursorForWeekOff.setUTCDate(cursorForWeekOff.getUTCDate() + 1);
     }
 
-    // Calculate total payable days using new logic: week off days + payable days from timesheets (based on hours) + paid leaves + comp-off - LWP
+    // Calculate total payable days
+    // Week off days are automatically payable + payable days from timesheets (based on hours) + paid leaves + comp-off - LWP
     const totalPayableDays = weekOffDays + totalPayableDaysFromTimesheets + paidLeaves + totalCompOffLeaveTaken - lwpDays;
     const parseNumeric = (value: unknown) => {
       const parsed = Number(value);
@@ -2348,35 +2371,54 @@ export class TimesheetsService {
     };
   }
 
-  async getAllUsersPayableDaysCSVByCycle(params: {
+  private resolvePayableDaysCycleRange(cycle?: string) {
+    const requestedCycle = cycle?.trim();
+
+    let cycleStart: Date;
+    let cycleEnd: Date;
+    let cycleKey: string;
+
+    if (!requestedCycle) {
+      const currentCycle = this.getCycleRangeForWorkDate(new Date());
+      cycleStart = currentCycle.cycleStart;
+      cycleEnd = currentCycle.cycleEnd;
+      cycleKey = currentCycle.cycleKey;
+    } else {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedCycle)) {
+        throw new BadRequestException('cycle must be in YYYY-MM-DD format');
+      }
+
+      const parsedCycle = new Date(`${requestedCycle}T00:00:00.000Z`);
+      if (Number.isNaN(parsedCycle.getTime())) {
+        throw new BadRequestException('cycle must be a valid date in YYYY-MM-DD format');
+      }
+
+      const cycleDate = this.normalizeDateUTC(parsedCycle);
+      const cycleDay = cycleDate.getUTCDate();
+
+      cycleEnd = new Date(cycleDate);
+      if (cycleDay >= 26) {
+        // If date is on/after 26th, cycle ends on 25th of next month.
+        cycleEnd.setUTCMonth(cycleEnd.getUTCMonth() + 1, 25);
+      } else {
+        // If date is before 26th, cycle ends on 25th of current month.
+        cycleEnd.setUTCDate(25);
+      }
+
+      cycleStart = new Date(cycleEnd);
+      cycleStart.setUTCMonth(cycleStart.getUTCMonth() - 1, 26);
+      cycleKey = this.formatDateKey(cycleEnd);
+    }
+
+    return { cycleStart, cycleEnd, cycleKey };
+  }
+
+  async getAllUsersPayableDaysByCycle(params: {
     orgId: number;
-    cycle: string;
+    cycle?: string;
   }) {
     const { orgId, cycle } = params;
-
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(cycle)) {
-      throw new BadRequestException('cycle must be in YYYY-MM-DD format');
-    }
-
-    const parsedCycle = new Date(`${cycle}T00:00:00.000Z`);
-    if (Number.isNaN(parsedCycle.getTime())) {
-      throw new BadRequestException('cycle must be a valid date in YYYY-MM-DD format');
-    }
-
-    const cycleDate = this.normalizeDateUTC(parsedCycle);
-    const cycleDay = cycleDate.getUTCDate();
-
-    const cycleEnd = new Date(cycleDate);
-    if (cycleDay >= 26) {
-      // If date is on/after 26th, cycle ends on 25th of next month.
-      cycleEnd.setUTCMonth(cycleEnd.getUTCMonth() + 1, 25);
-    } else {
-      // If date is before 26th, cycle ends on 25th of current month.
-      cycleEnd.setUTCDate(25);
-    }
-
-    const cycleStart = new Date(cycleEnd);
-    cycleStart.setUTCMonth(cycleStart.getUTCMonth() - 1, 26);
+    const { cycleStart, cycleEnd, cycleKey } = this.resolvePayableDaysCycleRange(cycle);
 
     const db = this.database.connection;
 
@@ -2416,7 +2458,190 @@ export class TimesheetsService {
             .from(payableDaysTable)
             .where(
               and(
-                eq(payableDaysTable.cycle, cycle),
+                eq(payableDaysTable.cycle, cycleKey),
+                inArray(payableDaysTable.userId, userIds),
+              ),
+            );
+
+    const cycleEndExclusive = new Date(cycleEnd);
+    cycleEndExclusive.setUTCDate(cycleEndExclusive.getUTCDate() + 1);
+
+    const cycleTimesheets =
+      userIds.length === 0
+        ? []
+        : await db
+            .select({
+              userId: timesheetsTable.userId,
+              totalHours: timesheetsTable.totalHours,
+            })
+            .from(timesheetsTable)
+            .where(
+              and(
+                eq(timesheetsTable.orgId, orgId),
+                inArray(timesheetsTable.userId, userIds),
+                gte(timesheetsTable.workDate, cycleStart),
+                lt(timesheetsTable.workDate, cycleEndExclusive),
+              ),
+            );
+
+    const totalTimesheetHoursByUserId = new Map<number, number>();
+    for (const row of cycleTimesheets) {
+      const userId = Number(row.userId);
+      const hours = Number(row.totalHours ?? 0);
+      if (!Number.isFinite(hours)) {
+        continue;
+      }
+
+      totalTimesheetHoursByUserId.set(
+        userId,
+        Number(((totalTimesheetHoursByUserId.get(userId) ?? 0) + hours).toFixed(2)),
+      );
+    }
+
+    const payableDaysByUserId = new Map(
+      payableDaysRows.map((row) => [Number(row.userId), row]),
+    );
+
+    const parseNumericValue = (value: unknown): number => {
+      const parsed = Number(value ?? 0);
+      if (!Number.isFinite(parsed)) {
+        return 0;
+      }
+      return parsed;
+    };
+
+    const workingDayInfo = await this.getWorkingDayInfo(orgId, cycleStart, cycleEnd);
+    const leaveBreakdownByUserId = await this.getApprovedLeaveBreakdownByUserForCycle({
+      userIds,
+      monthStart: cycleStart,
+      monthEnd: cycleEnd,
+      workingDayInfo,
+    });
+
+    const payableRows: PayableDaysSummaryRow[] = users.map((user) => {
+      const leaveBreakdown = leaveBreakdownByUserId.get(user.id) ?? {
+        earnLeave: 0,
+        specialLeave: 0,
+        compOffLeaves: 0,
+        lwp: 0,
+      };
+      const payableRow = payableDaysByUserId.get(user.id);
+
+      return {
+        userId: user.id,
+        email: user.email,
+        employmentType: user.employmentType,
+        joiningDate: user.joiningDate,
+        exitDate: user.exitDate,
+        status: user.status,
+        expectedAttendance: parseNumericValue(payableRow?.expectedAttendance),
+        cycle: cycleKey,
+        totalHours: Number(
+          (totalTimesheetHoursByUserId.get(user.id) ?? 0).toFixed(1),
+        ),
+        totalWorkingDays: Number(
+          parseNumericValue(payableRow?.totalWorkingDays).toFixed(1),
+        ),
+        earnLeave: Number(leaveBreakdown.earnLeave.toFixed(1)),
+        specialLeave: Number(leaveBreakdown.specialLeave.toFixed(1)),
+        compOffLeaves: Number(leaveBreakdown.compOffLeaves.toFixed(1)),
+        weekOff: Number(parseNumericValue(payableRow?.weekOff).toFixed(1)),
+        totalPayableDays: Number(
+          parseNumericValue(payableRow?.totalPayableDays).toFixed(1),
+        ),
+        lwp: Number(leaveBreakdown.lwp.toFixed(1)),
+      };
+    });
+
+    return {
+      rows: payableRows,
+      cycle: cycleKey,
+      count: payableRows.length,
+    };
+  }
+
+  async getAllUsersPayableDaysCSVByCycle(params: {
+    orgId: number;
+    cycle?: string;
+  }) {
+    const { orgId, cycle } = params;
+    const requestedCycle = cycle?.trim();
+
+    let cycleStart: Date;
+    let cycleEnd: Date;
+    let cycleKey: string;
+
+    if (!requestedCycle) {
+      const currentCycle = this.getCycleRangeForWorkDate(new Date());
+      cycleStart = currentCycle.cycleStart;
+      cycleEnd = currentCycle.cycleEnd;
+      cycleKey = currentCycle.cycleKey;
+    } else {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedCycle)) {
+        throw new BadRequestException('cycle must be in YYYY-MM-DD format');
+      }
+
+      const parsedCycle = new Date(`${requestedCycle}T00:00:00.000Z`);
+      if (Number.isNaN(parsedCycle.getTime())) {
+        throw new BadRequestException('cycle must be a valid date in YYYY-MM-DD format');
+      }
+
+      const cycleDate = this.normalizeDateUTC(parsedCycle);
+      const cycleDay = cycleDate.getUTCDate();
+
+      cycleEnd = new Date(cycleDate);
+      if (cycleDay >= 26) {
+        // If date is on/after 26th, cycle ends on 25th of next month.
+        cycleEnd.setUTCMonth(cycleEnd.getUTCMonth() + 1, 25);
+      } else {
+        // If date is before 26th, cycle ends on 25th of current month.
+        cycleEnd.setUTCDate(25);
+      }
+
+      cycleStart = new Date(cycleEnd);
+      cycleStart.setUTCMonth(cycleStart.getUTCMonth() - 1, 26);
+      cycleKey = this.formatDateKey(cycleEnd);
+    }
+
+    const db = this.database.connection;
+
+    const users = await db
+      .select({
+        id: usersTable.id,
+        email: usersTable.email,
+        employmentType: usersTable.employmentType,
+        joiningDate: usersTable.dateOfJoining,
+        exitDate: usersTable.dateOfExit,
+        status: usersTable.employmentStatus,
+      })
+      .from(usersTable)
+      .where(
+        and(
+          eq(usersTable.orgId, orgId),
+          or(
+            isNull(usersTable.employmentStatus),
+            not(eq(usersTable.employmentStatus, 'inactive')),
+          ),
+        ),
+      )
+      .orderBy(asc(usersTable.id));
+
+    const userIds = users.map((user) => user.id);
+    const payableDaysRows =
+      userIds.length === 0
+        ? []
+        : await db
+            .select({
+              userId: payableDaysTable.userId,
+              expectedAttendance: payableDaysTable.expectedAttendance,
+              totalWorkingDays: payableDaysTable.totalWorkingDays,
+              weekOff: payableDaysTable.weekOff,
+              totalPayableDays: payableDaysTable.totalPayableDays,
+            })
+            .from(payableDaysTable)
+            .where(
+              and(
+                eq(payableDaysTable.cycle, cycleKey),
                 inArray(payableDaysTable.userId, userIds),
               ),
             );
@@ -2493,7 +2718,7 @@ export class TimesheetsService {
           exitDate: user.exitDate,
           status: user.status,
           expectedAttendance: parseNumericValue(payableRow?.expectedAttendance),
-          cycle,
+          cycle: cycleKey,
           totalHours: Number(
             (totalTimesheetHoursByUserId.get(user.id) ?? 0).toFixed(1),
           ),
@@ -2515,7 +2740,7 @@ export class TimesheetsService {
 
     return {
       csv,
-      cycle,
+      cycle: cycleKey,
       count: payableRows.length,
     };
   }
@@ -3290,6 +3515,9 @@ export class TimesheetsService {
   ) {
     const db = this.database.connection;
     const now = new Date();
+    if (actor) {
+      checkAdminSelfAction(actor, targetUserId.toString());
+    }
 
     // Check if the entry exists and belongs to the specified user
     const [existingEntry] = await db
@@ -3604,6 +3832,9 @@ export class TimesheetsService {
     try {
       const db = this.database.connection;
       const now = new Date();
+      if (actor) {
+        checkAdminSelfAction(actor, targetUserId.toString());
+      }
 
       // Check if the entry exists and belongs to the specified user
       const [existingEntry] = await db
@@ -3636,9 +3867,25 @@ export class TimesheetsService {
           targetUserId,
         };
       }
-
       const timesheetId = existingEntry.timesheetId;
       const hoursToDelete = Number(existingEntry.hoursDecimal ?? 0);
+
+      // Fetch workDate before deleting the entry
+      const [timesheetData] = await db
+        .select({ workDate: timesheetsTable.workDate })
+        .from(timesheetsTable)
+        .where(eq(timesheetsTable.id, timesheetId))
+        .limit(1);
+
+      if (!timesheetData) {
+        return {
+          success: false,
+          message: `Timesheet with ID ${timesheetId} not found.`,
+          entryId,
+          targetUserId,
+        };
+      }
+      const workDate = timesheetData.workDate;
 
       // Permanently delete the timesheet entry
       try {
@@ -3664,6 +3911,30 @@ export class TimesheetsService {
           targetUserId,
           error: errorMsg,
         };
+      }
+
+      // After deletion, check if this was the last entry for a comp-off date
+      const remainingEntries = await db
+        .select({ id: timesheetEntriesTable.id })
+        .from(timesheetEntriesTable)
+        .where(
+          and(
+            eq(timesheetEntriesTable.timesheetId, timesheetId),
+            eq(timesheetEntriesTable.status, 'approved'),
+          ),
+        )
+        .limit(1);
+
+      if (remainingEntries.length === 0) {
+        // If no entries are left, re-evaluate comp-off
+        // This will effectively revoke the comp-off if no other approved entries exist for this day
+        await this.leavesService.tryProcessCompOffForTimesheet(
+          orgId,
+          targetUserId,
+          workDate,
+          timesheetId,
+          0, // Pass 0 hours to indicate no work was done
+        );
       }
 
       // Recalculate total hours for the affected timesheet (sum all approved entries)

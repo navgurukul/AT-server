@@ -48,6 +48,7 @@ import { RevokeCompOffDto } from "./dto/revoke-comp-off.dto";
 import { UpdateAllocatedLeaveDto } from "./dto/update-allocated-leave.dto";
 import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
 import { SalaryCycleUtil } from "../../common/utils/salary-cycle.util";
+import { checkAdminSelfAction } from '../../common/utils/self-action.utils';
 
 interface ListLeaveRequestsParams {
   actor?: AuthenticatedUser;
@@ -65,6 +66,7 @@ const HOURS_PER_WORKING_DAY = 8;
 const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 const HOURS_NEGATIVE_TOLERANCE = 1e-6;
 const COMP_OFF_LEAVE_CODE = "COMP_OFF";
+const LWP_LEAVE_CODE = "LWP";
 const COMP_OFF_FULL_DAY_HOURS = HOURS_PER_WORKING_DAY;
 const COMP_OFF_HALF_DAY_HOURS = COMP_OFF_FULL_DAY_HOURS / 2;
 const COMP_OFF_EXPIRY_DAYS = 30;
@@ -188,6 +190,8 @@ export class LeavesService {
     .set({
       status: 'pending',
       timesheetId: null,
+      creditedHours: '0',
+      timesheetHours: null,
     })
     .where(eq(compOffCreditsTable.id, grantedCredit.id));
     return true;
@@ -724,9 +728,15 @@ export class LeavesService {
           ? true
           : leaveType.requiresApproval;
       isPaidLeave = leaveType.paid ?? true;
+      
+      // Check if this is an LWP (Leave Without Pay) leave type
+      const isLWP = leaveType.code === LWP_LEAVE_CODE || 
+                    (leaveType.name?.toLowerCase().includes('without pay') ?? false);
 
       let balanceSnapshot: LeaveBalanceSnapshot | null = null;
-      if (isPaidLeave) {
+      // Track balance for both paid leaves and LWP
+      const shouldTrackBalance = isPaidLeave || isLWP;
+      if (shouldTrackBalance) {
         balanceSnapshot = await this.fetchLeaveBalanceSnapshot(
           tx,
           userId,
@@ -763,13 +773,13 @@ export class LeavesService {
         })
         .returning();
 
-      if (isPaidLeave) {
+      if (isPaidLeave || isLWP) {
         if (!balanceSnapshot) {
           throw new BadRequestException(
             "Leave balance not found for user and leave type",
           );
         }
-        // For all paid leaves, move from balance to pending
+        // For all paid leaves and LWP, move from balance to pending
         await this.updateLeaveBalanceFromSnapshot(tx, balanceSnapshot, {
           balanceHours: -requestedHours,
           pendingHours: requestedHours,
@@ -844,6 +854,7 @@ export class LeavesService {
     payload: CreateLeaveForUserDto
   ) {
     const db = this.database.connection;
+    checkAdminSelfAction(actor, payload.userId.toString());
 
     // Verify the target user exists and belongs to the same organization
     const [targetUser] = await db
@@ -887,7 +898,6 @@ export class LeavesService {
         "Only admin and super_admin can edit leave applications"
       );
     }
-
     const db = this.database.connection;
     const startDate = new Date(payload.startDate);
     const endDate = new Date(payload.endDate);
@@ -908,6 +918,8 @@ export class LeavesService {
           state: leaveRequestsTable.state,
           hours: leaveRequestsTable.hours,
           leaveTypePaid: leaveTypesTable.paid,
+          leaveTypeCode: leaveTypesTable.code,
+          leaveTypeName: leaveTypesTable.name,
           startDate: leaveRequestsTable.startDate,
           endDate: leaveRequestsTable.endDate,
           durationType: leaveRequestsTable.durationType,
@@ -925,6 +937,7 @@ export class LeavesService {
       if (!existingRequest) {
         throw new NotFoundException("Leave request not found");
       }
+      checkAdminSelfAction(actor, existingRequest.userId.toString());
 
       if (Number(existingRequest.orgId) !== actor.orgId) {
         throw new ForbiddenException(
@@ -942,6 +955,8 @@ export class LeavesService {
         .select({
           id: leaveTypesTable.id,
           paid: leaveTypesTable.paid,
+          code: leaveTypesTable.code,
+          name: leaveTypesTable.name,
         })
         .from(leaveTypesTable)
         .where(
@@ -1102,9 +1117,16 @@ export class LeavesService {
       const previousHours = Number(existingRequest.hours ?? 0);
       const previousLeaveTypeId = Number(existingRequest.leaveTypeId);
       const previousPaidLeave = existingRequest.leaveTypePaid ?? true;
+      const previousIsLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE || 
+                            (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+      const previousShouldTrackBalance = previousPaidLeave || previousIsLWP;
+      
       const nextPaidLeave = targetLeaveType.paid ?? true;
+      const nextIsLWP = targetLeaveType.code === LWP_LEAVE_CODE || 
+                        (targetLeaveType.name?.toLowerCase().includes('without pay') ?? false);
+      const nextShouldTrackBalance = nextPaidLeave || nextIsLWP;
 
-      if (previousPaidLeave) {
+      if (previousShouldTrackBalance) {
         await this.ensureLeaveBalanceRow(
           tx,
           existingRequest.userId,
@@ -1124,7 +1146,7 @@ export class LeavesService {
         }
       }
 
-      if (nextPaidLeave) {
+      if (nextShouldTrackBalance) {
         await this.ensureLeaveBalanceRow(
           tx,
           existingRequest.userId,
@@ -1263,6 +1285,8 @@ export class LeavesService {
           state: leaveRequestsTable.state,
           hours: leaveRequestsTable.hours,
           leaveTypePaid: leaveTypesTable.paid,
+          leaveTypeCode: leaveTypesTable.code,
+          leaveTypeName: leaveTypesTable.name,
           startDate: leaveRequestsTable.startDate,
           endDate: leaveRequestsTable.endDate,
           durationType: leaveRequestsTable.durationType,
@@ -1280,6 +1304,7 @@ export class LeavesService {
       if (!existingRequest) {
         throw new NotFoundException("Leave request not found");
       }
+      checkAdminSelfAction(actor, existingRequest.userId.toString());
 
       if (Number(existingRequest.orgId) !== actor.orgId) {
         throw new ForbiddenException(
@@ -1296,7 +1321,12 @@ export class LeavesService {
       const approvedHours = Number(existingRequest.hours ?? 0);
       let updatedBalance: LeaveBalanceSnapshot | null = null;
 
-      if (existingRequest.leaveTypePaid ?? true) {
+      const isPaidLeave = existingRequest.leaveTypePaid ?? true;
+      const isLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE || 
+                    (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+      const shouldRestoreBalance = isPaidLeave || isLWP;
+
+      if (shouldRestoreBalance) {
         await this.ensureLeaveBalanceRow(
           tx,
           existingRequest.userId,
@@ -1399,6 +1429,7 @@ export class LeavesService {
         "Only admin and super_admin can update allocated leave"
       );
     }
+    checkAdminSelfAction(actor, payload.userId.toString());
 
     const db = this.database.connection;
 
@@ -1523,6 +1554,7 @@ export class LeavesService {
     const today = this.normalizeDateUTC(new Date());
     const now = new Date();
 
+    checkAdminSelfAction(actor, payload.userId.toString());
     return db.transaction(async (tx) => {
       // Validate user exists and actor has permission
       const [targetUser] = await tx
@@ -1544,10 +1576,16 @@ export class LeavesService {
           ? Number(targetUser.managerId)
           : null;
 
-      // Admin/SuperAdmin can raise for all employees; managers only for direct reports
-      if (!this.canGrantCompOffForUser(actor, targetUser)) {
+      const isAuthorized = await this.isManagerInHierarchy(
+        tx,
+        targetUser.id,
+        actor.id,
+      );
+
+      // Admin/SuperAdmin can raise for all employees; managers only for their reports
+      if (!this.hasOrgWideCompOffAccess(actor) && !isAuthorized) {
         throw new ForbiddenException(
-          "Only administrators or the direct manager can authorize off-day work for an employee"
+          "Only administrators or a manager in the reporting chain can authorize off-day work for an employee",
         );
       }
 
@@ -1901,6 +1939,7 @@ export class LeavesService {
       if (!credit || Number(credit.orgId) !== actor.orgId) {
         throw new NotFoundException("Comp-off credit not found");
       }
+      checkAdminSelfAction(actor, credit.userId.toString());
 
       if (credit.status !== "granted" && credit.status !== "pending") {
         throw new BadRequestException(
@@ -2149,8 +2188,8 @@ export class LeavesService {
   }
 
   /**
-   * Expire pending comp-off requests that are older than a certain threshold
-   * and for which no timesheet has been filed.
+   * Expire pending comp-off requests once their configured expiry date passes
+   * and no eligible timesheet has been filed.
    */
   private async expireStalePendingCompOffRequests(
     tx: DatabaseService["connection"],
@@ -2158,9 +2197,6 @@ export class LeavesService {
     userId: number,
     now: Date
   ) {
-    const staleThreshold = new Date(now);
-    staleThreshold.setDate(now.getDate() - 7); // 7 days threshold
-
     const staleRequests = await tx
       .select({ id: compOffCreditsTable.id })
       .from(compOffCreditsTable)
@@ -2169,7 +2205,7 @@ export class LeavesService {
           eq(compOffCreditsTable.orgId, orgId),
           eq(compOffCreditsTable.userId, userId),
           eq(compOffCreditsTable.status, "pending"),
-          lt(compOffCreditsTable.workDate, sql`CAST(${staleThreshold.toISOString()} AS date)`)
+          lt(compOffCreditsTable.expiresAt, now)
         )
       );
 
@@ -2179,7 +2215,7 @@ export class LeavesService {
         .update(compOffCreditsTable)
         .set({
           status: "expired",
-          notes: "Expired due to no timesheet being filed within the timeframe.",
+          notes: "Expired because no eligible timesheet was filed before the comp-off expiry date.",
           updatedAt: now,
         })
         .where(inArray(compOffCreditsTable.id, staleRequestIds));
@@ -2360,7 +2396,7 @@ export class LeavesService {
     requestId: number,
     action: "approve" | "reject",
     payload: ReviewLeaveRequestDto,
-    approverId: number
+    approver: AuthenticatedUser
   ) {
     const db = this.database.connection;
     return await db.transaction(async (tx) => {
@@ -2377,6 +2413,7 @@ export class LeavesService {
           leaveTypeId: leaveRequestsTable.leaveTypeId,
           leaveTypePaid: leaveTypesTable.paid,
           leaveTypeCode: leaveTypesTable.code,
+          leaveTypeName: leaveTypesTable.name,
         })
         .from(leaveRequestsTable)
         .innerJoin(
@@ -2394,14 +2431,14 @@ export class LeavesService {
         throw new NotFoundException("Leave request not found");
       }
 
-      if (!approverId) {
+      if (!approver) {
         throw new ForbiddenException(
           "You are not authorized to review this leave request"
         );
       }
-
+      checkAdminSelfAction(approver, request.userId.toString());
       // Prevent users from approving/rejecting their own leave requests
-      if (request.userId === approverId) {
+      if (request.userId === approver.id) {
         throw new ForbiddenException(
           "You cannot approve or reject your own leave request"
         );
@@ -2412,7 +2449,7 @@ export class LeavesService {
         .select({ roleKey: rolesTable.key })
         .from(userRoles)
         .innerJoin(rolesTable, eq(userRoles.roleId, rolesTable.id))
-        .where(eq(userRoles.userId, approverId));
+        .where(eq(userRoles.userId, approver.id));
 
       const roleKeys = approverRoles.map((r) => r.roleKey);
       const isAdmin = roleKeys.includes("admin");
@@ -2425,20 +2462,18 @@ export class LeavesService {
         : null;
 
       // Admin and super_admin can approve any request (except their own)
-      if (isAdmin || isSuperAdmin) {
-        // Allowed to proceed
-      } else if (isManager) {
-        // Manager can only approve requests from their direct reports
-        if (request.managerId !== approverId) {
+      if (!isAdmin && !isSuperAdmin) {
+        const isAuthorized = await this.isManagerInHierarchy(
+          tx,
+          request.userId,
+          approver.id,
+        );
+
+        if (!isAuthorized) {
           throw new ForbiddenException(
-            "You can only approve leave requests from your direct reports"
+            "You are not in the reporting chain for this employee",
           );
         }
-      } else {
-        // Regular employees cannot approve leave requests
-        throw new ForbiddenException(
-          "You do not have permission to review leave requests"
-        );
       }
 
 
@@ -2468,7 +2503,7 @@ export class LeavesService {
         .update(leaveRequestsTable)
         .set({
           state: newState,
-          decidedByUserId: approverId,
+          decidedByUserId: approver.id,
           updatedAt: now,
         })
         .where(eq(leaveRequestsTable.id, requestId))
@@ -2489,8 +2524,15 @@ export class LeavesService {
         );
 
       const isPaidLeave = request.leaveTypePaid ?? true;
+      
+      // Check if this is an LWP leave type
+      const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
+                    (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+      
+      // Handle balance adjustments for paid leaves and LWP
+      const shouldAdjustBalance = isPaidLeave || isLWP;
 
-      if (isPaidLeave) {
+      if (shouldAdjustBalance) {
         if (action === "approve") {
           if (request.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
             await this.consumeCompOffCredits(tx, request.userId, requestedHours);
@@ -2516,7 +2558,7 @@ export class LeavesService {
         await this.auditService.createLog({
           tx,
           orgId: request.orgId,
-          actorUserId: approverId,
+          actorUserId: approver.id,
           actorRole,
           action: 'leave_modified',
           subjectType: 'leave_modified',
@@ -2553,7 +2595,7 @@ export class LeavesService {
   async bulkReviewLeaveRequests(
     payload: BulkReviewLeaveIdsDto,
     action: "approve" | "reject",
-    approverId: number
+    approver: AuthenticatedUser
   ) {
     const hasExplicitIds = payload.requestIds && payload.requestIds.length > 0;
     const hasRange = payload.month !== undefined && payload.year !== undefined;
@@ -2566,22 +2608,22 @@ export class LeavesService {
     const db = this.database.connection;
 
     return await db.transaction(async (tx) => {
-      if (!approverId) {
+      if (!approver) {
         throw new ForbiddenException(
           "You are not authorized to review these leave requests"
         );
       }
 
-      const [approver] = await tx
+      const [approverUser] = await tx
         .select({
           id: usersTable.id,
           role: usersTable.rolePrimary,
         })
         .from(usersTable)
-        .where(eq(usersTable.id, approverId))
+        .where(eq(usersTable.id, approver.id))
         .limit(1);
 
-      if (!approver) {
+      if (!approverUser) {
         throw new ForbiddenException(
           "You are not authorized to review these leave requests"
         );
@@ -2592,7 +2634,7 @@ export class LeavesService {
         .select({ roleKey: rolesTable.key })
         .from(userRoles)
         .innerJoin(rolesTable, eq(userRoles.roleId, rolesTable.id))
-        .where(eq(userRoles.userId, approverId));
+        .where(eq(userRoles.userId, approver.id));
 
       const roleKeys = approverRoles.map((r) => r.roleKey);
       const isAdmin = roleKeys.includes("admin");
@@ -2641,6 +2683,7 @@ export class LeavesService {
           leaveTypeId: leaveRequestsTable.leaveTypeId,
           leaveTypePaid: leaveTypesTable.paid,
           leaveTypeCode: leaveTypesTable.code,
+          leaveTypeName: leaveTypesTable.name,
         })
         .from(leaveRequestsTable)
         .innerJoin(
@@ -2660,8 +2703,9 @@ export class LeavesService {
       }
 
       const managedCandidates = candidates.filter((candidate) => {
+        checkAdminSelfAction(approver, candidate.userId.toString());
         // Always exclude user's own leave requests
-        if (candidate.userId === approverId) {
+        if (candidate.userId === approver.id) {
           return false;
         }
 
@@ -2671,7 +2715,7 @@ export class LeavesService {
         }
 
         // Manager can only approve requests from their direct reports
-        if (isManager && candidate.managerId === approverId) {
+        if (isManager && candidate.managerId === approver.id) {
           return true;
         }
 
@@ -2706,7 +2750,7 @@ export class LeavesService {
         .update(leaveRequestsTable)
         .set({
           state: newState,
-          decidedByUserId: approverId,
+          decidedByUserId: approver.id,
           updatedAt: now,
         })
         .where(inArray(leaveRequestsTable.id, eligibleIds));
@@ -2728,7 +2772,11 @@ export class LeavesService {
       if (action === "approve") {
         for (const request of eligible) {
           const isPaidLeave = request.leaveTypePaid ?? true;
-          if (!isPaidLeave) {
+          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
+                        (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+          const shouldAdjustBalance = isPaidLeave || isLWP;
+          
+          if (!shouldAdjustBalance) {
             continue;
           }
           const hours = Number(request.hours ?? 0);
@@ -2745,7 +2793,11 @@ export class LeavesService {
       } else {
         for (const request of eligible) {
           const isPaidLeave = request.leaveTypePaid ?? true;
-          if (!isPaidLeave) {
+          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
+                        (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+          const shouldAdjustBalance = isPaidLeave || isLWP;
+          
+          if (!shouldAdjustBalance) {
             continue;
           }
 
@@ -2779,7 +2831,7 @@ export class LeavesService {
           await this.auditService.createLog({
             tx,
             orgId: request.orgId,
-            actorUserId: approverId,
+            actorUserId: approver.id,
             actorRole,
             action: 'leave_modified',
             subjectType: 'leave_modified',
@@ -3367,6 +3419,7 @@ export class LeavesService {
       .select({
         id: compOffCreditsTable.id,
         creditedHours: compOffCreditsTable.creditedHours,
+        availedHours: compOffCreditsTable.availedHours,
         status: compOffCreditsTable.status,
       })
       .from(compOffCreditsTable)
@@ -3374,7 +3427,7 @@ export class LeavesService {
         and(
           eq(compOffCreditsTable.orgId, orgId),
           eq(compOffCreditsTable.userId, userId),
-          eq(compOffCreditsTable.status, "granted"),
+          inArray(compOffCreditsTable.status, ["granted", "partial_availed"]),
           lt(compOffCreditsTable.expiresAt, referenceDate)
         )
       );
@@ -3390,9 +3443,12 @@ export class LeavesService {
     );
 
     for (const credit of credits) {
-      const creditHours = Number(credit.creditedHours ?? 0);
-      if (creditHours > 0 && snapshot.balanceHours > 0) {
-        const deduction = Math.min(snapshot.balanceHours, creditHours);
+      const creditedHours = Number(credit.creditedHours ?? 0);
+      const availedHours = Number(credit.availedHours ?? 0);
+      const remainingHours = Math.max(0, creditedHours - availedHours);
+
+      if (remainingHours > 0 && snapshot.balanceHours > 0) {
+        const deduction = Math.min(snapshot.balanceHours, remainingHours);
         if (deduction > 0) {
           snapshot = await this.updateLeaveBalanceFromSnapshot(tx, snapshot, {
             balanceHours: -deduction,
@@ -3937,5 +3993,45 @@ export class LeavesService {
     const d1 = this.normalizeDateUTC(date1);
     const d2 = this.normalizeDateUTC(date2);
     return d1.getTime() === d2.getTime();
+  }
+
+  private async isManagerInHierarchy(
+    tx: DatabaseService["connection"],
+    requestorUserId: number,
+    actionTakerUserId: number,
+  ): Promise<boolean> {
+    const result = await tx.execute(sql`
+      WITH RECURSIVE "ManagerChain" AS (
+        -- 1. Base Case: Start with the employee (requestor)
+        SELECT
+            "id",
+            "manager_id",
+            1 AS level
+        FROM "users"
+        WHERE "id" = ${requestorUserId}
+
+        UNION ALL
+
+        -- 2. Recursive Step: Move up the hierarchy
+        SELECT
+            "u"."id",
+            "u"."manager_id",
+            "mc"."level" + 1
+        FROM "users" "u"
+        INNER JOIN "ManagerChain" "mc"
+            ON "u"."id" = "mc"."manager_id"
+      )
+      -- 3. Final Check: Is action-taker in this chain's list of managers?
+      -- We check the 'id' column because the chain includes the requestor themself.
+      SELECT EXISTS (
+          SELECT 1
+          FROM "ManagerChain"
+          WHERE "id" = ${actionTakerUserId}
+      ) AS "is_authorized";
+    `);
+
+    const isAuthorized = (result.rows[0] as { is_authorized: boolean })
+      .is_authorized;
+    return isAuthorized;
   }
 }
