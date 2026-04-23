@@ -190,6 +190,8 @@ export class LeavesService {
     .set({
       status: 'pending',
       timesheetId: null,
+      creditedHours: '0',
+      timesheetHours: null,
     })
     .where(eq(compOffCreditsTable.id, grantedCredit.id));
     return true;
