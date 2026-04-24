@@ -61,7 +61,22 @@ interface ListLeaveRequestsParams {
 
 interface ListCompOffParams {
   userId?: number;
+  email?: string;
+  workDate?: string;
+  holidayType?: string;
   status?: "pending" | "granted" | "expired" | "revoked";
+}
+
+interface CompOffCreditListRow {
+  id: number;
+  userId: number;
+  workDate: Date | string;
+  durationType: string;
+  creditedHours: number | string | null;
+  timesheetHours: number | string | null;
+  status: string;
+  expiresAt: Date | string;
+  leaveRequestId: number | null;
 }
 
 export interface MyCompOffCreditItem {
@@ -1945,52 +1960,207 @@ export class LeavesService {
     params: ListCompOffParams = {}
   ) {
     const db = this.database.connection;
-    const targetUserId = params.userId ?? actor.id;
+    const normalizedEmail = params.email?.trim().toLowerCase() || undefined;
+    if (params.userId !== undefined) {
+      const [targetUser] = await db
+        .select({
+          id: usersTable.id,
+          orgId: usersTable.orgId,
+          managerId: usersTable.managerId,
+          email: usersTable.email,
+        })
+        .from(usersTable)
+        .where(eq(usersTable.id, params.userId))
+        .limit(1);
 
-    const [targetUser] = await db
-      .select({
-        id: usersTable.id,
-        orgId: usersTable.orgId,
-        managerId: usersTable.managerId,
-        name: usersTable.name,
-      })
-      .from(usersTable)
-      .where(eq(usersTable.id, targetUserId))
-      .limit(1);
+      if (!targetUser || Number(targetUser.orgId) !== actor.orgId) {
+        throw new NotFoundException("User not found in this organisation");
+      }
 
-    if (!targetUser || Number(targetUser.orgId) !== actor.orgId) {
-      throw new NotFoundException("User not found in this organisation");
+      if (
+        normalizedEmail &&
+        targetUser.email.trim().toLowerCase() !== normalizedEmail
+      ) {
+        return {
+          user: {
+            id: targetUser.id,
+            email: targetUser.email,
+            managerId:
+              targetUser.managerId !== null && targetUser.managerId !== undefined
+                ? Number(targetUser.managerId)
+                : null,
+          },
+          credits: [],
+        };
+      }
+
+      const isSelf = targetUser.id === actor.id;
+      if (!isSelf && !this.hasOrgWideCompOffAccess(actor)) {
+        if (!this.isReportingManager(actor)) {
+          throw new ForbiddenException(
+            "You do not have permission to view comp-off credits for this user"
+          );
+        }
+
+        const canViewTargetUser = this.isDirectReport(targetUser.managerId, actor.id);
+
+        if (!canViewTargetUser) {
+          throw new ForbiddenException(
+            "Managers can only view comp-off credits for their mentees"
+          );
+        }
+      }
+
+      const rows = await this.fetchCompOffCreditRows(actor.orgId, [targetUser.id], params.status);
+      const credits = this.filterCompOffCreditsBySearch(
+        await this.mapCreditsToMyCompOffResponse(actor, rows),
+        {
+          workDate: params.workDate,
+          holidayType: params.holidayType,
+        }
+      );
+
+      return {
+        user: {
+          id: targetUser.id,
+          email: targetUser.email,
+          managerId:
+            targetUser.managerId !== null && targetUser.managerId !== undefined
+              ? Number(targetUser.managerId)
+              : null,
+        },
+        credits,
+      };
     }
 
-    const isSelf = targetUser.id === actor.id;
-    if (!isSelf && !this.canAccessOtherCompOff(actor, targetUser)) {
+    const hasOrgWideAccess = this.hasOrgWideCompOffAccess(actor);
+    const isManager = this.isReportingManager(actor);
+
+    if (!hasOrgWideAccess && !isManager) {
       throw new ForbiddenException(
-        "You do not have permission to view comp-off credits for this user"
+        "You do not have permission to view comp-off credits for other users"
       );
     }
 
+    const users = await db
+      .select({
+        id: usersTable.id,
+        email: usersTable.email,
+        managerId: usersTable.managerId,
+      })
+      .from(usersTable)
+      .where(
+        and(
+          eq(usersTable.orgId, actor.orgId),
+          sql`${usersTable.id} <> ${actor.id}`
+        )
+      );
+
+    if (users.length === 0) {
+      return { users: [] };
+    }
+
+    let visibleUsers = users;
+
+    if (!hasOrgWideAccess) {
+      visibleUsers = users.filter((user) =>
+        this.isDirectReport(user.managerId, actor.id)
+      );
+    }
+
+    if (normalizedEmail) {
+      visibleUsers = visibleUsers.filter((user) =>
+        user.email.trim().toLowerCase().includes(normalizedEmail)
+      );
+    }
+
+    if (visibleUsers.length === 0) {
+      return { users: [] };
+    }
+
+    const userIds = visibleUsers.map((user) => user.id);
+    const rows = await this.fetchCompOffCreditRows(actor.orgId, userIds, params.status);
+
+    const rowsByUserId = new Map<number, CompOffCreditListRow[]>();
+    for (const row of rows) {
+      const existingRows = rowsByUserId.get(row.userId) ?? [];
+      existingRows.push(row);
+      rowsByUserId.set(row.userId, existingRows);
+    }
+
+    const userCredits = await Promise.all(
+      visibleUsers.map(async (user) => ({
+        user: {
+          id: user.id,
+          email: user.email,
+          managerId:
+            user.managerId !== null && user.managerId !== undefined
+              ? Number(user.managerId)
+              : null,
+        },
+        credits: await this.mapCreditsToMyCompOffResponse(
+          actor,
+          rowsByUserId.get(user.id) ?? []
+        ),
+      }))
+    );
+
+    return {
+      users: userCredits.map((entry) => ({
+        ...entry,
+        credits: this.filterCompOffCreditsBySearch(entry.credits, {
+          workDate: params.workDate,
+          holidayType: params.holidayType,
+        }),
+      })),
+    };
+  }
+
+  async listMyCompOffCredits(
+    actor: AuthenticatedUser,
+    filters?: {
+      workDate?: string;
+      holidayType?: string;
+      status?: ListCompOffParams["status"];
+    }
+  ): Promise<MyCompOffCreditItem[]> {
+    const credits = await this.fetchCompOffCreditRows(actor.orgId, [actor.id]);
+    let results = await this.mapCreditsToMyCompOffResponse(actor, credits);
+
+    return this.filterCompOffCreditsBySearch(results, filters ?? {});
+  }
+
+  private async fetchCompOffCreditRows(
+    orgId: number,
+    userIds: number[],
+    status?: ListCompOffParams["status"]
+  ): Promise<CompOffCreditListRow[]> {
+    if (userIds.length === 0) {
+      return [];
+    }
+
+    const db = this.database.connection;
     const filters = [
-      eq(compOffCreditsTable.orgId, actor.orgId),
-      eq(compOffCreditsTable.userId, targetUser.id),
+      eq(compOffCreditsTable.orgId, orgId),
+      inArray(compOffCreditsTable.userId, userIds),
     ];
 
-    if (params.status) {
-      filters.push(eq(compOffCreditsTable.status, params.status));
+    if (status) {
+      filters.push(eq(compOffCreditsTable.status, status));
     }
 
     const rows = await db
       .select({
         id: compOffCreditsTable.id,
+        userId: compOffCreditsTable.userId,
         workDate: compOffCreditsTable.workDate,
         durationType: compOffCreditsTable.durationType,
         creditedHours: compOffCreditsTable.creditedHours,
         timesheetHours: compOffCreditsTable.timesheetHours,
         status: compOffCreditsTable.status,
         expiresAt: compOffCreditsTable.expiresAt,
-        notes: compOffCreditsTable.notes,
-        createdAt: compOffCreditsTable.createdAt,
-        updatedAt: compOffCreditsTable.updatedAt,
         leaveRequestId: compOffCreditsTable.leaveRequestId,
+        createdAt: compOffCreditsTable.createdAt,
       })
       .from(compOffCreditsTable)
       .where(and(...filters))
@@ -1999,36 +2169,23 @@ export class LeavesService {
         desc(compOffCreditsTable.createdAt)
       );
 
-    return {
-      user: {
-        id: targetUser.id,
-        name: targetUser.name,
-        managerId:
-          targetUser.managerId !== null && targetUser.managerId !== undefined
-            ? Number(targetUser.managerId)
-            : null,
-      },
-      credits: rows.map((row) => ({
-        id: row.id,
-        workDate: row.workDate,
-        durationType: row.durationType,
-        creditedHours: Number(row.creditedHours ?? 0),
-        timesheetHours: Number(row.timesheetHours ?? 0),
-        status: row.status,
-        expiresAt: row.expiresAt,
-        notes: row.notes ?? null,
-        createdAt: row.createdAt,
-        updatedAt: row.updatedAt,
-        leaveRequestId: row.leaveRequestId,
-      })),
-    };
+    return rows.map((row) => ({
+      id: row.id,
+      userId: Number(row.userId),
+      workDate: row.workDate,
+      durationType: row.durationType,
+      creditedHours: row.creditedHours,
+      timesheetHours: row.timesheetHours,
+      status: row.status,
+      expiresAt: row.expiresAt,
+      leaveRequestId: row.leaveRequestId,
+    }));
   }
 
-  async listMyCompOffCredits(
+  private async mapCreditsToMyCompOffResponse(
     actor: AuthenticatedUser,
-    filters?: { workDate?: string; holidayType?: string }
+    credits: CompOffCreditListRow[]
   ): Promise<MyCompOffCreditItem[]> {
-    const { credits } = await this.listCompOffCredits(actor);
     const db = this.database.connection;
 
     const workDateKeys = Array.from(
@@ -2133,7 +2290,7 @@ export class LeavesService {
       });
     }
 
-    let results = credits.map((credit) => ({
+    return credits.map((credit) => ({
       workDate: credit.workDate,
       holidayType: this.getHolidayType(
         credit.workDate,
@@ -2148,9 +2305,19 @@ export class LeavesService {
       expireDate: credit.expiresAt,
       status: credit.status,
     }));
+  }
 
-    // Apply filters if provided
-    if (filters?.workDate) {
+  private filterCompOffCreditsBySearch(
+    credits: MyCompOffCreditItem[],
+    filters: {
+      workDate?: string;
+      holidayType?: string;
+      status?: ListCompOffParams["status"];
+    }
+  ): MyCompOffCreditItem[] {
+    let results = credits;
+
+    if (filters.workDate) {
       const filterDate = this.formatDateKey(
         this.normalizeDateUTC(new Date(filters.workDate))
       );
@@ -2161,11 +2328,15 @@ export class LeavesService {
       );
     }
 
-    if (filters?.holidayType) {
+    if (filters.holidayType) {
       const searchType = filters.holidayType.toLowerCase();
       results = results.filter((item) =>
         item.holidayType.toLowerCase().includes(searchType)
       );
+    }
+
+    if (filters.status) {
+      results = results.filter((item) => item.status === filters.status);
     }
 
     return results;
@@ -3502,6 +3673,17 @@ export class LeavesService {
   private hasOrgWideLeaveBalanceAccess(actor: AuthenticatedUser): boolean {
     const privilegedRoles = new Set(["admin", "super_admin", "superadmin"]);
     return (actor.roles ?? []).some((role) => privilegedRoles.has(role));
+  }
+
+  private isDirectReport(
+    managerId: number | null | undefined,
+    actorId: number
+  ): boolean {
+    return (
+      managerId !== null &&
+      managerId !== undefined &&
+      Number(managerId) === actorId
+    );
   }
 
   private isReportingManager(actor: AuthenticatedUser): boolean {
