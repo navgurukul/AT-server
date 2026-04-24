@@ -16,6 +16,7 @@ import {
   lt,
   sql,
   isNotNull,
+  isNull,
 } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 
@@ -33,6 +34,7 @@ import {
   rolesTable,
   timesheetEntriesTable,
   timesheetsTable,
+  orgHolidaysTable,
   userRoles,
   usersTable,
   users,
@@ -60,6 +62,23 @@ interface ListLeaveRequestsParams {
 interface ListCompOffParams {
   userId?: number;
   status?: "pending" | "granted" | "expired" | "revoked";
+}
+
+export interface MyCompOffCreditItem {
+  workDate: string | Date;
+  holidayType: string;
+  duration: "full_day" | "half_day" | string;
+  timesheetHours: number;
+  creditedHours: number;
+  availedDate: Date | string | null;
+  expireDate: Date | string;
+  status:
+    | "pending"
+    | "granted"
+    | "expired"
+    | "revoked"
+    | "partial_availed"
+    | string;
 }
 
 const HOURS_PER_WORKING_DAY = 8;
@@ -98,17 +117,40 @@ export class LeavesService {
     tx: DatabaseService['connection'],
     userId: number,
     hoursToConsume: number,
+    leaveRequestId?: number,
   ) {
-    const credits = await tx
+    const activeCreditConditions = and(
+      eq(compOffCreditsTable.userId, userId),
+      inArray(compOffCreditsTable.status, ['granted', 'partial_availed']),
+    );
+
+    const linkedCredits = leaveRequestId
+      ? await tx
+          .select()
+          .from(compOffCreditsTable)
+          .where(
+            and(
+              activeCreditConditions,
+              eq(compOffCreditsTable.leaveRequestId, leaveRequestId),
+            ),
+          )
+          .orderBy(compOffCreditsTable.workDate)
+      : [];
+
+    const unlinkedCredits = await tx
       .select()
       .from(compOffCreditsTable)
       .where(
         and(
-          eq(compOffCreditsTable.userId, userId),
-          inArray(compOffCreditsTable.status, ['granted', 'partial_availed']),
+          activeCreditConditions,
+          leaveRequestId
+            ? isNull(compOffCreditsTable.leaveRequestId)
+            : sql`true`,
         ),
       )
       .orderBy(compOffCreditsTable.workDate);
+
+    const credits = [...linkedCredits, ...unlinkedCredits];
 
     let remainingHoursToConsume = hoursToConsume;
 
@@ -132,6 +174,7 @@ export class LeavesService {
           .set({
             availedHours: newAvailedHours.toString(),
             status: newStatus,
+            leaveRequestId: leaveRequestId ?? credit.leaveRequestId,
           })
           .where(eq(compOffCreditsTable.id, credit.id));
 
@@ -195,6 +238,63 @@ export class LeavesService {
     })
     .where(eq(compOffCreditsTable.id, grantedCredit.id));
     return true;
+  }
+
+  private async linkCompOffCreditsToLeaveRequest(
+    tx: DatabaseService['connection'],
+    userId: number,
+    hoursToLink: number,
+    leaveRequestId: number,
+  ) {
+    const credits = await tx
+      .select()
+      .from(compOffCreditsTable)
+      .where(
+        and(
+          eq(compOffCreditsTable.userId, userId),
+          inArray(compOffCreditsTable.status, ['granted', 'partial_availed']),
+          isNull(compOffCreditsTable.leaveRequestId),
+        ),
+      )
+      .orderBy(compOffCreditsTable.workDate);
+
+    let remainingHoursToLink = hoursToLink;
+
+    for (const credit of credits) {
+      if (remainingHoursToLink <= 0) {
+        break;
+      }
+
+      const availableHours = Number(credit.creditedHours) - Number(credit.availedHours);
+      const hoursToLinkNow = Math.min(remainingHoursToLink, availableHours);
+
+      if (hoursToLinkNow > 0) {
+        await tx
+          .update(compOffCreditsTable)
+          .set({
+            leaveRequestId,
+          })
+          .where(eq(compOffCreditsTable.id, credit.id));
+
+        remainingHoursToLink -= hoursToLinkNow;
+      }
+    }
+
+    if (remainingHoursToLink > 0) {
+      throw new Error('Insufficient comp-off credits to link to leave request');
+    }
+  }
+
+  private async clearCompOffCreditLinks(
+    tx: DatabaseService['connection'],
+    leaveRequestId: number,
+  ) {
+    await tx
+      .update(compOffCreditsTable)
+      .set({
+        leaveRequestId: null,
+      })
+      .where(eq(compOffCreditsTable.leaveRequestId, leaveRequestId));
   }
 
   async listBalances(userId: number) {
@@ -772,6 +872,15 @@ export class LeavesService {
           requestedAt: new Date(),
         })
         .returning();
+
+      if (leaveType.code === COMP_OFF_LEAVE_CODE) {
+        await this.linkCompOffCreditsToLeaveRequest(
+          tx,
+          userId,
+          requestedHours,
+          request.id,
+        );
+      }
 
       if (isPaidLeave || isLWP) {
         if (!balanceSnapshot) {
@@ -1881,6 +1990,7 @@ export class LeavesService {
         notes: compOffCreditsTable.notes,
         createdAt: compOffCreditsTable.createdAt,
         updatedAt: compOffCreditsTable.updatedAt,
+        leaveRequestId: compOffCreditsTable.leaveRequestId,
       })
       .from(compOffCreditsTable)
       .where(and(...filters))
@@ -1909,8 +2019,156 @@ export class LeavesService {
         notes: row.notes ?? null,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
+        leaveRequestId: row.leaveRequestId,
       })),
     };
+  }
+
+  async listMyCompOffCredits(
+    actor: AuthenticatedUser,
+    filters?: { workDate?: string; holidayType?: string }
+  ): Promise<MyCompOffCreditItem[]> {
+    const { credits } = await this.listCompOffCredits(actor);
+    const db = this.database.connection;
+
+    const workDateKeys = Array.from(
+      new Set(
+        credits.map((credit) =>
+          this.formatDateKey(this.normalizeDateUTC(new Date(credit.workDate)))
+        )
+      )
+    );
+
+    const holidayNameByDate = new Map<string, string>();
+
+    if (workDateKeys.length > 0) {
+      const holidayRows = await db
+        .select({
+          date: orgHolidaysTable.date,
+          isWorkingDay: orgHolidaysTable.isWorkingDay,
+          name: orgHolidaysTable.name,
+        })
+        .from(orgHolidaysTable)
+        .where(
+          and(
+            eq(orgHolidaysTable.orgId, actor.orgId),
+            inArray(orgHolidaysTable.date, workDateKeys)
+          )
+        );
+
+      for (const holiday of holidayRows) {
+        if (!holiday.isWorkingDay && holiday.name) {
+          const key = this.formatDateKey(this.normalizeDateUTC(new Date(holiday.date)));
+          holidayNameByDate.set(key, holiday.name);
+        }
+      }
+    }
+
+    const leaveRequestIds = credits
+      .map((credit) => credit.leaveRequestId)
+      .filter((id): id is number => id !== null && id !== undefined);
+
+    const leaveRequestDateById = new Map<number, { startDate: Date; endDate: Date }>();
+
+    if (leaveRequestIds.length > 0) {
+      const leaveRows = await db
+        .select({
+          id: leaveRequestsTable.id,
+          startDate: leaveRequestsTable.startDate,
+          endDate: leaveRequestsTable.endDate,
+        })
+        .from(leaveRequestsTable)
+        .where(inArray(leaveRequestsTable.id, leaveRequestIds));
+
+      for (const leave of leaveRows) {
+        const normalizedStartDate = this.normalizeDateUTC(new Date(leave.startDate));
+        const normalizedEndDate = this.normalizeDateUTC(new Date(leave.endDate));
+        leaveRequestDateById.set(leave.id, {
+          startDate: normalizedStartDate,
+          endDate: normalizedEndDate,
+        });
+      }
+    }
+
+    const availedDateByCreditId = new Map<number, Date>();
+    const creditsByLeaveRequestId = new Map<number, typeof credits>();
+
+    for (const credit of credits) {
+      if (!credit.leaveRequestId) {
+        continue;
+      }
+      const existingCredits = creditsByLeaveRequestId.get(credit.leaveRequestId) ?? [];
+      existingCredits.push(credit);
+      creditsByLeaveRequestId.set(credit.leaveRequestId, existingCredits);
+    }
+
+    for (const [leaveRequestId, linkedCredits] of creditsByLeaveRequestId.entries()) {
+      const requestDates = leaveRequestDateById.get(leaveRequestId);
+      if (!requestDates) {
+        continue;
+      }
+
+      const sortedCredits = [...linkedCredits].sort((a, b) => {
+        const workDateA = this.normalizeDateUTC(new Date(a.workDate)).getTime();
+        const workDateB = this.normalizeDateUTC(new Date(b.workDate)).getTime();
+        if (workDateA !== workDateB) {
+          return workDateA - workDateB;
+        }
+        return a.id - b.id;
+      });
+
+      const maxOffset = Math.max(
+        0,
+        Math.floor(
+          (requestDates.endDate.getTime() - requestDates.startDate.getTime()) /
+            (24 * 60 * 60 * 1000)
+        )
+      );
+
+      sortedCredits.forEach((credit, index) => {
+        const dayOffset = Math.min(index, maxOffset);
+        const availedDate = new Date(requestDates.startDate);
+        availedDate.setUTCDate(availedDate.getUTCDate() + dayOffset);
+        availedDateByCreditId.set(credit.id, availedDate);
+      });
+    }
+
+    let results = credits.map((credit) => ({
+      workDate: credit.workDate,
+      holidayType: this.getHolidayType(
+        credit.workDate,
+        holidayNameByDate.get(
+          this.formatDateKey(this.normalizeDateUTC(new Date(credit.workDate)))
+        )
+      ),
+      duration: credit.durationType,
+      timesheetHours: Number(credit.timesheetHours ?? 0),
+      creditedHours: Number(credit.creditedHours ?? 0),
+      availedDate: availedDateByCreditId.get(credit.id) ?? null,
+      expireDate: credit.expiresAt,
+      status: credit.status,
+    }));
+
+    // Apply filters if provided
+    if (filters?.workDate) {
+      const filterDate = this.formatDateKey(
+        this.normalizeDateUTC(new Date(filters.workDate))
+      );
+      results = results.filter(
+        (item) =>
+          this.formatDateKey(this.normalizeDateUTC(new Date(item.workDate))) ===
+          filterDate
+      );
+    }
+
+    if (filters?.holidayType) {
+      const searchType = filters.holidayType.toLowerCase();
+      results = results.filter((item) =>
+        item.holidayType.toLowerCase().includes(searchType)
+      );
+    }
+
+    return results;
   }
 
   async revokeCompOffCredit(
@@ -2535,7 +2793,12 @@ export class LeavesService {
       if (shouldAdjustBalance) {
         if (action === "approve") {
           if (request.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
-            await this.consumeCompOffCredits(tx, request.userId, requestedHours);
+            await this.consumeCompOffCredits(
+              tx,
+              request.userId,
+              requestedHours,
+              request.id,
+            );
           }
           await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
             pendingHours: -requestedHours,
@@ -2546,12 +2809,22 @@ export class LeavesService {
             pendingHours: -requestedHours,
             balanceHours: requestedHours,
           });
+          if (request.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
+            await this.clearCompOffCreditLinks(tx, request.id);
+          }
         } else if (previousState === "approved") {
           await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
             bookedHours: -requestedHours,
             balanceHours: requestedHours,
           });
         }
+      }
+
+      if (
+        action === "reject" &&
+        request.leaveTypeCode === COMP_OFF_LEAVE_CODE
+      ) {
+        await this.clearCompOffCreditLinks(tx, request.id);
       }
 
       if (actorRole) {
@@ -3482,6 +3755,40 @@ export class LeavesService {
 
   private formatDateKey(date: Date): string {
     return date.toISOString().slice(0, 10);
+  }
+
+  private getWeekdayName(workDate: string | Date): string {
+    const date = this.normalizeDateUTC(new Date(workDate));
+    return date.toLocaleDateString("en-US", {
+      weekday: "long",
+      timeZone: "UTC",
+    });
+  }
+
+  private getHolidayType(workDate: string | Date, holidayName?: string): string {
+    if (holidayName) {
+      return holidayName;
+    }
+
+    const date = this.normalizeDateUTC(new Date(workDate));
+    const dayOfWeek = date.getUTCDay();
+
+    if (dayOfWeek === 0) {
+      return "Sunday";
+    }
+
+    if (dayOfWeek === 6) {
+      const occurrence = Math.ceil(date.getUTCDate() / 7);
+      if (occurrence === 2) {
+        return "2nd Saturday";
+      }
+      if (occurrence === 4) {
+        return "4th Saturday";
+      }
+      return "Saturday";
+    }
+
+    return this.getWeekdayName(date).toLowerCase();
   }
 
   private getPayableDaysForTimesheetHours(hours: number): number {
