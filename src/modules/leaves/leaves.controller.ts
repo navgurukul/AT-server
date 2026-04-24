@@ -135,6 +135,24 @@ export class LeavesController {
     });
   }
 
+  @Get("my-comp-offs")
+  @ApiQuery({ name: "workDate", required: false })
+  @ApiQuery({ name: "holidayType", required: false })
+  @Permissions("leave:view:self")
+  listMyCompOffCredits(
+    @CurrentUser() actor: AuthenticatedUser | undefined,
+    @Query("workDate") workDate?: string,
+    @Query("holidayType") holidayType?: string
+  ) {
+    if (!actor) {
+      return null;
+    }
+    return this.leavesService.listMyCompOffCredits(actor, {
+      workDate,
+      holidayType,
+    });
+  }
+
   @Post("comp-offs")
   @Permissions("leave:approve:team")
   grantCompOff(
