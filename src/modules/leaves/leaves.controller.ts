@@ -119,9 +119,16 @@ export class LeavesController {
   }
 
   @Get("comp-offs")
-  @Permissions("leave:view:self")
+  @ApiQuery({ name: "email", required: false })
+  @ApiQuery({ name: "workDate", required: false })
+  @ApiQuery({ name: "holidayType", required: false })
+  @ApiQuery({ name: "status", required: false })
+  @Permissions("leave:view:team")
   listCompOffCredits(
     @Query("userId") userId: string | undefined,
+    @Query("email") email: string | undefined,
+    @Query("workDate") workDate: string | undefined,
+    @Query("holidayType") holidayType: string | undefined,
     @Query("status")
     status: "pending" | "granted" | "expired" | "revoked" | undefined,
     @CurrentUser() actor: AuthenticatedUser | undefined
@@ -131,6 +138,9 @@ export class LeavesController {
     }
     return this.leavesService.listCompOffCredits(actor, {
       userId: userId ? Number.parseInt(userId, 10) : undefined,
+      email,
+      workDate,
+      holidayType,
       status,
     });
   }
@@ -138,11 +148,15 @@ export class LeavesController {
   @Get("my-comp-offs")
   @ApiQuery({ name: "workDate", required: false })
   @ApiQuery({ name: "holidayType", required: false })
+  @ApiQuery({ name: "status", required: false })
   @Permissions("leave:view:self")
   listMyCompOffCredits(
     @CurrentUser() actor: AuthenticatedUser | undefined,
     @Query("workDate") workDate?: string,
-    @Query("holidayType") holidayType?: string
+    @Query("holidayType") holidayType?: string,
+    @Query("status")
+    status: "pending" | "granted" | "expired" | "revoked" | undefined =
+      undefined
   ) {
     if (!actor) {
       return null;
@@ -150,6 +164,7 @@ export class LeavesController {
     return this.leavesService.listMyCompOffCredits(actor, {
       workDate,
       holidayType,
+      status,
     });
   }
 
