@@ -1,13 +1,13 @@
 /**
  * Salary Cycle Utility
  * 
- * Salary cycle runs from 26th of a month at 7:00 AM to 25th of the next month at 7:00 AM.
+ * Salary cycle runs from 26th of a month at 7:01 AM to 26th of the next month at 7:00 AM.
  * Payable day calculation: 26th to 25th of every month.
  */
 
 export interface SalaryCycleRange {
-  start: Date; // 26th at 7:00 AM
-  end: Date;   // 25th of next month at 7:00 AM
+  start: Date; // 26th at 7:01 AM
+  end: Date;   // 26th of next month at 7:00 AM
   year: number;
   month: number; // The month in which the cycle starts
   cycleLabel: string; // e.g., "26 Jan 2026 - 25 Feb 2026"
@@ -18,12 +18,12 @@ export class SalaryCycleUtil {
 // Salary cycle start day of month (26th)
   private static readonly CYCLE_START_DAY = 26;
   // Salary cycle end day of month (25th)
-  private static readonly CYCLE_END_DAY = 25;
+  private static readonly CYCLE_END_DAY = 26;
 
   
 // Cycle start time: 7:00 AM
   private static readonly CYCLE_START_HOUR = 7;
-  private static readonly CYCLE_START_MINUTE = 0;
+  private static readonly CYCLE_START_MINUTE = 1;
 
  
 // Cycle end time: 7:00 AM (on 25th of next month)
