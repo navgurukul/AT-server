@@ -848,6 +848,23 @@ export class LeavesService {
       const isLWP = leaveType.code === LWP_LEAVE_CODE || 
                     (leaveType.name?.toLowerCase().includes('without pay') ?? false);
 
+      if (isLWP) {
+        const lwpBalance = await this.fetchLeaveBalanceSnapshot(
+          tx,
+          userId,
+          payload.leaveTypeId,
+        );
+
+        if (
+          lwpBalance.balanceHours <= 0 ||
+          requestedHours > lwpBalance.balanceHours
+        ) {
+          throw new BadRequestException(
+            'Insufficient LWP balance. You cannot apply for more than your available balance.',
+          );
+        }
+      }
+
       let balanceSnapshot: LeaveBalanceSnapshot | null = null;
       // Track balance for both paid leaves and LWP
       const shouldTrackBalance = isPaidLeave || isLWP;
@@ -1700,16 +1717,21 @@ export class LeavesService {
           ? Number(targetUser.managerId)
           : null;
 
-      const isAuthorized = await this.isManagerInHierarchy(
-        tx,
-        targetUser.id,
-        actor.id,
-      );
+      let isAuthorized = false;
+      if (this.hasOrgWideCompOffAccess(actor)) {
+        isAuthorized = true;
+      } else {
+        isAuthorized = await this.isManagerInHierarchy(
+          tx,
+          targetUser.id,
+          actor.id,
+        );
+      }
 
       // Admin/SuperAdmin can raise for all employees; managers only for their reports
-      if (!this.hasOrgWideCompOffAccess(actor) && !isAuthorized) {
+      if (!isAuthorized) {
         throw new ForbiddenException(
-          "Only administrators or a manager in the reporting chain can authorize off-day work for an employee",
+          'Only administrators or a manager in the reporting chain can authorize off-day work for an employee',
         );
       }
 
@@ -3883,6 +3905,7 @@ export class LeavesService {
           eq(compOffCreditsTable.orgId, orgId),
           eq(compOffCreditsTable.userId, userId),
           inArray(compOffCreditsTable.status, ["granted", "partial_availed"]),
+          isNull(compOffCreditsTable.leaveRequestId),
           lt(compOffCreditsTable.expiresAt, referenceDate)
         )
       );
