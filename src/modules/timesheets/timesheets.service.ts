@@ -935,6 +935,22 @@ export class TimesheetsService {
       )
       .limit(1);
 
+    const joiningDate = userEmployment?.dateOfJoining
+      ? this.normalizeDateUTC(new Date(userEmployment.dateOfJoining))
+      : null;
+    const exitDate = userEmployment?.dateOfExit
+      ? this.normalizeDateUTC(new Date(userEmployment.dateOfExit))
+      : null;
+
+    const effectiveStartDate = joiningDate && joiningDate > cycleStartDate
+      ? joiningDate
+      : cycleStartDate;
+    const effectiveEndDate = joiningDate === null
+      ? cycleEndDate
+      : exitDate && exitDate < cycleEndDate
+        ? exitDate
+        : cycleEndDate;
+
     const cycleTimesheets = await tx
       .select({
         workDate: timesheetsTable.workDate,
@@ -945,8 +961,8 @@ export class TimesheetsService {
         and(
           eq(timesheetsTable.orgId, orgId),
           eq(timesheetsTable.userId, userId),
-          gte(timesheetsTable.workDate, cycleStartDate),
-          lte(timesheetsTable.workDate, cycleEndDate),
+          gte(timesheetsTable.workDate, effectiveStartDate),
+          lte(timesheetsTable.workDate, effectiveEndDate),
         ),
       );
 
@@ -973,26 +989,10 @@ export class TimesheetsService {
         and(
           eq(leaveRequestsTable.userId, userId),
           eq(leaveRequestsTable.state, 'approved'),
-          lte(leaveRequestsTable.startDate, cycleEndDate),
-          gte(leaveRequestsTable.endDate, cycleStartDate),
+          lte(leaveRequestsTable.startDate, effectiveEndDate),
+          gte(leaveRequestsTable.endDate, effectiveStartDate),
         ),
       );
-
-    const joiningDate = userEmployment?.dateOfJoining
-      ? this.normalizeDateUTC(new Date(userEmployment.dateOfJoining))
-      : null;
-    const exitDate = userEmployment?.dateOfExit
-      ? this.normalizeDateUTC(new Date(userEmployment.dateOfExit))
-      : null;
-
-    const effectiveStartDate = joiningDate && joiningDate > cycleStartDate
-      ? joiningDate
-      : cycleStartDate;
-    const effectiveEndDate = joiningDate === null
-      ? cycleEndDate
-      : exitDate && exitDate < cycleEndDate
-        ? exitDate
-        : cycleEndDate;
 
     const expectedAttendance =
       effectiveEndDate >= effectiveStartDate
