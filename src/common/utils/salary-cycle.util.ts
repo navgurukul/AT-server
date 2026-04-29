@@ -18,7 +18,7 @@ export class SalaryCycleUtil {
 // Salary cycle start day of month (26th)
   private static readonly CYCLE_START_DAY = 26;
   // Salary cycle end day of month (25th)
-  private static readonly CYCLE_END_DAY = 26;
+  private static readonly CYCLE_END_DAY = 25;
 
   
 // Cycle start time: 7:00 AM
@@ -27,7 +27,7 @@ export class SalaryCycleUtil {
 
  
 // Cycle end time: 7:00 AM (on 25th of next month)
-  private static readonly CYCLE_END_HOUR = 7;
+  private static readonly CYCLE_END_HOUR = 24+7; // 7:00 AM on the next day (26th) is effectively 24+7 hours from the start of the cycle
   private static readonly CYCLE_END_MINUTE = 0;
 
   /**
