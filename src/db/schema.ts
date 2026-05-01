@@ -62,6 +62,7 @@ export const compOffStatusEnum = pgEnum("comp_off_status", [
   "revoked",
   "availed",
   "partial_availed",
+  "warning",
 ]);
 
 export const decisionEnum = pgEnum("decision", [
