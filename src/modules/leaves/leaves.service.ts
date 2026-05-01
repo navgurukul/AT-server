@@ -4003,7 +4003,7 @@ export class LeavesService {
         creditedHours: compOffCreditsTable.creditedHours,
         availedHours: compOffCreditsTable.availedHours,
         status: compOffCreditsTable.status,
-        workDate: compOffCreditsTable.workDate,
+        expiresAt: compOffCreditsTable.expiresAt,
       })
       .from(compOffCreditsTable)
       .where(
@@ -4027,9 +4027,9 @@ export class LeavesService {
     );
 
     for (const credit of credits) {
-      // Compute salary cycle end for this credit's workDate
-      const workDate = new Date(credit.workDate as string | Date);
-      const { cycleEnd } = this.getCycleRangeForWorkDate(workDate);
+      // Compute salary cycle end for this credit's expiry date.
+      const expiryDate = new Date(credit.expiresAt as string | Date);
+      const { cycleEnd } = this.getCycleRangeForWorkDate(expiryDate);
       // Only expire if referenceDate (now) > cycleEnd
       if (referenceDate > cycleEnd) {
         const creditedHours = Number(credit.creditedHours ?? 0);
