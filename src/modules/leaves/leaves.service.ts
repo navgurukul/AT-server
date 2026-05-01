@@ -64,7 +64,14 @@ interface ListCompOffParams {
   email?: string;
   workDate?: string;
   holidayType?: string;
-  status?: "pending" | "granted" | "expired" | "revoked";
+  status?:
+    | "pending"
+    | "granted"
+    | "expired"
+    | "revoked"
+    | "availed"
+    | "partial_availed"
+    | "warning";
 }
 
 interface CompOffCreditListRow {
@@ -92,8 +99,22 @@ export interface MyCompOffCreditItem {
     | "granted"
     | "expired"
     | "revoked"
+    | "availed"
     | "partial_availed"
+    | "warning"
     | string;
+}
+
+export interface MyCompOffCreditsSummary {
+  total: number;
+  active: number;
+  availed: number;
+  expired: number;
+}
+
+export interface MyCompOffCreditsResponse {
+  "comp-off": MyCompOffCreditsSummary;
+  credits: MyCompOffCreditItem[];
 }
 
 const HOURS_PER_WORKING_DAY = 8;
@@ -2206,11 +2227,66 @@ export class LeavesService {
       holidayType?: string;
       status?: ListCompOffParams["status"];
     }
-  ): Promise<MyCompOffCreditItem[]> {
+  ): Promise<MyCompOffCreditsResponse> {
     const credits = await this.fetchCompOffCreditRows(actor.orgId, [actor.id]);
     let results = await this.mapCreditsToMyCompOffResponse(actor, credits);
+    results = this.filterCompOffCreditsBySearch(results, filters ?? {});
 
-    return this.filterCompOffCreditsBySearch(results, filters ?? {});
+    const nonPendingCount = results.filter((c) => c.status !== "pending").length;
+    const statusTotals = this.buildCompOffStatusTotals(results);
+
+    return {
+      "comp-off": {
+        total: nonPendingCount,
+        ...statusTotals,
+      },
+      credits: results,
+    };
+  }
+
+  private buildCompOffStatusTotals(
+    credits: MyCompOffCreditItem[]
+  ): Omit<MyCompOffCreditsSummary, "total"> {
+    const totals: Record<string, number> = {
+      active: 0,
+      availed: 0,
+      expired: 0,
+    };
+
+    for (const credit of credits) {
+      if (credit.status === "pending") {
+        continue;
+      }
+
+      const durationValue = credit.duration === "half_day" ? 0.5 : 1;
+
+      switch (credit.status) {
+        case "granted":
+        case "warning":
+          totals.active += durationValue;
+          break;
+        case "partial_availed":
+          totals.active += durationValue * 0.5;
+          totals.availed += durationValue * 0.5;
+          break;
+        case "availed":
+          totals.availed += durationValue;
+          break;
+        case "expired":
+          totals.expired += durationValue;
+          break;
+        case "revoked":
+          // revoked doesn't count toward any summary
+          break;
+      }
+    }
+
+    // Round to 1 decimal place for cleaner output
+    return {
+      active: Math.round(totals.active * 10) / 10,
+      availed: Math.round(totals.availed * 10) / 10,
+      expired: Math.round(totals.expired * 10) / 10,
+    };
   }
 
   private async fetchCompOffCreditRows(

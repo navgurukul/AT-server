@@ -130,7 +130,15 @@ export class LeavesController {
     @Query("workDate") workDate: string | undefined,
     @Query("holidayType") holidayType: string | undefined,
     @Query("status")
-    status: "pending" | "granted" | "expired" | "revoked" | undefined,
+    status:
+      | "pending"
+      | "granted"
+      | "expired"
+      | "revoked"
+      | "availed"
+      | "partial_availed"
+      | "warning"
+      | undefined,
     @CurrentUser() actor: AuthenticatedUser | undefined
   ) {
     if (!actor) {
@@ -155,8 +163,15 @@ export class LeavesController {
     @Query("workDate") workDate?: string,
     @Query("holidayType") holidayType?: string,
     @Query("status")
-    status: "pending" | "granted" | "expired" | "revoked" | undefined =
-      undefined
+    status:
+      | "pending"
+      | "granted"
+      | "expired"
+      | "revoked"
+      | "availed"
+      | "partial_availed"
+      | "warning"
+      | undefined = undefined
   ) {
     if (!actor) {
       return null;
