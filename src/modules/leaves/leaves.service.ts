@@ -122,6 +122,8 @@ const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 const HOURS_NEGATIVE_TOLERANCE = 1e-6;
 const COMP_OFF_LEAVE_CODE = "COMP_OFF";
 const LWP_LEAVE_CODE = "LWP";
+const TIMESHEET_HALF_DAY_MIN_HOURS = 3;
+const TIMESHEET_FULL_DAY_MIN_HOURS = 6;
 const COMP_OFF_FULL_DAY_HOURS = HOURS_PER_WORKING_DAY;
 const COMP_OFF_HALF_DAY_HOURS = COMP_OFF_FULL_DAY_HOURS / 2;
 const COMP_OFF_EXPIRY_DAYS = 30;
@@ -3631,17 +3633,16 @@ export class LeavesService {
     endDate: Date,
     requestedDurationType: "half_day" | "full_day" | "custom"
   ): Promise<boolean> {
-    // Half-day leave can coexist with timesheets (other half worked).
-    if (requestedDurationType === "half_day") {
-      return false;
-    }
-
     const db = this.database.connection;
     const start = this.normalizeDateUTC(startDate);
     const end = this.normalizeDateUTC(endDate);
 
     const rows = await db
-      .select({ id: timesheetsTable.id })
+      .select({ 
+        id: timesheetsTable.id,
+        totalHours: timesheetsTable.totalHours,
+        workDate: timesheetsTable.workDate,
+      })
       .from(timesheetsTable)
       .where(
         and(
@@ -3650,10 +3651,23 @@ export class LeavesService {
           gte(timesheetsTable.workDate, start),
           lte(timesheetsTable.workDate, end)
         )
-      )
-      .limit(1);
+      );
 
-    return rows.length > 0;
+    if (rows.length === 0) {
+      return false;
+    }
+
+    // For full-day or custom leaves, any timesheet is blocking
+    if (requestedDurationType !== "half_day") {
+      return true;
+    }
+
+    // For half-day leaves, only block if timesheet is a full day (>= 6 hours)
+    // 3 to less than 6 hours is treated as a half day and can coexist.
+    return rows.some((row) => {
+      const timesheetHours = parseFloat(row.totalHours.toString());
+      return timesheetHours >= TIMESHEET_FULL_DAY_MIN_HOURS - HOURS_NEGATIVE_TOLERANCE;
+    });
   }
 
   private normalizeHours(value: number): number {
