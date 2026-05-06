@@ -1705,13 +1705,11 @@ export class TimesheetsService {
       }
 
       const requestHours = request.hours ? Number(request.hours) : 0;
-      const totalRequestHours =
-        requestHours > 0
-          ? requestHours
-          : request.durationType === 'half_day'
-            ? dayKeys.length * HALF_DAY_HOURS
-            : dayKeys.length * HOURS_PER_WORKING_DAY;
-      const perDayHours = dayKeys.length === 0 ? 0 : totalRequestHours / dayKeys.length;
+      const { leaveDaysCount, hoursPerDay: perDayHours } = this.getCycleLeaveMetrics({
+        dayCount: dayKeys.length,
+        durationType: request.durationType,
+        requestHours,
+      });
 
       // Determine leave type for day counting
       const isLWP = request.leaveTypeCode === 'lwp' || 
@@ -1720,15 +1718,8 @@ export class TimesheetsService {
                        request.leaveTypeName?.toLowerCase().includes('comp off');
       const isPaidLeave = !isLWP && !isCompOff;
 
-      // Count leave days based on actual hours, not just day count
-      // Full day = 8 hours, Half day = 4 hours
+      // Count leave days from the actual working days in this cycle.
       const isApproved = request.state === 'approved';
-      const leaveDaysCount =
-        requestHours > 0
-          ? requestHours / HOURS_PER_WORKING_DAY
-          : request.durationType === 'half_day'
-            ? dayKeys.length * 0.5
-            : dayKeys.length;
 
       // Only count approved leaves towards payable days
       if (isApproved) {
@@ -1951,6 +1942,77 @@ export class TimesheetsService {
       cursor.setUTCDate(cursor.getUTCDate() + 1);
     }
 
+    const totalsFromDays = days.reduce(
+      (acc, day) => {
+        const leaveInfo = day.leaves;
+
+        if (!leaveInfo || leaveInfo.totalHours <= 0) {
+          return acc;
+        }
+
+        acc.leaveHours += leaveInfo.totalHours;
+
+        const hasPaidLeave = leaveInfo.entries.some((entry) => {
+          if (entry.state !== 'approved') {
+            return false;
+          }
+
+          const leaveTypeCode = (entry.leaveType.code ?? '').toLowerCase();
+          const leaveTypeName = (entry.leaveType.name ?? '').toLowerCase();
+
+          return !(
+            leaveTypeCode === 'lwp' ||
+            leaveTypeCode === 'comp_off' ||
+            leaveTypeName.includes('without pay') ||
+            leaveTypeName.includes('comp off')
+          );
+        });
+
+        if (hasPaidLeave) {
+          acc.paidLeaves += leaveInfo.totalHours / HOURS_PER_WORKING_DAY;
+        }
+
+        const hasLwpLeave = leaveInfo.entries.some((entry) => {
+          if (entry.state !== 'approved') {
+            return false;
+          }
+
+          const leaveTypeCode = (entry.leaveType.code ?? '').toLowerCase();
+          const leaveTypeName = (entry.leaveType.name ?? '').toLowerCase();
+
+          return (
+            leaveTypeCode === 'lwp' ||
+            leaveTypeName.includes('without pay')
+          );
+        });
+
+        if (hasLwpLeave) {
+          acc.lwpDays += leaveInfo.totalHours / HOURS_PER_WORKING_DAY;
+        }
+
+        const hasCompOffLeave = leaveInfo.entries.some((entry) => {
+          if (entry.state !== 'approved') {
+            return false;
+          }
+
+          const leaveTypeCode = (entry.leaveType.code ?? '').toLowerCase();
+          const leaveTypeName = (entry.leaveType.name ?? '').toLowerCase();
+
+          return (
+            leaveTypeCode === 'comp_off' ||
+            leaveTypeName.includes('comp off')
+          );
+        });
+
+        if (hasCompOffLeave) {
+          acc.totalCompOffLeaveTaken += leaveInfo.totalHours / HOURS_PER_WORKING_DAY;
+        }
+
+        return acc;
+      },
+      { paidLeaves: 0, leaveHours: 0, lwpDays: 0, totalCompOffLeaveTaken: 0 },
+    );
+
     // Get salary cycle label for display
     const cycleInfo = SalaryCycleUtil.getSalaryCycleForMonth(year, month);
 
@@ -1972,14 +2034,13 @@ export class TimesheetsService {
       totals: {
         totalHours: totalHoursFromPayableDays,
         totalWorkingDays: totalWorkingDaysFromPayableDays,
-        paidLeaves,
-        totalCompOffLeaveTaken,
+        paidLeaves: Number(totalsFromDays.paidLeaves.toFixed(2)),
+        totalCompOffLeaveTaken: Number(totalsFromDays.totalCompOffLeaveTaken.toFixed(2)),
         weekOffDays: weekOffDaysFromPayableDays,
         numOfWorkOnWeekendDays,
         totalPayableDays: totalPayableDaysFromPayableDays,
-        LWP: lwpDays,
+        LWP: Number(totalsFromDays.lwpDays.toFixed(2)),
         timesheetHours: Number(totalTimesheetHours.toFixed(2)),
-        leaveHours: Number(totalLeaveHours.toFixed(2)),
       },
       days,
     };
@@ -2186,16 +2247,12 @@ export class TimesheetsService {
                        request.leaveTypeName?.toLowerCase().includes('comp off');
       const isPaidLeave = !isLWP && !isCompOff;
 
-      // Count leave days based on leave hours (8h = 1 day, 4h = 0.5 day)
-      // Fallback to durationType/day count when hours are missing
-      let leaveDaysCount = 0;
-      if (requestHours > 0) {
-        leaveDaysCount = requestHours / HOURS_PER_WORKING_DAY;
-      } else if (request.durationType === 'half_day') {
-        leaveDaysCount = dayKeys.length * 0.5;
-      } else {
-        leaveDaysCount = dayKeys.length;
-      }
+      // Count leave days from the actual working days in this cycle.
+      const { leaveDaysCount } = this.getCycleLeaveMetrics({
+        dayCount: dayKeys.length,
+        durationType: request.durationType,
+        requestHours,
+      });
 
       if (isLWP) {
         lwpDays += leaveDaysCount;
@@ -2890,6 +2947,33 @@ export class TimesheetsService {
     );
   }
 
+  private getCycleLeaveMetrics(params: {
+    dayCount: number;
+    durationType: string | null | undefined;
+    requestHours: number;
+  }): { leaveDaysCount: number; hoursPerDay: number } {
+    const { dayCount, durationType, requestHours } = params;
+
+    if (durationType === 'half_day') {
+      return {
+        leaveDaysCount: dayCount * 0.5,
+        hoursPerDay: HALF_DAY_HOURS,
+      };
+    }
+
+    if (durationType === 'custom' && requestHours > 0) {
+      return {
+        leaveDaysCount: requestHours / HOURS_PER_WORKING_DAY,
+        hoursPerDay: dayCount > 0 ? requestHours / dayCount : 0,
+      };
+    }
+
+    return {
+      leaveDaysCount: dayCount,
+      hoursPerDay: HOURS_PER_WORKING_DAY,
+    };
+  }
+
   private async getApprovedLeaveBreakdownByUserForCycle(params: {
     userIds: number[];
     monthStart: Date;
@@ -2971,14 +3055,11 @@ export class TimesheetsService {
         continue;
       }
 
-      let leaveDaysCount = 0;
-      if (requestHours > 0) {
-        leaveDaysCount = requestHours / HOURS_PER_WORKING_DAY;
-      } else if (request.durationType === 'half_day') {
-        leaveDaysCount = dayKeys.length * 0.5;
-      } else {
-        leaveDaysCount = dayKeys.length;
-      }
+      const { leaveDaysCount } = this.getCycleLeaveMetrics({
+        dayCount: dayKeys.length,
+        durationType: request.durationType,
+        requestHours,
+      });
 
       const leaveTypeCode = request.leaveTypeCode ?? '';
       const leaveTypeName = request.leaveTypeName ?? '';
