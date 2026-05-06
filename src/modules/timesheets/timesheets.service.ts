@@ -3616,19 +3616,12 @@ export class TimesheetsService {
         );
 
       if (!targetTimesheet) {
-        // Create new timesheet for the target date
-        const [newTimesheet] = await db
-          .insert(timesheetsTable)
-          .values({
-            orgId,
-            userId: targetUserId,
-            workDate,
-            state: 'draft',
-            totalHours: '0',
-            submittedAt: now,
-          })
-          .returning({ id: timesheetsTable.id });
-        targetTimesheetId = newTimesheet.id;
+        // the entry remains on the same timesheet row (avoid creating duplicates).
+        await db
+          .update(timesheetsTable)
+          .set({ workDate, updatedAt: now })
+          .where(eq(timesheetsTable.id, existingEntry.timesheetId));
+        targetTimesheetId = existingEntry.timesheetId;
       } else {
         targetTimesheetId = targetTimesheet.id;
       }
