@@ -4724,34 +4724,43 @@ export class LeavesService {
     requestorUserId: number,
     actionTakerUserId: number,
   ): Promise<boolean> {
+    // Safety bounds: prevents runaway recursion on cyclic/invalid hierarchies.
+    // Keep this small; most org chains are shallow. If exceeded, authorization should fail closed.
+    const maxDepth = 50;
+
     const result = await tx.execute(sql`
-      WITH RECURSIVE "ManagerChain" AS (
-        -- 1. Base Case: Start with the employee (requestor)
+      WITH RECURSIVE
+      _settings AS (
+        SELECT set_config('statement_timeout', '2000ms', true) AS _ignored
+      ),
+      manager_chain AS (
         SELECT
-            "id",
-            "manager_id",
-            1 AS level
-        FROM "users"
-        WHERE "id" = ${requestorUserId}
+          u.id,
+          u.manager_id,
+          ARRAY[u.id] AS path,
+          1 AS depth
+        FROM users u
+        WHERE u.id = ${requestorUserId}
 
         UNION ALL
 
-        -- 2. Recursive Step: Move up the hierarchy
         SELECT
-            "u"."id",
-            "u"."manager_id",
-            "mc"."level" + 1
-        FROM "users" "u"
-        INNER JOIN "ManagerChain" "mc"
-            ON "u"."id" = "mc"."manager_id"
+          m.id,
+          m.manager_id,
+          mc.path || m.id,
+          mc.depth + 1
+        FROM manager_chain mc
+        JOIN users m
+          ON m.id = mc.manager_id
+        WHERE mc.manager_id IS NOT NULL
+          AND NOT (m.id = ANY(mc.path))
+          AND mc.depth < ${maxDepth}
       )
-      -- 3. Final Check: Is action-taker in this chain's list of managers?
-      -- We check the 'id' column because the chain includes the requestor themself.
       SELECT EXISTS (
-          SELECT 1
-          FROM "ManagerChain"
-          WHERE "id" = ${actionTakerUserId}
-      ) AS "is_authorized";
+        SELECT 1
+        FROM manager_chain
+        WHERE id = ${actionTakerUserId}
+      ) AS is_authorized;
     `);
 
     const isAuthorized = (result.rows[0] as { is_authorized: boolean })

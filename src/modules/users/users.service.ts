@@ -2,7 +2,7 @@ import { BadRequestException, ForbiddenException, Injectable, NotFoundException 
 import { Cron } from '@nestjs/schedule';
 import { JWT } from 'google-auth-library';
 import { createHash } from 'crypto';
-import { and, asc, count, desc, eq, ilike, inArray, isNotNull, isNull, or } from 'drizzle-orm';
+import { and, asc, count, desc, eq, ilike, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { DatabaseService } from '../../database/database.service';
@@ -639,6 +639,36 @@ export class UsersService {
 
     const updateStatements: Record<string, unknown> = {};
     if (payload.managerId !== undefined) {
+      if (payload.managerId === id) {
+        throw new BadRequestException('A user cannot be their own manager');
+      }
+
+      if (payload.managerId !== null) {
+        const [managerExists] = await db
+          .select({ id: usersTable.id })
+          .from(usersTable)
+          .where(eq(usersTable.id, payload.managerId))
+          .limit(1);
+
+        if (!managerExists) {
+          throw new NotFoundException(
+            `Manager with id ${payload.managerId} not found`,
+          );
+        }
+
+        const wouldCycle = await this.wouldCreateManagerCycle({
+          db,
+          employeeId: id,
+          newManagerId: payload.managerId,
+        });
+
+        if (wouldCycle) {
+          throw new BadRequestException(
+            'Invalid manager assignment: this would create a reporting cycle',
+          );
+        }
+      }
+
       updateStatements.managerId = payload.managerId;
     }
 
@@ -1364,6 +1394,49 @@ async syncManagerRolesCron() {
 
   private generatePlaceholderPassword(seed: string): string {
     return createHash('sha256').update(`navtrack:${seed}`).digest('hex');
+  }
+
+  private async wouldCreateManagerCycle(params: {
+    db: DatabaseService['connection'];
+    employeeId: number;
+    newManagerId: number;
+  }): Promise<boolean> {
+    const maxDepth = 100;
+
+    // Check if `employeeId` appears in the upward chain starting from `newManagerId`.
+    // If yes, setting employee.manager_id = newManagerId would create a cycle.
+    const result = await params.db.execute(sql`
+      WITH RECURSIVE manager_chain AS (
+        SELECT
+          u.id,
+          u.manager_id,
+          ARRAY[u.id] AS path,
+          1 AS depth
+        FROM users u
+        WHERE u.id = ${params.newManagerId}
+
+        UNION ALL
+
+        SELECT
+          m.id,
+          m.manager_id,
+          mc.path || m.id,
+          mc.depth + 1
+        FROM manager_chain mc
+        JOIN users m
+          ON m.id = mc.manager_id
+        WHERE mc.manager_id IS NOT NULL
+          AND NOT (m.id = ANY(mc.path))
+          AND mc.depth < ${maxDepth}
+      )
+      SELECT EXISTS (
+        SELECT 1
+        FROM manager_chain
+        WHERE id = ${params.employeeId}
+      ) AS would_cycle;
+    `);
+
+    return Boolean((result.rows[0] as { would_cycle: boolean } | undefined)?.would_cycle);
   }
 
   async updateUserRole(
