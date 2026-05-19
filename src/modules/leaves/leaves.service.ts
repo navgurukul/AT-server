@@ -122,6 +122,11 @@ const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 const HOURS_NEGATIVE_TOLERANCE = 1e-6;
 const COMP_OFF_LEAVE_CODE = "COMP_OFF";
 const LWP_LEAVE_CODE = "LWP";
+const ONE_DAY_NOTICE_MS = 24 * 60 * 60 * 1000;
+const CASUAL_OR_COMP_OFF_SHORT_RANGE_DAYS = 2;
+const CASUAL_OR_COMP_OFF_MEDIUM_RANGE_DAYS = 5;
+const CASUAL_OR_COMP_OFF_SHORT_NOTICE_DAYS = 1;
+const CASUAL_OR_COMP_OFF_MEDIUM_NOTICE_DAYS = 7;
 const TIMESHEET_HALF_DAY_MIN_HOURS = 3;
 const TIMESHEET_FULL_DAY_MIN_HOURS = 6;
 const COMP_OFF_FULL_DAY_HOURS = HOURS_PER_WORKING_DAY;
@@ -926,10 +931,49 @@ export class LeavesService {
           ? true
           : leaveType.requiresApproval;
       isPaidLeave = leaveType.paid ?? true;
-      
+
+      const isWellnessLeave =
+        leaveType.code === "wellness" ||
+        leaveType.code === "wellness_leave" ||
+        (leaveType.name?.toLowerCase().includes("wellness") ?? false);
+      const isCasualLeave =
+        leaveType.code === "casual" ||
+        leaveType.code === "casual_leave" ||
+        (leaveType.name?.toLowerCase().includes("casual") ?? false);
+      const isCompOffLeave =
+        leaveType.code === COMP_OFF_LEAVE_CODE ||
+        (leaveType.name?.toLowerCase().includes("comp off") ?? false);
+      const isAutoApproveEligibleCustomLeave = isCasualLeave || isCompOffLeave;
+      // Duration is the count of working days spanned (not hours-based)
+      const leaveDurationDays = workingDays;
+      const requestedAt = new Date();
+      const requestedAtUTC = this.normalizeDateUTC(requestedAt);
+      const startDateUTC = this.normalizeDateUTC(startDate);
+      const noticeDays = Math.floor(
+        (startDateUTC.getTime() - requestedAtUTC.getTime()) / ONE_DAY_NOTICE_MS
+      );
+      const isWithinShortAutoApprovalWindow =
+        leaveDurationDays >= 1 &&
+        leaveDurationDays <= CASUAL_OR_COMP_OFF_SHORT_RANGE_DAYS &&
+        noticeDays >= CASUAL_OR_COMP_OFF_SHORT_NOTICE_DAYS;
+      const isWithinMediumAutoApprovalWindow =
+        leaveDurationDays >= 3 &&
+        leaveDurationDays <= CASUAL_OR_COMP_OFF_MEDIUM_RANGE_DAYS &&
+        noticeDays >= CASUAL_OR_COMP_OFF_MEDIUM_NOTICE_DAYS;
+      const shouldAutoApproveCustomLeave =
+        isAutoApproveEligibleCustomLeave &&
+        (isWithinShortAutoApprovalWindow || isWithinMediumAutoApprovalWindow);
+      const isLWP =
+        leaveType.code === LWP_LEAVE_CODE ||
+        (leaveType.name?.toLowerCase().includes("without pay") ?? false);
+
+      const shouldAutoApprove =
+        isWellnessLeave ||
+        isLWP ||
+        shouldAutoApproveCustomLeave ||
+        (!isAutoApproveEligibleCustomLeave && isPaidLeave && !requiresApproval);
+
       // Check if this is an LWP (Leave Without Pay) leave type
-      const isLWP = leaveType.code === LWP_LEAVE_CODE || 
-                    (leaveType.name?.toLowerCase().includes('without pay') ?? false);
 
       if (isLWP) {
         const lwpBalance = await this.fetchLeaveBalanceSnapshot(
@@ -983,8 +1027,8 @@ export class LeavesService {
           halfDaySegment: requestedHalfDaySegment,
           hours: requestedHours.toString(),
           reason: payload.reason ?? null,
-          state: "pending",
-          requestedAt: new Date(),
+          state: shouldAutoApprove ? "approved" : "pending",
+          requestedAt,
         })
         .returning();
 
@@ -1004,11 +1048,33 @@ export class LeavesService {
             "Leave balance not found for user and leave type",
           );
         }
-        // For all paid leaves and LWP, move from balance to pending
+        // For all paid leaves and LWP, move from balance to the correct bucket.
         await this.updateLeaveBalanceFromSnapshot(tx, balanceSnapshot, {
           balanceHours: -requestedHours,
-          pendingHours: requestedHours,
+          ...(shouldAutoApprove
+            ? { bookedHours: requestedHours }
+            : { pendingHours: requestedHours }),
         });
+      }
+
+      // If the request was auto-approved, recalculate payable days for affected cycles
+      if (shouldAutoApprove) {
+        const now = new Date();
+        const affectedCycles = this.getCycleRangesForDateWindow(
+          new Date(startDate),
+          new Date(endDate),
+        );
+        for (const cycle of affectedCycles) {
+          await this.recalculateAndPersistPayableDaysForCycle(
+            tx,
+            orgId,
+            userId,
+            cycle.cycleStart,
+            cycle.cycleEnd,
+            cycle.cycleKey,
+            now,
+          );
+        }
       }
 
       return request;
@@ -1040,7 +1106,7 @@ export class LeavesService {
       endDate,
       durationType: requestedDurationType,
       halfDaySegment: requestedHalfDaySegment,
-      state: isPaidLeave ? (requiresApproval ? "pending" : "approved") : "pending",
+      state: request.state,
       userName: userInfo?.name ?? `User ${userId}`,
       userSlackId: userInfo?.slackId ?? null,
       userDiscordId: userInfo?.discordId ?? null,
@@ -1048,12 +1114,7 @@ export class LeavesService {
       reason: payload.reason ?? null,
     };
 
-    // Only send notification if leave is today or in the past
-    // Future leaves will be notified by the daily queue on their actual leave date
-    const today = this.normalizeDateUTC(new Date());
-    if (startDate.getTime() <= today.getTime()) {
-      await this.notifyLatestProjectSlackChannel(userId, orgId, notificationPayload);
-    }
+    await this.notifyLatestProjectSlackChannel(userId, orgId, notificationPayload);
 
     const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
     if (actorRole) {
@@ -3069,6 +3130,12 @@ export class LeavesService {
             "You are not in the reporting chain for this employee",
           );
         }
+        // Certain sensitive leave types must be reviewed only by admin/super_admin
+        if (this.isPrivilegedLeaveType(request.leaveTypeCode, request.leaveTypeName)) {
+          throw new ForbiddenException(
+            "Only admin or super_admin can approve or reject this leave"
+          );
+        }
       }
 
 
@@ -3328,6 +3395,10 @@ export class LeavesService {
 
         // Manager can only approve requests from their direct reports
         if (isManager && candidate.managerId === approver.id) {
+          // But some leave types are privileged and cannot be handled by managers
+          if (this.isPrivilegedLeaveType(candidate.leaveTypeCode, candidate.leaveTypeName)) {
+            return false;
+          }
           return true;
         }
 
@@ -3510,6 +3581,12 @@ export class LeavesService {
       return 'admin';
     }
     return null;
+  }
+
+  private isPrivilegedLeaveType(code?: string | null, name?: string | null): boolean {
+    const value = `${(code ?? '')} ${(name ?? '')}`.toLowerCase();
+    const privileged = ['maternity', 'parental', 'miscarriage', 'srs', 'adoption'];
+    return privileged.some((p) => value.includes(p));
   }
 
   private isAdminOrSuperAdmin(actor?: AuthenticatedUser): boolean {
@@ -4649,39 +4726,14 @@ export class LeavesService {
     );
 
     for (const leave of allLeaves) {
-      // Notify for the specific active day only (so multi-day leaves get
-      // a notification each day in their range). Preserve original range
-      // on the payload for reference.
-      const notificationDate = today; // normalized UTC date for "today"
       const payload = {
         leaveId: leave.id,
         userId: leave.userId,
         leaveTypeId: leave.leaveTypeId,
-        // Use the notification date as the start/end so renderer shows a
-        // single-date notification for that day
-        startDate: notificationDate,
-        endDate: notificationDate,
-        // keep original range for debugging/reference
-        originalStartDate: leave.startDate,
-        originalEndDate: leave.endDate,
-        reason: leave.reason,
+        startDate: leave.startDate,
+        endDate: leave.endDate,
+        reason: leave.reason
       };
-
-      // Fetch leave type name to handle special-case one-time notifications
-      const [ltRow] = await db
-        .select({ name: leaveTypesTable.name })
-        .from(leaveTypesTable)
-        .where(eq(leaveTypesTable.id, leave.leaveTypeId))
-        .limit(1);
-
-      const leaveTypeName = (ltRow?.name ?? '').toString().toLowerCase();
-
-      // For Maternity and Parental leaves, only notify on the first day
-      const isSingleNotifyType = leaveTypeName.includes('maternity') || leaveTypeName.includes('parental');
-      const leaveStartNorm = this.normalizeDateUTC(new Date(leave.startDate));
-      if (isSingleNotifyType && notificationDate.getTime() !== leaveStartNorm.getTime()) {
-        continue; // skip creating a notification for non-first days
-      }
 
       // check slack notification
       const slackExists = await db
