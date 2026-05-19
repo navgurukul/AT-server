@@ -1048,7 +1048,12 @@ export class LeavesService {
       reason: payload.reason ?? null,
     };
 
-    await this.notifyLatestProjectSlackChannel(userId, orgId, notificationPayload);
+    // Only send notification if leave is today or in the past
+    // Future leaves will be notified by the daily queue on their actual leave date
+    const today = this.normalizeDateUTC(new Date());
+    if (startDate.getTime() <= today.getTime()) {
+      await this.notifyLatestProjectSlackChannel(userId, orgId, notificationPayload);
+    }
 
     const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
     if (actorRole) {
@@ -4644,14 +4649,39 @@ export class LeavesService {
     );
 
     for (const leave of allLeaves) {
+      // Notify for the specific active day only (so multi-day leaves get
+      // a notification each day in their range). Preserve original range
+      // on the payload for reference.
+      const notificationDate = today; // normalized UTC date for "today"
       const payload = {
         leaveId: leave.id,
         userId: leave.userId,
         leaveTypeId: leave.leaveTypeId,
-        startDate: leave.startDate,
-        endDate: leave.endDate,
-        reason: leave.reason
+        // Use the notification date as the start/end so renderer shows a
+        // single-date notification for that day
+        startDate: notificationDate,
+        endDate: notificationDate,
+        // keep original range for debugging/reference
+        originalStartDate: leave.startDate,
+        originalEndDate: leave.endDate,
+        reason: leave.reason,
       };
+
+      // Fetch leave type name to handle special-case one-time notifications
+      const [ltRow] = await db
+        .select({ name: leaveTypesTable.name })
+        .from(leaveTypesTable)
+        .where(eq(leaveTypesTable.id, leave.leaveTypeId))
+        .limit(1);
+
+      const leaveTypeName = (ltRow?.name ?? '').toString().toLowerCase();
+
+      // For Maternity and Parental leaves, only notify on the first day
+      const isSingleNotifyType = leaveTypeName.includes('maternity') || leaveTypeName.includes('parental');
+      const leaveStartNorm = this.normalizeDateUTC(new Date(leave.startDate));
+      if (isSingleNotifyType && notificationDate.getTime() !== leaveStartNorm.getTime()) {
+        continue; // skip creating a notification for non-first days
+      }
 
       // check slack notification
       const slackExists = await db
