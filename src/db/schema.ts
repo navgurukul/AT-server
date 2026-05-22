@@ -62,6 +62,7 @@ export const compOffStatusEnum = pgEnum("comp_off_status", [
   "revoked",
   "availed",
   "partial_availed",
+  "warning",
 ]);
 
 export const decisionEnum = pgEnum("decision", [
@@ -419,6 +420,7 @@ export const compOffCredits = pgTable("comp_off_credits", {
     .notNull()
     .references(() => users.id),
   timesheetId: integer("timesheet_id").references(() => timesheets.id),
+  leaveRequestId: integer("leave_request_id").references(() => leaveRequests.id),
   workDate: date("work_date").notNull(),
   durationType: varchar("duration_type", { length: 20 }).notNull(),
   creditedHours: numeric("credited_hours", { precision: 5, scale: 2 }).notNull(),

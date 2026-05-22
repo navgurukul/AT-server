@@ -16,6 +16,7 @@ import {
   lt,
   sql,
   isNotNull,
+  isNull,
 } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 
@@ -33,6 +34,7 @@ import {
   rolesTable,
   timesheetEntriesTable,
   timesheetsTable,
+  orgHolidaysTable,
   userRoles,
   usersTable,
   users,
@@ -47,7 +49,7 @@ import { GrantCompOffDto } from "./dto/grant-comp-off.dto";
 import { RevokeCompOffDto } from "./dto/revoke-comp-off.dto";
 import { UpdateAllocatedLeaveDto } from "./dto/update-allocated-leave.dto";
 import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
-import { SalaryCycleUtil } from "../../common/utils/salary-cycle.util";
+import { SalaryCycleUtil } from "src/common/utils/salary-cycle.util";
 import { checkAdminSelfAction } from '../../common/utils/self-action.utils';
 
 interface ListLeaveRequestsParams {
@@ -59,7 +61,60 @@ interface ListLeaveRequestsParams {
 
 interface ListCompOffParams {
   userId?: number;
-  status?: "pending" | "granted" | "expired" | "revoked";
+  email?: string;
+  workDate?: string;
+  holidayType?: string;
+  status?:
+    | "pending"
+    | "granted"
+    | "expired"
+    | "revoked"
+    | "availed"
+    | "partial_availed"
+    | "warning";
+}
+
+interface CompOffCreditListRow {
+  id: number;
+  userId: number;
+  workDate: Date | string;
+  durationType: string;
+  creditedHours: number | string | null;
+  timesheetHours: number | string | null;
+  status: string;
+  expiresAt: Date | string;
+  leaveRequestId: number | null;
+}
+
+export interface MyCompOffCreditItem {
+  workDate: string | Date;
+  holidayType: string;
+  duration: "full_day" | "half_day" | string;
+  timesheetHours: number;
+  creditedHours: number;
+  availedDate: Date | string | null;
+  expireDate: Date | string;
+  status:
+    | "pending"
+    | "granted"
+    | "expired"
+    | "revoked"
+    | "availed"
+    | "partial_availed"
+    | "warning"
+    | string;
+}
+
+export interface MyCompOffCreditsSummary {
+  total: number;
+  active: number;
+  availed: number;
+  expired: number;
+}
+
+export interface MyCompOffCreditsResponse {
+  "comp-off": MyCompOffCreditsSummary;
+  credits: MyCompOffCreditItem[];
 }
 
 const HOURS_PER_WORKING_DAY = 8;
@@ -67,6 +122,13 @@ const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 const HOURS_NEGATIVE_TOLERANCE = 1e-6;
 const COMP_OFF_LEAVE_CODE = "COMP_OFF";
 const LWP_LEAVE_CODE = "LWP";
+const ONE_DAY_NOTICE_MS = 24 * 60 * 60 * 1000;
+const CASUAL_OR_COMP_OFF_SHORT_RANGE_DAYS = 2;
+const CASUAL_OR_COMP_OFF_MEDIUM_RANGE_DAYS = 5;
+const CASUAL_OR_COMP_OFF_SHORT_NOTICE_DAYS = 1;
+const CASUAL_OR_COMP_OFF_MEDIUM_NOTICE_DAYS = 7;
+const TIMESHEET_HALF_DAY_MIN_HOURS = 3;
+const TIMESHEET_FULL_DAY_MIN_HOURS = 6;
 const COMP_OFF_FULL_DAY_HOURS = HOURS_PER_WORKING_DAY;
 const COMP_OFF_HALF_DAY_HOURS = COMP_OFF_FULL_DAY_HOURS / 2;
 const COMP_OFF_EXPIRY_DAYS = 30;
@@ -98,23 +160,60 @@ export class LeavesService {
     tx: DatabaseService['connection'],
     userId: number,
     hoursToConsume: number,
+    leaveRequestId?: number,
+    leaveEndDate?: Date,
   ) {
-    const credits = await tx
+    const normalizedLeaveEndDate = leaveEndDate
+      ? this.normalizeDateUTC(leaveEndDate)
+      : null;
+    const activeCreditConditions = and(
+      eq(compOffCreditsTable.userId, userId),
+      inArray(compOffCreditsTable.status, ['granted', 'partial_availed', 'warning']),
+    );
+
+    const linkedCredits = leaveRequestId
+      ? await tx
+          .select()
+          .from(compOffCreditsTable)
+          .where(
+            and(
+              activeCreditConditions,
+              eq(compOffCreditsTable.leaveRequestId, leaveRequestId),
+            ),
+          )
+          .orderBy(compOffCreditsTable.workDate)
+      : [];
+
+    const unlinkedCredits = await tx
       .select()
       .from(compOffCreditsTable)
       .where(
         and(
-          eq(compOffCreditsTable.userId, userId),
-          inArray(compOffCreditsTable.status, ['granted', 'partial_availed']),
+          activeCreditConditions,
+          leaveRequestId
+            ? isNull(compOffCreditsTable.leaveRequestId)
+            : sql`true`,
         ),
       )
       .orderBy(compOffCreditsTable.workDate);
+
+    const credits = [...linkedCredits, ...unlinkedCredits];
 
     let remainingHoursToConsume = hoursToConsume;
 
     for (const credit of credits) {
       if (remainingHoursToConsume <= 0) {
         break;
+      }
+
+      if (
+        normalizedLeaveEndDate &&
+        !this.isCompOffCreditEligibleForLeaveDate(
+          credit.expiresAt,
+          normalizedLeaveEndDate,
+        )
+      ) {
+        continue;
       }
 
       const availableHours = Number(credit.creditedHours) - Number(credit.availedHours);
@@ -132,6 +231,7 @@ export class LeavesService {
           .set({
             availedHours: newAvailedHours.toString(),
             status: newStatus,
+            leaveRequestId: leaveRequestId ?? credit.leaveRequestId,
           })
           .where(eq(compOffCreditsTable.id, credit.id));
 
@@ -195,6 +295,109 @@ export class LeavesService {
     })
     .where(eq(compOffCreditsTable.id, grantedCredit.id));
     return true;
+  }
+
+  private async linkCompOffCreditsToLeaveRequest(
+    tx: DatabaseService['connection'],
+    userId: number,
+    hoursToLink: number,
+    leaveRequestId: number,
+    leaveEndDate: Date,
+  ) {
+    const normalizedLeaveEndDate = this.normalizeDateUTC(leaveEndDate);
+    const credits = await tx
+      .select()
+      .from(compOffCreditsTable)
+      .where(
+        and(
+          eq(compOffCreditsTable.userId, userId),
+          inArray(compOffCreditsTable.status, ['granted', 'partial_availed', 'warning']),
+          isNull(compOffCreditsTable.leaveRequestId),
+        ),
+      )
+      .orderBy(compOffCreditsTable.workDate);
+
+    let remainingHoursToLink = hoursToLink;
+    let skippedHoursDueToExpiry = 0;
+
+    for (const credit of credits) {
+      if (remainingHoursToLink <= 0) {
+        break;
+      }
+
+      if (
+        !this.isCompOffCreditEligibleForLeaveDate(
+          credit.expiresAt,
+          normalizedLeaveEndDate,
+        )
+      ) {
+        const availableHours =
+          Number(credit.creditedHours) - Number(credit.availedHours);
+        if (availableHours > 0) {
+          skippedHoursDueToExpiry += availableHours;
+        }
+        continue;
+      }
+
+      const availableHours = Number(credit.creditedHours) - Number(credit.availedHours);
+      const hoursToLinkNow = Math.min(remainingHoursToLink, availableHours);
+
+      if (hoursToLinkNow > 0) {
+        await tx
+          .update(compOffCreditsTable)
+          .set({
+            leaveRequestId,
+          })
+          .where(eq(compOffCreditsTable.id, credit.id));
+
+        remainingHoursToLink -= hoursToLinkNow;
+      }
+    }
+
+    if (remainingHoursToLink > 0) {
+      if (skippedHoursDueToExpiry > 0) {
+        throw new BadRequestException(
+          "Comp-off leave date must be on or before the credit expiry date."
+        );
+      }
+      throw new Error('Insufficient comp-off credits to link to leave request');
+    }
+  }
+
+  private async clearCompOffCreditLinks(
+    tx: DatabaseService['connection'],
+    leaveRequestId: number,
+  ) {
+    // Unlink comp-off credits from the leave request
+    await tx
+      .update(compOffCreditsTable)
+      .set({
+        leaveRequestId: null,
+      })
+      .where(eq(compOffCreditsTable.leaveRequestId, leaveRequestId));
+
+    // Now, for any affected credits, if expires_at is in the past and status is granted/partial_availed, set status to warning
+    const now = new Date();
+    const affectedCredits = await tx
+      .select({ id: compOffCreditsTable.id, expiresAt: compOffCreditsTable.expiresAt, status: compOffCreditsTable.status })
+      .from(compOffCreditsTable)
+      .where(
+        and(
+          isNull(compOffCreditsTable.leaveRequestId),
+          inArray(compOffCreditsTable.status, ['granted', 'partial_availed']),
+          lt(compOffCreditsTable.expiresAt, now),
+        )
+      );
+    if (affectedCredits.length > 0) {
+      const ids = affectedCredits.map(c => c.id);
+      await tx
+        .update(compOffCreditsTable)
+        .set({
+          status: 'warning',
+          updatedAt: now,
+        })
+        .where(inArray(compOffCreditsTable.id, ids));
+    }
   }
 
   async listBalances(userId: number) {
@@ -728,10 +931,66 @@ export class LeavesService {
           ? true
           : leaveType.requiresApproval;
       isPaidLeave = leaveType.paid ?? true;
-      
+
+      const isWellnessLeave =
+        leaveType.code === "wellness" ||
+        leaveType.code === "wellness_leave" ||
+        (leaveType.name?.toLowerCase().includes("wellness") ?? false);
+      const isCasualLeave =
+        leaveType.code === "casual" ||
+        leaveType.code === "casual_leave" ||
+        (leaveType.name?.toLowerCase().includes("casual") ?? false);
+      const isCompOffLeave =
+        leaveType.code === COMP_OFF_LEAVE_CODE ||
+        (leaveType.name?.toLowerCase().includes("comp off") ?? false);
+      const isAutoApproveEligibleCustomLeave = isCasualLeave || isCompOffLeave;
+      // Duration is the count of working days spanned (not hours-based)
+      const leaveDurationDays = workingDays;
+      const requestedAt = new Date();
+      const requestedAtUTC = this.normalizeDateUTC(requestedAt);
+      const startDateUTC = this.normalizeDateUTC(startDate);
+      const noticeDays = Math.floor(
+        (startDateUTC.getTime() - requestedAtUTC.getTime()) / ONE_DAY_NOTICE_MS
+      );
+      const isWithinShortAutoApprovalWindow =
+        leaveDurationDays >= 1 &&
+        leaveDurationDays <= CASUAL_OR_COMP_OFF_SHORT_RANGE_DAYS &&
+        noticeDays >= CASUAL_OR_COMP_OFF_SHORT_NOTICE_DAYS;
+      const isWithinMediumAutoApprovalWindow =
+        leaveDurationDays >= 3 &&
+        leaveDurationDays <= CASUAL_OR_COMP_OFF_MEDIUM_RANGE_DAYS &&
+        noticeDays >= CASUAL_OR_COMP_OFF_MEDIUM_NOTICE_DAYS;
+      const shouldAutoApproveCustomLeave =
+        isAutoApproveEligibleCustomLeave &&
+        (isWithinShortAutoApprovalWindow || isWithinMediumAutoApprovalWindow);
+      const isLWP =
+        leaveType.code === LWP_LEAVE_CODE ||
+        (leaveType.name?.toLowerCase().includes("without pay") ?? false);
+
+      const shouldAutoApprove =
+        isWellnessLeave ||
+        isLWP ||
+        shouldAutoApproveCustomLeave ||
+        (!isAutoApproveEligibleCustomLeave && isPaidLeave && !requiresApproval);
+
       // Check if this is an LWP (Leave Without Pay) leave type
-      const isLWP = leaveType.code === LWP_LEAVE_CODE || 
-                    (leaveType.name?.toLowerCase().includes('without pay') ?? false);
+
+      if (isLWP) {
+        const lwpBalance = await this.fetchLeaveBalanceSnapshot(
+          tx,
+          userId,
+          payload.leaveTypeId,
+        );
+
+        if (
+          lwpBalance.balanceHours <= 0 ||
+          requestedHours > lwpBalance.balanceHours
+        ) {
+          throw new BadRequestException(
+            'Insufficient LWP balance. You cannot apply for more than your available balance.',
+          );
+        }
+      }
 
       let balanceSnapshot: LeaveBalanceSnapshot | null = null;
       // Track balance for both paid leaves and LWP
@@ -768,10 +1027,20 @@ export class LeavesService {
           halfDaySegment: requestedHalfDaySegment,
           hours: requestedHours.toString(),
           reason: payload.reason ?? null,
-          state: "pending",
-          requestedAt: new Date(),
+          state: shouldAutoApprove ? "approved" : "pending",
+          requestedAt,
         })
         .returning();
+
+      if (leaveType.code === COMP_OFF_LEAVE_CODE) {
+        await this.linkCompOffCreditsToLeaveRequest(
+          tx,
+          userId,
+          requestedHours,
+          request.id,
+          endDate,
+        );
+      }
 
       if (isPaidLeave || isLWP) {
         if (!balanceSnapshot) {
@@ -779,11 +1048,33 @@ export class LeavesService {
             "Leave balance not found for user and leave type",
           );
         }
-        // For all paid leaves and LWP, move from balance to pending
+        // For all paid leaves and LWP, move from balance to the correct bucket.
         await this.updateLeaveBalanceFromSnapshot(tx, balanceSnapshot, {
           balanceHours: -requestedHours,
-          pendingHours: requestedHours,
+          ...(shouldAutoApprove
+            ? { bookedHours: requestedHours }
+            : { pendingHours: requestedHours }),
         });
+      }
+
+      // If the request was auto-approved, recalculate payable days for affected cycles
+      if (shouldAutoApprove) {
+        const now = new Date();
+        const affectedCycles = this.getCycleRangesForDateWindow(
+          new Date(startDate),
+          new Date(endDate),
+        );
+        for (const cycle of affectedCycles) {
+          await this.recalculateAndPersistPayableDaysForCycle(
+            tx,
+            orgId,
+            userId,
+            cycle.cycleStart,
+            cycle.cycleEnd,
+            cycle.cycleKey,
+            now,
+          );
+        }
       }
 
       return request;
@@ -815,7 +1106,7 @@ export class LeavesService {
       endDate,
       durationType: requestedDurationType,
       halfDaySegment: requestedHalfDaySegment,
-      state: isPaidLeave ? (requiresApproval ? "pending" : "approved") : "pending",
+      state: request.state,
       userName: userInfo?.name ?? `User ${userId}`,
       userSlackId: userInfo?.slackId ?? null,
       userDiscordId: userInfo?.discordId ?? null,
@@ -1576,16 +1867,21 @@ export class LeavesService {
           ? Number(targetUser.managerId)
           : null;
 
-      const isAuthorized = await this.isManagerInHierarchy(
-        tx,
-        targetUser.id,
-        actor.id,
-      );
+      let isAuthorized = false;
+      if (this.hasOrgWideCompOffAccess(actor)) {
+        isAuthorized = true;
+      } else {
+        isAuthorized = await this.isManagerInHierarchy(
+          tx,
+          targetUser.id,
+          actor.id,
+        );
+      }
 
       // Admin/SuperAdmin can raise for all employees; managers only for their reports
-      if (!this.hasOrgWideCompOffAccess(actor) && !isAuthorized) {
+      if (!isAuthorized) {
         throw new ForbiddenException(
-          "Only administrators or a manager in the reporting chain can authorize off-day work for an employee",
+          'Only administrators or a manager in the reporting chain can authorize off-day work for an employee',
         );
       }
 
@@ -1836,51 +2132,262 @@ export class LeavesService {
     params: ListCompOffParams = {}
   ) {
     const db = this.database.connection;
-    const targetUserId = params.userId ?? actor.id;
+    const normalizedEmail = params.email?.trim().toLowerCase() || undefined;
+    if (params.userId !== undefined) {
+      const [targetUser] = await db
+        .select({
+          id: usersTable.id,
+          orgId: usersTable.orgId,
+          managerId: usersTable.managerId,
+          email: usersTable.email,
+        })
+        .from(usersTable)
+        .where(eq(usersTable.id, params.userId))
+        .limit(1);
 
-    const [targetUser] = await db
-      .select({
-        id: usersTable.id,
-        orgId: usersTable.orgId,
-        managerId: usersTable.managerId,
-        name: usersTable.name,
-      })
-      .from(usersTable)
-      .where(eq(usersTable.id, targetUserId))
-      .limit(1);
+      if (!targetUser || Number(targetUser.orgId) !== actor.orgId) {
+        throw new NotFoundException("User not found in this organisation");
+      }
 
-    if (!targetUser || Number(targetUser.orgId) !== actor.orgId) {
-      throw new NotFoundException("User not found in this organisation");
+      if (
+        normalizedEmail &&
+        targetUser.email.trim().toLowerCase() !== normalizedEmail
+      ) {
+        return {
+          user: {
+            id: targetUser.id,
+            email: targetUser.email,
+            managerId:
+              targetUser.managerId !== null && targetUser.managerId !== undefined
+                ? Number(targetUser.managerId)
+                : null,
+          },
+          credits: [],
+        };
+      }
+
+      const isSelf = targetUser.id === actor.id;
+      if (!isSelf && !this.hasOrgWideCompOffAccess(actor)) {
+        if (!this.isReportingManager(actor)) {
+          throw new ForbiddenException(
+            "You do not have permission to view comp-off credits for this user"
+          );
+        }
+
+        const canViewTargetUser = this.isDirectReport(targetUser.managerId, actor.id);
+
+        if (!canViewTargetUser) {
+          throw new ForbiddenException(
+            "Managers can only view comp-off credits for their mentees"
+          );
+        }
+      }
+
+      const rows = await this.fetchCompOffCreditRows(actor.orgId, [targetUser.id], params.status);
+      const credits = this.filterCompOffCreditsBySearch(
+        await this.mapCreditsToMyCompOffResponse(actor, rows),
+        {
+          workDate: params.workDate,
+          holidayType: params.holidayType,
+        }
+      );
+
+      return {
+        user: {
+          id: targetUser.id,
+          email: targetUser.email,
+          managerId:
+            targetUser.managerId !== null && targetUser.managerId !== undefined
+              ? Number(targetUser.managerId)
+              : null,
+        },
+        credits,
+      };
     }
 
-    const isSelf = targetUser.id === actor.id;
-    if (!isSelf && !this.canAccessOtherCompOff(actor, targetUser)) {
+    const hasOrgWideAccess = this.hasOrgWideCompOffAccess(actor);
+    const isManager = this.isReportingManager(actor);
+
+    if (!hasOrgWideAccess && !isManager) {
       throw new ForbiddenException(
-        "You do not have permission to view comp-off credits for this user"
+        "You do not have permission to view comp-off credits for other users"
       );
     }
 
+    const users = await db
+      .select({
+        id: usersTable.id,
+        email: usersTable.email,
+        managerId: usersTable.managerId,
+      })
+      .from(usersTable)
+      .where(
+        and(
+          eq(usersTable.orgId, actor.orgId),
+          sql`${usersTable.id} <> ${actor.id}`
+        )
+      );
+
+    if (users.length === 0) {
+      return { users: [] };
+    }
+
+    let visibleUsers = users;
+
+    if (!hasOrgWideAccess) {
+      visibleUsers = users.filter((user) =>
+        this.isDirectReport(user.managerId, actor.id)
+      );
+    }
+
+    if (normalizedEmail) {
+      visibleUsers = visibleUsers.filter((user) =>
+        user.email.trim().toLowerCase().includes(normalizedEmail)
+      );
+    }
+
+    if (visibleUsers.length === 0) {
+      return { users: [] };
+    }
+
+    const userIds = visibleUsers.map(user => user.id);
+    const rows = await this.fetchCompOffCreditRows(actor.orgId, userIds, params.status);
+
+    const rowsByUserId = new Map<number, CompOffCreditListRow[]>();
+    for (const row of rows) {
+      const existingRows = rowsByUserId.get(row.userId) ?? [];
+      existingRows.push(row);
+      rowsByUserId.set(row.userId, existingRows);
+    }
+
+    const userCredits = await Promise.all(
+      visibleUsers.map(async (user) => ({
+        user: {
+          id: user.id,
+          email: user.email,
+          managerId:
+            user.managerId !== null && user.managerId !== undefined
+              ? Number(user.managerId)
+              : null,
+        },
+        credits: await this.mapCreditsToMyCompOffResponse(
+          actor,
+          rowsByUserId.get(user.id) ?? []
+        ),
+      }))
+    );
+
+    return {
+      users: userCredits.map((entry) => ({
+        ...entry,
+        credits: this.filterCompOffCreditsBySearch(entry.credits, {
+          workDate: params.workDate,
+          holidayType: params.holidayType,
+        }),
+      })),
+    };
+  }
+
+  async listMyCompOffCredits(
+    actor: AuthenticatedUser,
+    filters?: {
+      workDate?: string;
+      holidayType?: string;
+      status?: ListCompOffParams["status"];
+    }
+  ): Promise<MyCompOffCreditsResponse> {
+    const credits = await this.fetchCompOffCreditRows(actor.orgId, [actor.id]);
+    let results = await this.mapCreditsToMyCompOffResponse(actor, credits);
+    results = this.filterCompOffCreditsBySearch(results, filters ?? {});
+
+    const nonPendingCount = results.filter((c) => c.status !== "pending").length;
+    const statusTotals = this.buildCompOffStatusTotals(results);
+
+    return {
+      "comp-off": {
+        total: nonPendingCount,
+        ...statusTotals,
+      },
+      credits: results,
+    };
+  }
+
+  private buildCompOffStatusTotals(
+    credits: MyCompOffCreditItem[]
+  ): Omit<MyCompOffCreditsSummary, "total"> {
+    const totals: Record<string, number> = {
+      active: 0,
+      availed: 0,
+      expired: 0,
+    };
+
+    for (const credit of credits) {
+      if (credit.status === "pending") {
+        continue;
+      }
+
+      const durationValue = credit.duration === "half_day" ? 0.5 : 1;
+
+      switch (credit.status) {
+        case "granted":
+        case "warning":
+          totals.active += durationValue;
+          break;
+        case "partial_availed":
+          totals.active += durationValue * 0.5;
+          totals.availed += durationValue * 0.5;
+          break;
+        case "availed":
+          totals.availed += durationValue;
+          break;
+        case "expired":
+          totals.expired += durationValue;
+          break;
+        case "revoked":
+          // revoked doesn't count toward any summary
+          break;
+      }
+    }
+
+    // Round to 1 decimal place for cleaner output
+    return {
+      active: Math.round(totals.active * 10) / 10,
+      availed: Math.round(totals.availed * 10) / 10,
+      expired: Math.round(totals.expired * 10) / 10,
+    };
+  }
+
+  private async fetchCompOffCreditRows(
+    orgId: number,
+    userIds: number[],
+    status?: ListCompOffParams["status"]
+  ): Promise<CompOffCreditListRow[]> {
+    if (userIds.length === 0) {
+      return [];
+    }
+
+    const db = this.database.connection;
     const filters = [
-      eq(compOffCreditsTable.orgId, actor.orgId),
-      eq(compOffCreditsTable.userId, targetUser.id),
+      eq(compOffCreditsTable.orgId, orgId),
+      inArray(compOffCreditsTable.userId, userIds),
     ];
 
-    if (params.status) {
-      filters.push(eq(compOffCreditsTable.status, params.status));
+    if (status) {
+      filters.push(eq(compOffCreditsTable.status, status));
     }
 
     const rows = await db
       .select({
         id: compOffCreditsTable.id,
+        userId: compOffCreditsTable.userId,
         workDate: compOffCreditsTable.workDate,
         durationType: compOffCreditsTable.durationType,
         creditedHours: compOffCreditsTable.creditedHours,
         timesheetHours: compOffCreditsTable.timesheetHours,
         status: compOffCreditsTable.status,
         expiresAt: compOffCreditsTable.expiresAt,
-        notes: compOffCreditsTable.notes,
+        leaveRequestId: compOffCreditsTable.leaveRequestId,
         createdAt: compOffCreditsTable.createdAt,
-        updatedAt: compOffCreditsTable.updatedAt,
       })
       .from(compOffCreditsTable)
       .where(and(...filters))
@@ -1889,28 +2396,177 @@ export class LeavesService {
         desc(compOffCreditsTable.createdAt)
       );
 
-    return {
-      user: {
-        id: targetUser.id,
-        name: targetUser.name,
-        managerId:
-          targetUser.managerId !== null && targetUser.managerId !== undefined
-            ? Number(targetUser.managerId)
-            : null,
-      },
-      credits: rows.map((row) => ({
-        id: row.id,
-        workDate: row.workDate,
-        durationType: row.durationType,
-        creditedHours: Number(row.creditedHours ?? 0),
-        timesheetHours: Number(row.timesheetHours ?? 0),
-        status: row.status,
-        expiresAt: row.expiresAt,
-        notes: row.notes ?? null,
-        createdAt: row.createdAt,
-        updatedAt: row.updatedAt,
-      })),
-    };
+    return rows.map((row) => ({
+      id: row.id,
+      userId: Number(row.userId),
+      workDate: row.workDate,
+      durationType: row.durationType,
+      creditedHours: row.creditedHours,
+      timesheetHours: row.timesheetHours,
+      status: row.status,
+      expiresAt: row.expiresAt,
+      leaveRequestId: row.leaveRequestId,
+    }));
+  }
+
+  private async mapCreditsToMyCompOffResponse(
+    actor: AuthenticatedUser,
+    credits: CompOffCreditListRow[]
+  ): Promise<MyCompOffCreditItem[]> {
+    const db = this.database.connection;
+
+    const workDateKeys = Array.from(
+      new Set(
+        credits.map((credit) =>
+          this.formatDateKey(this.normalizeDateUTC(new Date(credit.workDate)))
+        )
+      )
+    );
+
+    const holidayNameByDate = new Map<string, string>();
+
+    if (workDateKeys.length > 0) {
+      const holidayRows = await db
+        .select({
+          date: orgHolidaysTable.date,
+          isWorkingDay: orgHolidaysTable.isWorkingDay,
+          name: orgHolidaysTable.name,
+        })
+        .from(orgHolidaysTable)
+        .where(
+          and(
+            eq(orgHolidaysTable.orgId, actor.orgId),
+            inArray(orgHolidaysTable.date, workDateKeys)
+          )
+        );
+
+      for (const holiday of holidayRows) {
+        if (!holiday.isWorkingDay && holiday.name) {
+          const key = this.formatDateKey(this.normalizeDateUTC(new Date(holiday.date)));
+          holidayNameByDate.set(key, holiday.name);
+        }
+      }
+    }
+
+    const leaveRequestIds = credits
+      .map((credit) => credit.leaveRequestId)
+      .filter((id): id is number => id !== null && id !== undefined);
+
+    const leaveRequestDateById = new Map<number, { startDate: Date; endDate: Date }>();
+
+    if (leaveRequestIds.length > 0) {
+      const leaveRows = await db
+        .select({
+          id: leaveRequestsTable.id,
+          startDate: leaveRequestsTable.startDate,
+          endDate: leaveRequestsTable.endDate,
+        })
+        .from(leaveRequestsTable)
+        .where(inArray(leaveRequestsTable.id, leaveRequestIds));
+
+      for (const leave of leaveRows) {
+        const normalizedStartDate = this.normalizeDateUTC(new Date(leave.startDate));
+        const normalizedEndDate = this.normalizeDateUTC(new Date(leave.endDate));
+        leaveRequestDateById.set(leave.id, {
+          startDate: normalizedStartDate,
+          endDate: normalizedEndDate,
+        });
+      }
+    }
+
+    const availedDateByCreditId = new Map<number, Date>();
+    const creditsByLeaveRequestId = new Map<number, typeof credits>();
+
+    for (const credit of credits) {
+      if (!credit.leaveRequestId) {
+        continue;
+      }
+      const existingCredits = creditsByLeaveRequestId.get(credit.leaveRequestId) ?? [];
+      existingCredits.push(credit);
+      creditsByLeaveRequestId.set(credit.leaveRequestId, existingCredits);
+    }
+
+    for (const [leaveRequestId, linkedCredits] of creditsByLeaveRequestId.entries()) {
+      const requestDates = leaveRequestDateById.get(leaveRequestId);
+      if (!requestDates) {
+        continue;
+      }
+
+      const sortedCredits = [...linkedCredits].sort((a, b) => {
+        const workDateA = this.normalizeDateUTC(new Date(a.workDate)).getTime();
+        const workDateB = this.normalizeDateUTC(new Date(b.workDate)).getTime();
+        if (workDateA !== workDateB) {
+          return workDateA - workDateB;
+        }
+        return a.id - b.id;
+      });
+
+      const maxOffset = Math.max(
+        0,
+        Math.floor(
+          (requestDates.endDate.getTime() - requestDates.startDate.getTime()) /
+            (24 * 60 * 60 * 1000)
+        )
+      );
+
+      sortedCredits.forEach((credit, index) => {
+        const dayOffset = Math.min(index, maxOffset);
+        const availedDate = new Date(requestDates.startDate);
+        availedDate.setUTCDate(availedDate.getUTCDate() + dayOffset);
+        availedDateByCreditId.set(credit.id, availedDate);
+      });
+    }
+
+    return credits.map((credit) => ({
+      workDate: credit.workDate,
+      holidayType: this.getHolidayType(
+        credit.workDate,
+        holidayNameByDate.get(
+          this.formatDateKey(this.normalizeDateUTC(new Date(credit.workDate)))
+        )
+      ),
+      duration: credit.durationType,
+      timesheetHours: Number(credit.timesheetHours ?? 0),
+      creditedHours: Number(credit.creditedHours ?? 0),
+      availedDate: availedDateByCreditId.get(credit.id) ?? null,
+      expireDate: credit.expiresAt,
+      status: credit.status,
+    }));
+  }
+
+  private filterCompOffCreditsBySearch(
+    credits: MyCompOffCreditItem[],
+    filters: {
+      workDate?: string;
+      holidayType?: string;
+      status?: ListCompOffParams["status"];
+    }
+  ): MyCompOffCreditItem[] {
+    let results = credits;
+
+    if (filters.workDate) {
+      const filterDate = this.formatDateKey(
+        this.normalizeDateUTC(new Date(filters.workDate))
+      );
+      results = results.filter(
+        (item) =>
+          this.formatDateKey(this.normalizeDateUTC(new Date(item.workDate))) ===
+          filterDate
+      );
+    }
+
+    if (filters.holidayType) {
+      const searchType = filters.holidayType.toLowerCase();
+      results = results.filter((item) =>
+        item.holidayType.toLowerCase().includes(searchType)
+      );
+    }
+
+    if (filters.status) {
+      results = results.filter((item) => item.status === filters.status);
+    }
+
+    return results;
   }
 
   async revokeCompOffCredit(
@@ -2474,6 +3130,12 @@ export class LeavesService {
             "You are not in the reporting chain for this employee",
           );
         }
+        // Certain sensitive leave types must be reviewed only by admin/super_admin
+        if (this.isPrivilegedLeaveType(request.leaveTypeCode, request.leaveTypeName)) {
+          throw new ForbiddenException(
+            "Only admin or super_admin can approve or reject this leave"
+          );
+        }
       }
 
 
@@ -2535,13 +3197,23 @@ export class LeavesService {
       if (shouldAdjustBalance) {
         if (action === "approve") {
           if (request.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
-            await this.consumeCompOffCredits(tx, request.userId, requestedHours);
+            await this.consumeCompOffCredits(
+              tx,
+              request.userId,
+              requestedHours,
+              request.id,
+              new Date(request.endDate),
+            );
           }
           await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
             pendingHours: -requestedHours,
             bookedHours: requestedHours,
           });
         } else if (previousState === "pending") {
+          if (request.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
+            await this.clearCompOffCreditLinks(tx, request.id);
+          }
+          // If leave was pending and is now rejected, move hours back to balance
           await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
             pendingHours: -requestedHours,
             balanceHours: requestedHours,
@@ -2552,6 +3224,13 @@ export class LeavesService {
             balanceHours: requestedHours,
           });
         }
+      }
+
+      if (
+        action === "reject" &&
+        request.leaveTypeCode === COMP_OFF_LEAVE_CODE
+      ) {
+        await this.clearCompOffCreditLinks(tx, request.id);
       }
 
       if (actorRole) {
@@ -2716,6 +3395,10 @@ export class LeavesService {
 
         // Manager can only approve requests from their direct reports
         if (isManager && candidate.managerId === approver.id) {
+          // But some leave types are privileged and cannot be handled by managers
+          if (this.isPrivilegedLeaveType(candidate.leaveTypeCode, candidate.leaveTypeName)) {
+            return false;
+          }
           return true;
         }
 
@@ -2900,6 +3583,12 @@ export class LeavesService {
     return null;
   }
 
+  private isPrivilegedLeaveType(code?: string | null, name?: string | null): boolean {
+    const value = `${(code ?? '')} ${(name ?? '')}`.toLowerCase();
+    const privileged = ['maternity', 'parental', 'miscarriage', 'srs', 'adoption'];
+    return privileged.some((p) => value.includes(p));
+  }
+
   private isAdminOrSuperAdmin(actor?: AuthenticatedUser): boolean {
     if (!actor) {
       return false;
@@ -3026,17 +3715,16 @@ export class LeavesService {
     endDate: Date,
     requestedDurationType: "half_day" | "full_day" | "custom"
   ): Promise<boolean> {
-    // Half-day leave can coexist with timesheets (other half worked).
-    if (requestedDurationType === "half_day") {
-      return false;
-    }
-
     const db = this.database.connection;
     const start = this.normalizeDateUTC(startDate);
     const end = this.normalizeDateUTC(endDate);
 
     const rows = await db
-      .select({ id: timesheetsTable.id })
+      .select({ 
+        id: timesheetsTable.id,
+        totalHours: timesheetsTable.totalHours,
+        workDate: timesheetsTable.workDate,
+      })
       .from(timesheetsTable)
       .where(
         and(
@@ -3045,10 +3733,23 @@ export class LeavesService {
           gte(timesheetsTable.workDate, start),
           lte(timesheetsTable.workDate, end)
         )
-      )
-      .limit(1);
+      );
 
-    return rows.length > 0;
+    if (rows.length === 0) {
+      return false;
+    }
+
+    // For full-day or custom leaves, any timesheet is blocking
+    if (requestedDurationType !== "half_day") {
+      return true;
+    }
+
+    // For half-day leaves, only block if timesheet is a full day (>= 6 hours)
+    // 3 to less than 6 hours is treated as a half day and can coexist.
+    return rows.some((row) => {
+      const timesheetHours = parseFloat(row.totalHours.toString());
+      return timesheetHours >= TIMESHEET_FULL_DAY_MIN_HOURS - HOURS_NEGATIVE_TOLERANCE;
+    });
   }
 
   private normalizeHours(value: number): number {
@@ -3231,6 +3932,17 @@ export class LeavesService {
     return (actor.roles ?? []).some((role) => privilegedRoles.has(role));
   }
 
+  private isDirectReport(
+    managerId: number | null | undefined,
+    actorId: number
+  ): boolean {
+    return (
+      managerId !== null &&
+      managerId !== undefined &&
+      Number(managerId) === actorId
+    );
+  }
+
   private isReportingManager(actor: AuthenticatedUser): boolean {
     const managerRoles = new Set(["manager", "reporting_manager"]);
     return (actor.roles ?? []).some((role) => managerRoles.has(role));
@@ -3404,31 +4116,75 @@ export class LeavesService {
     if (!balance) {
       return;
     }
-
-    await this.expireStaleCompOffCredits(tx, orgId, userId, leaveTypeId, new Date());
+    
+    await this.expireGrantedCompOffCredits(tx, orgId, userId, new Date());
+    await this.expireStaleCompOffCredits(tx, orgId, userId, new Date());
   }
 
-  private async expireStaleCompOffCredits(
-    tx: DatabaseService["connection"],
+  /**
+   * Change status from 'granted' to 'warning' when expiresAt is passed
+   */
+  private async expireGrantedCompOffCredits(
+    tx: DatabaseService['connection'],
     orgId: number,
     userId: number,
-    leaveTypeId: number,
     referenceDate: Date
   ) {
     const credits = await tx
       .select({
         id: compOffCreditsTable.id,
-        creditedHours: compOffCreditsTable.creditedHours,
-        availedHours: compOffCreditsTable.availedHours,
-        status: compOffCreditsTable.status,
       })
       .from(compOffCreditsTable)
       .where(
         and(
           eq(compOffCreditsTable.orgId, orgId),
           eq(compOffCreditsTable.userId, userId),
-          inArray(compOffCreditsTable.status, ["granted", "partial_availed"]),
-          lt(compOffCreditsTable.expiresAt, referenceDate)
+          inArray(compOffCreditsTable.status, ['granted', 'partial_availed']),
+          lt(compOffCreditsTable.expiresAt, referenceDate),
+          isNull(compOffCreditsTable.leaveRequestId)
+        )
+      );
+
+    if (credits.length === 0) {
+      return;
+    }
+
+    const creditIds = credits.map(c => c.id);
+    await tx
+      .update(compOffCreditsTable)
+      .set({
+        status: 'warning',
+        updatedAt: referenceDate,
+      })
+      .where(inArray(compOffCreditsTable.id, creditIds));
+  }
+
+  private async expireStaleCompOffCredits(
+    tx: DatabaseService["connection"],
+    orgId: number,
+    userId: number,
+    referenceDate: Date
+  ) {
+    // Fetch leaveTypeId inside this function
+    const leaveTypeId = await this.findCompOffLeaveTypeId(tx, orgId);
+    if (!leaveTypeId) return;
+
+    const credits = await tx
+      .select({
+        id: compOffCreditsTable.id,
+        creditedHours: compOffCreditsTable.creditedHours,
+        availedHours: compOffCreditsTable.availedHours,
+        status: compOffCreditsTable.status,
+        expiresAt: compOffCreditsTable.expiresAt,
+      })
+      .from(compOffCreditsTable)
+      .where(
+        and(
+          eq(compOffCreditsTable.orgId, orgId),
+          eq(compOffCreditsTable.userId, userId),
+          eq(compOffCreditsTable.status, "warning"),
+          // Linked warning credits should stay warning and not auto-expire.
+          isNull(compOffCreditsTable.leaveRequestId),
         )
       );
 
@@ -3443,26 +4199,32 @@ export class LeavesService {
     );
 
     for (const credit of credits) {
-      const creditedHours = Number(credit.creditedHours ?? 0);
-      const availedHours = Number(credit.availedHours ?? 0);
-      const remainingHours = Math.max(0, creditedHours - availedHours);
+      // Compute salary cycle end for this credit's expiry date.
+      const expiryDate = new Date(credit.expiresAt as string | Date);
+      const { cycleEnd } = this.getCycleRangeForWorkDate(expiryDate);
+      // Only expire if referenceDate (now) > cycleEnd
+      if (referenceDate > cycleEnd) {
+        const creditedHours = Number(credit.creditedHours ?? 0);
+        const availedHours = Number(credit.availedHours ?? 0);
+        const remainingHours = Math.max(0, creditedHours - availedHours);
 
-      if (remainingHours > 0 && snapshot.balanceHours > 0) {
-        const deduction = Math.min(snapshot.balanceHours, remainingHours);
-        if (deduction > 0) {
-          snapshot = await this.updateLeaveBalanceFromSnapshot(tx, snapshot, {
-            balanceHours: -deduction,
-          });
+        if (remainingHours > 0 && snapshot.balanceHours > 0) {
+          const deduction = Math.min(snapshot.balanceHours, remainingHours);
+          if (deduction > 0) {
+            snapshot = await this.updateLeaveBalanceFromSnapshot(tx, snapshot, {
+              balanceHours: -deduction,
+            });
+          }
         }
-      }
 
-      await tx
-        .update(compOffCreditsTable)
-        .set({
-          status: "expired",
-          updatedAt: referenceDate,
-        })
-        .where(eq(compOffCreditsTable.id, credit.id));
+        await tx
+          .update(compOffCreditsTable)
+          .set({
+            status: "expired",
+            updatedAt: referenceDate,
+          })
+          .where(eq(compOffCreditsTable.id, credit.id));
+      }
     }
   }
 
@@ -3470,6 +4232,16 @@ export class LeavesService {
     return new Date(
       Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
     );
+  }
+
+  private isCompOffCreditEligibleForLeaveDate(
+    creditExpiresAt: Date | string,
+    leaveDate: Date,
+  ): boolean {
+    const normalizedCreditExpiryDate = this.normalizeDateUTC(
+      new Date(creditExpiresAt),
+    );
+    return normalizedCreditExpiryDate >= leaveDate;
   }
 
   private calculateCompOffExpiryAt(workDate: Date | string): Date {
@@ -3482,6 +4254,40 @@ export class LeavesService {
 
   private formatDateKey(date: Date): string {
     return date.toISOString().slice(0, 10);
+  }
+
+  private getWeekdayName(workDate: string | Date): string {
+    const date = this.normalizeDateUTC(new Date(workDate));
+    return date.toLocaleDateString("en-US", {
+      weekday: "long",
+      timeZone: "UTC",
+    });
+  }
+
+  private getHolidayType(workDate: string | Date, holidayName?: string): string {
+    if (holidayName) {
+      return holidayName;
+    }
+
+    const date = this.normalizeDateUTC(new Date(workDate));
+    const dayOfWeek = date.getUTCDay();
+
+    if (dayOfWeek === 0) {
+      return "Sunday";
+    }
+
+    if (dayOfWeek === 6) {
+      const occurrence = Math.ceil(date.getUTCDate() / 7);
+      if (occurrence === 2) {
+        return "2nd Saturday";
+      }
+      if (occurrence === 4) {
+        return "4th Saturday";
+      }
+      return "Saturday";
+    }
+
+    return this.getWeekdayName(date).toLowerCase();
   }
 
   private getPayableDaysForTimesheetHours(hours: number): number {
@@ -4000,34 +4806,43 @@ export class LeavesService {
     requestorUserId: number,
     actionTakerUserId: number,
   ): Promise<boolean> {
+    // Safety bounds: prevents runaway recursion on cyclic/invalid hierarchies.
+    // Keep this small; most org chains are shallow. If exceeded, authorization should fail closed.
+    const maxDepth = 50;
+
     const result = await tx.execute(sql`
-      WITH RECURSIVE "ManagerChain" AS (
-        -- 1. Base Case: Start with the employee (requestor)
+      WITH RECURSIVE
+      _settings AS (
+        SELECT set_config('statement_timeout', '2000ms', true) AS _ignored
+      ),
+      manager_chain AS (
         SELECT
-            "id",
-            "manager_id",
-            1 AS level
-        FROM "users"
-        WHERE "id" = ${requestorUserId}
+          u.id,
+          u.manager_id,
+          ARRAY[u.id] AS path,
+          1 AS depth
+        FROM users u
+        WHERE u.id = ${requestorUserId}
 
         UNION ALL
 
-        -- 2. Recursive Step: Move up the hierarchy
         SELECT
-            "u"."id",
-            "u"."manager_id",
-            "mc"."level" + 1
-        FROM "users" "u"
-        INNER JOIN "ManagerChain" "mc"
-            ON "u"."id" = "mc"."manager_id"
+          m.id,
+          m.manager_id,
+          mc.path || m.id,
+          mc.depth + 1
+        FROM manager_chain mc
+        JOIN users m
+          ON m.id = mc.manager_id
+        WHERE mc.manager_id IS NOT NULL
+          AND NOT (m.id = ANY(mc.path))
+          AND mc.depth < ${maxDepth}
       )
-      -- 3. Final Check: Is action-taker in this chain's list of managers?
-      -- We check the 'id' column because the chain includes the requestor themself.
       SELECT EXISTS (
-          SELECT 1
-          FROM "ManagerChain"
-          WHERE "id" = ${actionTakerUserId}
-      ) AS "is_authorized";
+        SELECT 1
+        FROM manager_chain
+        WHERE id = ${actionTakerUserId}
+      ) AS is_authorized;
     `);
 
     const isAuthorized = (result.rows[0] as { is_authorized: boolean })
