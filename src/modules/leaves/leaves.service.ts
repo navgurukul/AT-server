@@ -626,6 +626,7 @@ export class LeavesService {
     // (handled at creation time), so existing data is trusted here.
 
     const decidedByUser = alias(users, "decidedByUser");
+    const manager = alias(users, "manager");
 
     const baseQuery = db
       .select({
@@ -647,6 +648,8 @@ export class LeavesService {
         requesterName: usersTable.name,
         requesterEmail: usersTable.email,
         managerId: usersTable.managerId,
+        managerName: manager.name,
+        managerEmail: manager.email,
         decidedByUserName: decidedByUser.name,
       })
       .from(leaveRequestsTable)
@@ -654,6 +657,10 @@ export class LeavesService {
       .innerJoin(
         leaveTypesTable,
         eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id),
+      )
+      .leftJoin(
+        manager,
+        eq(usersTable.managerId, manager.id),
       )
       .leftJoin(
         decidedByUser,
@@ -671,7 +678,11 @@ export class LeavesService {
         name: row.requesterName ?? null,
         email: row.requesterEmail ?? null,
       },
-      managerId: row.managerId !== null && row.managerId !== undefined ? Number(row.managerId) : null,
+      manager: {
+        id: row.managerId !== null && row.managerId !== undefined ? Number(row.managerId) : null,
+        name: row.managerName ?? null,
+        email: row.managerEmail ?? null,
+      },
       leaveType: {
         id: Number(row.leaveTypeId),
         name: row.leaveTypeName,
