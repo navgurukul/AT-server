@@ -17,17 +17,10 @@ export class SalaryCycleUtil {
   
 // Salary cycle start day of month (26th)
   private static readonly CYCLE_START_DAY = 26;
-  // Salary cycle end day of month (25th)
   private static readonly CYCLE_END_DAY = 25;
-
-  
-// Cycle start time: 7:00 AM
   private static readonly CYCLE_START_HOUR = 7;
   private static readonly CYCLE_START_MINUTE = 1;
-
- 
-// Cycle end time: 7:00 AM (on 25th of next month)
-  private static readonly CYCLE_END_HOUR = 24+7; // 7:00 AM on the next day (26th) is effectively 24+7 hours from the start of the cycle
+  private static readonly CYCLE_END_HOUR = 7; // 7:00 AM on the 26th
   private static readonly CYCLE_END_MINUTE = 0;
 
   /**
@@ -36,16 +29,28 @@ export class SalaryCycleUtil {
    * @returns SalaryCycleRange object with start and end dates
    */
   static getCurrentSalaryCycle(now: Date = new Date()): SalaryCycleRange {
-    const year = now.getUTCFullYear();
-    const month = now.getUTCMonth(); // 0-indexed
-    const day = now.getUTCDate();
-    const hour = now.getUTCHours();
+    // Offset for IST (UTC + 5:30)
+    const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+    
+    // 1. Create a localized date object shifted to IST
+    const istDate = new Date(now.getTime() + IST_OFFSET_MS);
+
+    // 2. Extract the components. These will now represent exactly what time it is in IST.
+    const year = istDate.getUTCFullYear();
+    const month = istDate.getUTCMonth(); // 0-indexed
+    const day = istDate.getUTCDate();
+    const hour = istDate.getUTCHours();
+    const minute = istDate.getUTCMinutes();
 
     let cycleStartYear = year;
     let cycleStartMonth = month;
 
-    // If we're before 26th at 7:00 AM, we're still in the previous cycle
-    if (day < this.CYCLE_START_DAY || (day === this.CYCLE_START_DAY && hour < this.CYCLE_START_HOUR)) {
+    // 3. If we are before the 26th at 7:01 AM IST, we are still in the previous cycle
+    const isBeforeCycleStart = 
+      day < this.CYCLE_START_DAY || 
+      (day === this.CYCLE_START_DAY && (hour < this.CYCLE_START_HOUR || (hour === this.CYCLE_START_HOUR && minute < this.CYCLE_START_MINUTE)));
+
+    if (isBeforeCycleStart) {
       // Go back one month
       if (cycleStartMonth === 0) {
         cycleStartMonth = 11;
@@ -55,39 +60,45 @@ export class SalaryCycleUtil {
       }
     }
 
-    // Start: 26th at 7:00 AM of cycleStartMonth
-    const start = new Date(Date.UTC(
+    // 4. Start: 26th at 7:01 AM IST of cycleStartMonth
+    // We build it in UTC, then subtract the offset to generate a true, accurate global Date object
+    const startIST = Date.UTC(
       cycleStartYear,
       cycleStartMonth,
       this.CYCLE_START_DAY,
       this.CYCLE_START_HOUR,
       this.CYCLE_START_MINUTE,
       0,
-      0,
-    ));
+      0
+    );
+    const start = new Date(startIST - IST_OFFSET_MS);
 
-    // End: 25th at 7:00 AM of next month
+    // 5. End (Hard Cutoff): 26th at 7:00 AM IST of the next month
     let cycleEndYear = cycleStartYear;
     let cycleEndMonth = cycleStartMonth + 1;
+    
     if (cycleEndMonth > 11) {
       cycleEndMonth = 0;
       cycleEndYear++;
     }
-    const end = new Date(Date.UTC(
+    
+    // Notice we use CYCLE_START_DAY (26) here instead of CYCLE_END_DAY (25) to enforce the true tracker limit
+    const endIST = Date.UTC(
       cycleEndYear,
       cycleEndMonth,
-      this.CYCLE_END_DAY,
+      this.CYCLE_START_DAY,
       this.CYCLE_END_HOUR,
       this.CYCLE_END_MINUTE,
       0,
-      0,
-    ));
+      0
+    );
+    const end = new Date(endIST - IST_OFFSET_MS);
 
     const cycleLabel = this.formatCycleLabel(start, end);
 
     return {
       start,
-      end,
+      end, // Represents the true hard cutoff: 26th 7:00 AM IST
       year: cycleStartYear,
       month: cycleStartMonth + 1, // 1-indexed for external use
       cycleLabel,
@@ -101,21 +112,45 @@ export class SalaryCycleUtil {
    * @returns SalaryCycleRange object
    */
   static getSalaryCycleForMonth(year: number, month: number): SalaryCycleRange {
+    const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+    
     // month is 1-indexed
     const cycleStartMonth = month - 1; // Convert to 0-indexed
 
-    // Start: 26th at 7:00 AM
-    const start = new Date(year, cycleStartMonth, this.CYCLE_START_DAY, this.CYCLE_START_HOUR, this.CYCLE_START_MINUTE, 0, 0);
+    // 1. Start: 26th at 7:01 AM IST
+    const startIST = Date.UTC(
+      year,
+      cycleStartMonth,
+      this.CYCLE_START_DAY,
+      this.CYCLE_START_HOUR,
+      this.CYCLE_START_MINUTE,
+      0,
+      0
+    );
+    const start = new Date(startIST - IST_OFFSET_MS);
 
-    // End: 25th at 7:00 AM of next month
+    // 2. End (Hard Cutoff): 26th at 7:00 AM IST of the next month
     let cycleEndYear = year;
     let cycleEndMonth = cycleStartMonth + 1;
+    
     if (cycleEndMonth > 11) {
       cycleEndMonth = 0;
       cycleEndYear++;
     }
-    const end = new Date(cycleEndYear, cycleEndMonth, this.CYCLE_END_DAY, this.CYCLE_END_HOUR, this.CYCLE_END_MINUTE, 0, 0);
+    
+    // Fixed: Using CYCLE_START_DAY (26) so it matches the hard cutoff expectation of formatCycleLabel
+    const endIST = Date.UTC(
+      cycleEndYear,
+      cycleEndMonth,
+      this.CYCLE_START_DAY, 
+      this.CYCLE_END_HOUR,
+      this.CYCLE_END_MINUTE,
+      0,
+      0
+    );
+    const end = new Date(endIST - IST_OFFSET_MS);
 
+    // 3. Generate Label (Will now correctly subtract 24h from the 26th to display the 25th)
     const cycleLabel = this.formatCycleLabel(start, end);
 
     return {
@@ -189,15 +224,25 @@ export class SalaryCycleUtil {
   private static formatCycleLabel(start: Date, end: Date): string {
     const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     
-    // Start display is 26th
-    const startDay = start.getUTCDate();
-    const startMonth = monthNames[start.getUTCMonth()];
-    const startYear = start.getUTCFullYear();
+    // 1. Define the IST offset
+    const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+    
+    // 2. Shift both dates into IST to safely extract local calendar values
+    const istStart = new Date(start.getTime() + IST_OFFSET_MS);
+    
+    // 3. Subtract 24 hours from the end date to get the visual end (the 25th)
+    // We subtract it from the IST shifted time to handle month/year changes perfectly
+    const visualEndIST = new Date(end.getTime() + IST_OFFSET_MS - (24 * 60 * 60 * 1000));
 
-    // End display is 25th
-    const endDay = end.getUTCDate();
-    const endMonth = monthNames[end.getUTCMonth()];
-    const endYear = end.getUTCFullYear();
+    // Start display components (26th)
+    const startDay = istStart.getUTCDate();
+    const startMonth = monthNames[istStart.getUTCMonth()];
+    const startYear = istStart.getUTCFullYear();
+
+    // End display components (25th)
+    const endDay = visualEndIST.getUTCDate();
+    const endMonth = monthNames[visualEndIST.getUTCMonth()];
+    const endYear = visualEndIST.getUTCFullYear();
 
     return `${startDay} ${startMonth} ${startYear} - ${endDay} ${endMonth} ${endYear}`;
   }
