@@ -112,21 +112,45 @@ export class SalaryCycleUtil {
    * @returns SalaryCycleRange object
    */
   static getSalaryCycleForMonth(year: number, month: number): SalaryCycleRange {
+    const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+    
     // month is 1-indexed
     const cycleStartMonth = month - 1; // Convert to 0-indexed
 
-    // Start: 26th at 7:00 AM
-    const start = new Date(year, cycleStartMonth, this.CYCLE_START_DAY, this.CYCLE_START_HOUR, this.CYCLE_START_MINUTE, 0, 0);
+    // 1. Start: 26th at 7:01 AM IST
+    const startIST = Date.UTC(
+      year,
+      cycleStartMonth,
+      this.CYCLE_START_DAY,
+      this.CYCLE_START_HOUR,
+      this.CYCLE_START_MINUTE,
+      0,
+      0
+    );
+    const start = new Date(startIST - IST_OFFSET_MS);
 
-    // End: 25th at 7:00 AM of next month
+    // 2. End (Hard Cutoff): 26th at 7:00 AM IST of the next month
     let cycleEndYear = year;
     let cycleEndMonth = cycleStartMonth + 1;
+    
     if (cycleEndMonth > 11) {
       cycleEndMonth = 0;
       cycleEndYear++;
     }
-    const end = new Date(cycleEndYear, cycleEndMonth, this.CYCLE_END_DAY, this.CYCLE_END_HOUR, this.CYCLE_END_MINUTE, 0, 0);
+    
+    // Fixed: Using CYCLE_START_DAY (26) so it matches the hard cutoff expectation of formatCycleLabel
+    const endIST = Date.UTC(
+      cycleEndYear,
+      cycleEndMonth,
+      this.CYCLE_START_DAY, 
+      this.CYCLE_END_HOUR,
+      this.CYCLE_END_MINUTE,
+      0,
+      0
+    );
+    const end = new Date(endIST - IST_OFFSET_MS);
 
+    // 3. Generate Label (Will now correctly subtract 24h from the 26th to display the 25th)
     const cycleLabel = this.formatCycleLabel(start, end);
 
     return {
