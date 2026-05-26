@@ -120,6 +120,32 @@ export class TimesheetsService {
     }
   }
 
+  private checkAdHocDailyLimit(
+    entries: { projectId: number | null; hours: number }[],
+    projectRecords?: Array<{ id: number; name: string | null }>,
+  ) {
+    const adHocProjectIds = new Set(
+      (projectRecords ?? [])
+        .filter((project) => project.name === 'Ad-hoc tasks')
+        .map((project) => Number(project.id)),
+    );
+
+    if (adHocProjectIds.size === 0) return;
+
+    const adHocHours = entries.reduce((acc, entry) => {
+      if (entry.projectId !== null && adHocProjectIds.has(entry.projectId)) {
+        return acc + entry.hours;
+      }
+      return acc;
+    }, 0);
+
+    if (adHocHours > 2) {
+      throw new BadRequestException(
+        'Ad-hoc tasks cannot exceed 2 hours',
+      );
+    }
+  }
+
   async listTimesheets(params: ListTimesheetParams) {
     const db = this.database.connection;
 
@@ -406,6 +432,11 @@ export class TimesheetsService {
           `Projects not found in organisation: ${missing.join(', ')}`,
         );
       }
+
+      this.checkAdHocDailyLimit(
+        normalizedEntries.map((e) => ({ projectId: e.projectId, hours: e.hours })),
+        projectRecords ?? undefined,
+      );
     }
 
     const today = normalizeDate(now);
@@ -581,6 +612,11 @@ export class TimesheetsService {
           `Timesheet hours cannot exceed ${MAX_HOURS_PER_DAY} hours per day (total: ${combinedHours}h)`
         );
       }
+
+      this.checkAdHocDailyLimit(
+        entriesToSave.map((e) => ({ projectId: e.projectId, hours: e.hours })),
+        projectRecords ?? undefined,
+      );
 
       finalTotalHoursForDay = combinedHours;
     }
