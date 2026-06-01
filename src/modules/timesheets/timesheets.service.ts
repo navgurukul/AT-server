@@ -19,13 +19,14 @@ import {
 import { SalaryCycleUtil } from '../../common/utils/salary-cycle.util';
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { DatabaseService } from '../../database/database.service';
-import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, notificationsTable, payableDaysTable, projectsTable, rolesTable, timesheetEntriesTable, timesheetsTable, userRolesTable, usersTable } from '../../db/schema';
+import { backfillCountersTable, backfillDatesTable, departmentsTable, leaveRequestsTable, leaveTypesTable, notificationsTable, payableDaysTable, projectsTable, rolesTable, timesheetEntriesTable, timesheetsTable, userRolesTable, usersTable, orgsTable } from '../../db/schema';
 import { AuditService } from '../audit/audit.service';
 import { CalendarService } from '../calendar/calendar.service';
 import { LeavesService } from '../leaves/leaves.service';
 import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 import { CreateTimesheetAdminDto } from './dto/create-timesheet-admin.dto';
 import { checkAdminSelfAction } from '../../common/utils/self-action.utils';
+import { getYYYYMMDD } from '../../common/utils/access-control.util';
 
 interface ListTimesheetParams {
   userId?: number;
@@ -279,6 +280,7 @@ export class TimesheetsService {
         email: usersTable.email,
         slackId: usersTable.slackId,
         role: rolesTable.key,
+        dateOfExit: usersTable.dateOfExit,
       })
       .from(usersTable)
       .leftJoin(userRolesTable, eq(usersTable.id, userRolesTable.userId))
@@ -442,6 +444,17 @@ export class TimesheetsService {
     const today = normalizeDate(now);
     if (workDate > today) {
       throw new BadRequestException("Cannot create timesheet for future date");
+    }
+
+    if (userInfo?.dateOfExit) {
+      const workDateStr = getYYYYMMDD(workDate);
+      const exitDateStr = getYYYYMMDD(userInfo.dateOfExit);
+      if (workDateStr > exitDateStr) {
+        this.logger.warn(
+          `Blocked tracker submission: userId=${userId}, workDate=${workDateStr}, dateOfExit=${exitDateStr}`
+        );
+        throw new BadRequestException('Cannot create timesheet after Date of Exit');
+      }
     }
 
     // Check if workDate is within the current salary cycle
@@ -3645,11 +3658,16 @@ export class TimesheetsService {
         projectId: timesheetEntriesTable.projectId,
         hoursDecimal: timesheetEntriesTable.hoursDecimal,
         taskDescription: timesheetEntriesTable.taskDescription,
+        dateOfExit: usersTable.dateOfExit,
       })
       .from(timesheetEntriesTable)
       .innerJoin(
         timesheetsTable,
         eq(timesheetEntriesTable.timesheetId, timesheetsTable.id),
+      )
+      .innerJoin(
+        usersTable,
+        eq(timesheetsTable.userId, usersTable.id),
       )
       .where(
         and(
@@ -3663,6 +3681,16 @@ export class TimesheetsService {
       throw new NotFoundException(
         `Timesheet entry with ID ${entryId} for user ${targetUserId} not found`,
       );
+    }
+
+    if (existingEntry.dateOfExit) {
+      const dateToCheck = updateData.date ? normalizeDate(new Date(updateData.date)) : normalizeDate(existingEntry.workDate);
+      const dateToCheckStr = getYYYYMMDD(dateToCheck);
+      const exitDateStr = getYYYYMMDD(existingEntry.dateOfExit);
+      if (dateToCheckStr > exitDateStr) {
+        this.logger.warn(`Blocked admin tracker entry update: targetUserId=${targetUserId}, workDate=${dateToCheckStr}, dateOfExit=${exitDateStr}`);
+        throw new BadRequestException('Cannot create or update timesheet after Date of Exit');
+      }
     }
 
     const oldWorkDate = existingEntry.workDate;

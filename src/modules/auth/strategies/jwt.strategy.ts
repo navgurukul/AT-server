@@ -5,9 +5,10 @@ import { Request } from 'express';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 
 import { DatabaseService } from '../../../database/database.service';
-import { authBlacklistedTokensTable, usersTable } from '../../../db/schema';
+import { authBlacklistedTokensTable, usersTable, orgsTable } from '../../../db/schema';
 import { JwtPayload } from '../types/jwt-payload.interface';
 import { eq } from 'drizzle-orm';
+import { validateUserAccess } from '../../../common/utils/access-control.util';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
@@ -40,22 +41,38 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException('Token has been revoked');
     }
 
-    const [user] = await db
+    const [userResult] = await db
       .select({
-        id: usersTable.id,
-        email: usersTable.email,
-        orgId: usersTable.orgId,
-        name: usersTable.name,
-        status: usersTable.status,
-        managerId: usersTable.managerId,
-        employeeDepartmentId: usersTable.employeeDepartmentId,
+        user: {
+          id: usersTable.id,
+          email: usersTable.email,
+          orgId: usersTable.orgId,
+          name: usersTable.name,
+          status: usersTable.status,
+          managerId: usersTable.managerId,
+          employeeDepartmentId: usersTable.employeeDepartmentId,
+          dateOfExit: usersTable.dateOfExit,
+        },
+        timezone: orgsTable.timezone,
       })
       .from(usersTable)
+      .leftJoin(orgsTable, eq(usersTable.orgId, orgsTable.id))
       .where(eq(usersTable.id, payload.sub));
 
-    if (!user) {
+    if (!userResult || !userResult.user) {
       throw new UnauthorizedException('User no longer exists');
     }
+
+    const { user, timezone } = userResult;
+
+    // Validate access using our centralized validation utility
+    validateUserAccess({
+      id: Number(user.id),
+      email: user.email,
+      status: user.status,
+      dateOfExit: user.dateOfExit,
+      timezone,
+    });
 
     return {
       id: Number(user.id),
@@ -76,3 +93,4 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     };
   }
 }
+
