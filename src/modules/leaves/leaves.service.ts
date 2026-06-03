@@ -3,6 +3,7 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Logger,
 } from "@nestjs/common";
 import {
   and,
@@ -51,6 +52,8 @@ import { UpdateAllocatedLeaveDto } from "./dto/update-allocated-leave.dto";
 import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
 import { SalaryCycleUtil } from "src/common/utils/salary-cycle.util";
 import { checkAdminSelfAction } from '../../common/utils/self-action.utils';
+import { getYYYYMMDD } from "../../common/utils/access-control.util";
+import { Cron } from "@nestjs/schedule";
 
 interface ListLeaveRequestsParams {
   actor?: AuthenticatedUser;
@@ -150,6 +153,8 @@ interface LeaveBalanceSnapshot {
 
 @Injectable()
 export class LeavesService {
+  private readonly logger = new Logger(LeavesService.name);
+
   constructor(
     private readonly database: DatabaseService,
     private readonly calendarService: CalendarService,
@@ -775,15 +780,41 @@ export class LeavesService {
     const db = this.database.connection;
     const startDate = new Date(payload.startDate);
     const endDate = new Date(payload.endDate);
+
+    const [user] = await db
+      .select({
+        id: usersTable.id,
+        dateOfExit: usersTable.dateOfExit,
+      })
+      .from(usersTable)
+      .where(eq(usersTable.id, userId))
+      .limit(1);
+
+    if (!user) {
+      throw new NotFoundException(`User with ID ${userId} not found`);
+    }
+
+    if (user.dateOfExit) {
+      const startDateStr = getYYYYMMDD(startDate);
+      const endDateStr = getYYYYMMDD(endDate);
+      const exitDateStr = getYYYYMMDD(user.dateOfExit);
+      if (startDateStr > exitDateStr || endDateStr > exitDateStr) {
+        this.logger.warn(
+          `Blocked leave request: userId=${userId}, range=${startDateStr} to ${endDateStr}, dateOfExit=${exitDateStr}`
+        );
+        throw new BadRequestException('Leave request cannot exceed Date of Exit');
+      }
+    }
+
+    if (endDate < startDate) {
+      throw new BadRequestException("End date cannot be before start date");
+    }
+
     let requiresApproval = true;
     let isPaidLeave = true;
     let requestedDurationType: "half_day" | "full_day" | "custom" = "full_day";
     let requestedHours = 0;
     let requestedHalfDaySegment: "first_half" | "second_half" | null = null;
-
-    if (endDate < startDate) {
-      throw new BadRequestException("End date cannot be before start date");
-    }
 
     this.enforcePastDateWindowForNonPrivilegedActor(startDate, endDate, actor);
 
@@ -1227,17 +1258,32 @@ export class LeavesService {
           durationType: leaveRequestsTable.durationType,
           halfDaySegment: leaveRequestsTable.halfDaySegment,
           reason: leaveRequestsTable.reason,
+          dateOfExit: usersTable.dateOfExit,
         })
         .from(leaveRequestsTable)
         .innerJoin(
           leaveTypesTable,
           eq(leaveTypesTable.id, leaveRequestsTable.leaveTypeId)
         )
+        .innerJoin(
+          usersTable,
+          eq(leaveRequestsTable.userId, usersTable.id)
+        )
         .where(eq(leaveRequestsTable.id, requestId))
         .limit(1);
 
       if (!existingRequest) {
         throw new NotFoundException("Leave request not found");
+      }
+
+      if (existingRequest.dateOfExit) {
+        const startDateStr = getYYYYMMDD(startDate);
+        const endDateStr = getYYYYMMDD(endDate);
+        const exitDateStr = getYYYYMMDD(existingRequest.dateOfExit);
+        if (startDateStr > exitDateStr || endDateStr > exitDateStr) {
+          this.logger.warn(`Blocked admin leave request update: userId=${existingRequest.userId}, range=${startDateStr} to ${endDateStr}, dateOfExit=${exitDateStr}`);
+          throw new BadRequestException('Leave request cannot exceed Date of Exit');
+        }
       }
       checkAdminSelfAction(actor, existingRequest.userId.toString());
 
@@ -4859,5 +4905,166 @@ export class LeavesService {
     const isAuthorized = (result.rows[0] as { is_authorized: boolean })
       .is_authorized;
     return isAuthorized;
+  }
+
+  @Cron('0 2 * * *', {
+    name: 'auto-reject-exited-leaves',
+    timeZone: 'Asia/Kolkata',
+  })
+  async autoRejectExitedUserLeavesCron() {
+    this.logger.log('Running automated leave cleanup for exited employees...');
+    const result = await this.autoRejectExitedUserLeaves();
+    this.logger.log(
+      `Automated leave cleanup completed: processed ${result.processedCount} leaves, skipped ${result.skippedCount} leaves.`
+    );
+  }
+
+  async autoRejectExitedUserLeaves(orgId?: number): Promise<{ processedCount: number; skippedCount: number; failures: string[] }> {
+    const db = this.database.connection;
+    const now = new Date();
+
+    // 1. Fetch active/pending leaves for users with dateOfExit
+    const expiredLeaves = await db
+      .select({
+        id: leaveRequestsTable.id,
+        userId: leaveRequestsTable.userId,
+        orgId: leaveRequestsTable.orgId,
+        leaveTypeId: leaveRequestsTable.leaveTypeId,
+        startDate: leaveRequestsTable.startDate,
+        endDate: leaveRequestsTable.endDate,
+        hours: leaveRequestsTable.hours,
+        state: leaveRequestsTable.state,
+        dateOfExit: usersTable.dateOfExit,
+        email: usersTable.email,
+        leaveTypeCode: leaveTypesTable.code,
+        leaveTypeName: leaveTypesTable.name,
+        leaveTypePaid: leaveTypesTable.paid,
+      })
+      .from(leaveRequestsTable)
+      .innerJoin(usersTable, eq(leaveRequestsTable.userId, usersTable.id))
+      .innerJoin(leaveTypesTable, eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id))
+      .where(
+        and(
+          inArray(leaveRequestsTable.state, ['pending', 'approved']),
+          isNotNull(usersTable.dateOfExit),
+          orgId ? eq(leaveRequestsTable.orgId, orgId) : undefined
+        )
+      );
+
+    let processedCount = 0;
+    let skippedCount = 0;
+    const failures: string[] = [];
+
+    // 2. Filter in-memory using timezone-safe comparison
+    const leavesToProcess = expiredLeaves.filter((leave) => {
+      const startDateStr = getYYYYMMDD(new Date(leave.startDate));
+      const endDateStr = getYYYYMMDD(new Date(leave.endDate));
+      const exitDateStr = getYYYYMMDD(leave.dateOfExit!);
+      const isPastExit = startDateStr > exitDateStr || endDateStr > exitDateStr;
+      if (!isPastExit) {
+        skippedCount++;
+      }
+      return isPastExit;
+    });
+
+    for (const leave of leavesToProcess) {
+      try {
+        await db.transaction(async (tx) => {
+          const previousState = leave.state;
+          const newState = previousState === 'approved' ? 'cancelled' : 'rejected';
+          const exitDateStr = getYYYYMMDD(leave.dateOfExit!);
+          const requestedHours = Number(leave.hours ?? 0);
+
+          // Update the leave request state
+          await tx
+            .update(leaveRequestsTable)
+            .set({
+              state: newState,
+              updatedAt: now,
+            })
+            .where(eq(leaveRequestsTable.id, leave.id));
+
+          // Clear comp-off links if applicable
+          if (leave.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
+            await this.clearCompOffCreditLinks(tx, leave.id);
+          }
+
+          // Balance rebalancing/restoration
+          const isPaidLeave = leave.leaveTypePaid ?? true;
+          const isLWP = leave.leaveTypeCode === LWP_LEAVE_CODE || 
+                        (leave.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+          const shouldAdjustBalance = isPaidLeave || isLWP;
+
+          if (shouldAdjustBalance) {
+            if (previousState === 'pending') {
+              await this.adjustLeaveBalance(tx, leave.userId, leave.leaveTypeId, {
+                pendingHours: -requestedHours,
+                balanceHours: requestedHours,
+              });
+            } else if (previousState === 'approved') {
+              await this.adjustLeaveBalance(tx, leave.userId, leave.leaveTypeId, {
+                bookedHours: -requestedHours,
+                balanceHours: requestedHours,
+              });
+            }
+          }
+
+          // Recalculate payable days for approved leaves only
+          if (previousState === 'approved') {
+            const affectedCycles = this.getCycleRangesForDateWindow(
+              new Date(leave.startDate),
+              new Date(leave.endDate),
+            );
+            for (const cycle of affectedCycles) {
+              await this.recalculateAndPersistPayableDaysForCycle(
+                tx,
+                leave.orgId,
+                leave.userId,
+                cycle.cycleStart,
+                cycle.cycleEnd,
+                cycle.cycleKey,
+                now,
+              );
+            }
+          }
+
+          // System Audit Log
+          await this.auditService.createLog({
+            tx,
+            orgId: leave.orgId,
+            actorUserId: null, // SYSTEM constant
+            actorRole: 'system', // Attributed to system
+            action: 'leave_auto_rejected',
+            subjectType: 'leave_request',
+            targetUserId: leave.userId,
+            prev: {
+              state: previousState,
+            },
+            next: {
+              state: newState,
+              reason: `Automated cleanup: leave range falls beyond Date of Exit (${exitDateStr})`,
+              leaveId: leave.id,
+              dateOfExit: exitDateStr,
+            },
+          });
+
+          this.logger.log(
+            `Automated leave cleanup: successfully processed auto-${newState} for leaveId=${leave.id}, userId=${leave.userId}, dateOfExit=${exitDateStr}`
+          );
+        });
+
+        processedCount++;
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        this.logger.error(`Automated leave cleanup: failed for leaveId=${leave.id}, error=${errorMsg}`);
+        failures.push(`leaveId=${leave.id}: ${errorMsg}`);
+      }
+    }
+
+    return {
+      processedCount,
+      skippedCount,
+      failures,
+    };
   }
 }
