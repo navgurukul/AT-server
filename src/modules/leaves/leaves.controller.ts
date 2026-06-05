@@ -9,9 +9,12 @@ import {
   ParseIntPipe,
   Post,
   Query,
+  UploadedFile,
+  UseInterceptors,
   ValidationPipe,
 } from "@nestjs/common";
-import { ApiQuery, ApiTags } from "@nestjs/swagger";
+import { FileInterceptor } from "@nestjs/platform-express";
+import { ApiBody, ApiConsumes, ApiQuery, ApiTags } from "@nestjs/swagger";
 
 import { Permissions } from "../../common/decorators/permissions.decorator";
 import { Roles } from "../../common/decorators/roles.decorator";
@@ -25,6 +28,67 @@ import { GrantCompOffDto } from "./dto/grant-comp-off.dto";
 import { RevokeCompOffDto } from "./dto/revoke-comp-off.dto";
 import { UpdateAllocatedLeaveDto } from "./dto/update-allocated-leave.dto";
 import { LeavesService } from "./leaves.service";
+
+const CREATE_LEAVE_MULTIPART_SCHEMA_SELF = {
+  type: "object",
+  properties: {
+    leaveTypeId: { type: "integer", example: 1 },
+    startDate: { type: "string", format: "date" },
+    endDate: { type: "string", format: "date" },
+    hours: { type: "number" },
+    reason: { type: "string" },
+    courseOrProgrammeName: { type: "string" },
+    durationType: {
+      type: "string",
+      enum: ["half_day", "full_day", "custom"],
+    },
+    halfDaySegment: {
+      type: "string",
+      enum: ["first_half", "second_half"],
+    },
+    relationship: {
+      type: "string",
+      enum: ["parent", "child", "other_immediate_family_member"],
+    },
+    relationshipDetails: { type: "string" },
+    document: {
+      type: "string",
+      format: "binary",
+      description: "Supporting document for selected leave types.",
+    },
+  },
+};
+
+const CREATE_LEAVE_MULTIPART_SCHEMA_ADMIN = {
+  type: "object",
+  properties: {
+    leaveTypeId: { type: "integer", example: 1 },
+    startDate: { type: "string", format: "date" },
+    endDate: { type: "string", format: "date" },
+    hours: { type: "number" },
+    reason: { type: "string" },
+    courseOrProgrammeName: { type: "string" },
+    durationType: {
+      type: "string",
+      enum: ["half_day", "full_day", "custom"],
+    },
+    halfDaySegment: {
+      type: "string",
+      enum: ["first_half", "second_half"],
+    },
+    relationship: {
+      type: "string",
+      enum: ["parent", "child", "other_immediate_family_member"],
+    },
+    relationshipDetails: { type: "string" },
+    userId: { type: "integer", example: 1 },
+    document: {
+      type: "string",
+      format: "binary",
+      description: "Supporting document for selected leave types.",
+    },
+  },
+};
 
 @ApiTags("leaves")
 @Controller("leaves")
@@ -90,14 +154,24 @@ export class LeavesController {
 
   @Post("requests")
   @Permissions("leave:create:self")
+  @ApiConsumes("multipart/form-data")
+  @ApiBody({ schema: CREATE_LEAVE_MULTIPART_SCHEMA_SELF })
+  @UseInterceptors(FileInterceptor("document"))
   requestLeave(
     @Body() payload: CreateLeaveRequestDto,
-    @CurrentUser() user: AuthenticatedUser | undefined
+    @CurrentUser() user: AuthenticatedUser | undefined,
+    @UploadedFile() document?: { buffer: Buffer; originalname: string; mimetype: string; size: number },
   ) {
     if (!user) {
       return null;
     }
-    return this.leavesService.createLeaveRequest(user.id, user.orgId, payload);
+    return this.leavesService.createLeaveRequest(
+      user.id,
+      user.orgId,
+      payload,
+      undefined,
+      document,
+    );
   }
 
   @Get("my-requests")
@@ -310,14 +384,18 @@ export class LeavesController {
   @Post("admin/apply")
   @Permissions("leave:create:any")
   @Roles("admin", "super_admin")
+  @ApiConsumes("multipart/form-data")
+  @ApiBody({ schema: CREATE_LEAVE_MULTIPART_SCHEMA_ADMIN })
+  @UseInterceptors(FileInterceptor("document"))
   applyLeaveForUser(
     @Body() payload: CreateLeaveForUserDto,
-    @CurrentUser() actor: AuthenticatedUser | undefined
+    @CurrentUser() actor: AuthenticatedUser | undefined,
+    @UploadedFile() document?: { buffer: Buffer; originalname: string; mimetype: string; size: number },
   ) {
     if (!actor) {
       return null;
     }
-    return this.leavesService.createLeaveRequestForUser(actor, payload);
+    return this.leavesService.createLeaveRequestForUser(actor, payload, document);
   }
 
   @Patch("admin/requests/:id")

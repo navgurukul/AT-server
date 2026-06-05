@@ -405,6 +405,21 @@ export const leaveRequests = pgTable("leave_requests", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });
 
+export const bereavementLeaveRequest = pgTable(
+  "bereavement_leave_request",
+  {
+    id: serial("id").primaryKey(),
+    leaveRequestId: integer("leave_request_id")
+      .notNull()
+      .unique()
+      .references(() => leaveRequests.id, { onDelete: "cascade" }),
+    relationship: varchar("relationship", { length: 64 }).notNull(),
+    relationshipDetails: text("relationship_details"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+  }
+);
+
 export const compOffCredits = pgTable("comp_off_credits", {
   id: serial("id").primaryKey(),
   orgId: integer("org_id")
@@ -725,6 +740,7 @@ export const schema = {
   leavePolicies,
   leaveBalances,
   leaveRequests,
+  bereavementLeaveRequest,
   compOffCredits,
   approvals,
   payrollWindows,
@@ -760,6 +776,7 @@ export const leaveTypesTable = leaveTypes;
 export const leavePoliciesTable = leavePolicies;
 export const leaveBalancesTable = leaveBalances;
 export const leaveRequestsTable = leaveRequests;
+export const bereavementLeaveRequestTable = bereavementLeaveRequest;
 export const compOffCreditsTable = compOffCredits;
 export const approvalsTable = approvals;
 export const payrollWindowsTable = payrollWindows;
