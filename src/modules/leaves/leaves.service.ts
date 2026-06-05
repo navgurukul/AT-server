@@ -2,9 +2,10 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
-  NotFoundException,
   Logger,
+  NotFoundException,
 } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
 import {
   and,
   count,
@@ -24,6 +25,7 @@ import { alias } from "drizzle-orm/pg-core";
 import { DatabaseService } from "../../database/database.service";
 import {
   approvalsTable,
+  bereavementLeaveRequestTable,
   compOffCreditsTable,
   leaveBalancesTable,
   leavePoliciesTable,
@@ -54,6 +56,7 @@ import { SalaryCycleUtil } from "src/common/utils/salary-cycle.util";
 import { checkAdminSelfAction } from '../../common/utils/self-action.utils';
 import { getYYYYMMDD } from "../../common/utils/access-control.util";
 import { Cron } from "@nestjs/schedule";
+import nodemailer from "nodemailer";
 
 interface ListLeaveRequestsParams {
   actor?: AuthenticatedUser;
@@ -68,13 +71,13 @@ interface ListCompOffParams {
   workDate?: string;
   holidayType?: string;
   status?:
-    | "pending"
-    | "granted"
-    | "expired"
-    | "revoked"
-    | "availed"
-    | "partial_availed"
-    | "warning";
+  | "pending"
+  | "granted"
+  | "expired"
+  | "revoked"
+  | "availed"
+  | "partial_availed"
+  | "warning";
 }
 
 interface CompOffCreditListRow {
@@ -98,14 +101,14 @@ export interface MyCompOffCreditItem {
   availedDate: Date | string | null;
   expireDate: Date | string;
   status:
-    | "pending"
-    | "granted"
-    | "expired"
-    | "revoked"
-    | "availed"
-    | "partial_availed"
-    | "warning"
-    | string;
+  | "pending"
+  | "granted"
+  | "expired"
+  | "revoked"
+  | "availed"
+  | "partial_availed"
+  | "warning"
+  | string;
 }
 
 export interface MyCompOffCreditsSummary {
@@ -135,6 +138,13 @@ const TIMESHEET_FULL_DAY_MIN_HOURS = 6;
 const COMP_OFF_FULL_DAY_HOURS = HOURS_PER_WORKING_DAY;
 const COMP_OFF_HALF_DAY_HOURS = COMP_OFF_FULL_DAY_HOURS / 2;
 const COMP_OFF_EXPIRY_DAYS = 30;
+const MAX_LEAVE_DOCUMENT_UPLOAD_BYTES = 10 * 1024 * 1024;
+const ALLOWED_LEAVE_DOCUMENT_MIME_TYPES = new Set([
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/jpg",
+]);
 
 type LeaveBalanceDelta = Partial<{
   balanceHours: number;
@@ -151,6 +161,18 @@ interface LeaveBalanceSnapshot {
   allocatedHours: number;
 }
 
+interface LeaveDocumentUpload {
+  buffer: Buffer;
+  originalname: string;
+  mimetype: string;
+  size: number;
+}
+
+export interface LeaveEmailDeliveryResult {
+  sent: boolean;
+  reason?: string;
+}
+
 @Injectable()
 export class LeavesService {
   private readonly logger = new Logger(LeavesService.name);
@@ -159,6 +181,7 @@ export class LeavesService {
     private readonly database: DatabaseService,
     private readonly calendarService: CalendarService,
     private readonly auditService: AuditService,
+    private readonly configService: ConfigService,
   ) {}
 
   private async consumeCompOffCredits(
@@ -178,15 +201,15 @@ export class LeavesService {
 
     const linkedCredits = leaveRequestId
       ? await tx
-          .select()
-          .from(compOffCreditsTable)
-          .where(
-            and(
-              activeCreditConditions,
-              eq(compOffCreditsTable.leaveRequestId, leaveRequestId),
-            ),
-          )
-          .orderBy(compOffCreditsTable.workDate)
+        .select()
+        .from(compOffCreditsTable)
+        .where(
+          and(
+            activeCreditConditions,
+            eq(compOffCreditsTable.leaveRequestId, leaveRequestId),
+          ),
+        )
+        .orderBy(compOffCreditsTable.workDate)
       : [];
 
     const unlinkedCredits = await tx
@@ -291,14 +314,14 @@ export class LeavesService {
     });
 
     await tx
-    .update(compOffCreditsTable)
-    .set({
-      status: 'pending',
-      timesheetId: null,
-      creditedHours: '0',
-      timesheetHours: null,
-    })
-    .where(eq(compOffCreditsTable.id, grantedCredit.id));
+      .update(compOffCreditsTable)
+      .set({
+        status: 'pending',
+        timesheetId: null,
+        creditedHours: '0',
+        timesheetHours: null,
+      })
+      .where(eq(compOffCreditsTable.id, grantedCredit.id));
     return true;
   }
 
@@ -602,7 +625,7 @@ export class LeavesService {
       // Admin and superadmin can see all employee leaves (except their own)
       const isAdmin = params.actor.roles?.includes("admin");
       const isSuperAdmin = params.actor.roles?.includes("super_admin");
-      
+
       if (!isAdmin && !isSuperAdmin) {
         // Manager: Only show leave requests from their direct reports (mentees)
         const mentees = await db
@@ -648,6 +671,10 @@ export class LeavesService {
         requestedAt: leaveRequestsTable.requestedAt,
         updatedAt: leaveRequestsTable.updatedAt,
         decidedByUserId: leaveRequestsTable.decidedByUserId,
+        bereavementRelationship:
+          bereavementLeaveRequestTable.relationship,
+        bereavementRelationshipDetails:
+          bereavementLeaveRequestTable.relationshipDetails,
         leaveTypeName: leaveTypesTable.name,
         leaveTypeCode: leaveTypesTable.code,
         requesterName: usersTable.name,
@@ -670,6 +697,13 @@ export class LeavesService {
       .leftJoin(
         decidedByUser,
         eq(leaveRequestsTable.decidedByUserId, decidedByUser.id),
+      )
+      .leftJoin(
+        bereavementLeaveRequestTable,
+        eq(
+          bereavementLeaveRequestTable.leaveRequestId,
+          leaveRequestsTable.id,
+        ),
       );
 
     const query = filters.length > 0 ? baseQuery.where(and(...filters)) : baseQuery;
@@ -700,6 +734,10 @@ export class LeavesService {
       halfDaySegment: row.halfDaySegment ?? null,
       hours: row.hours ? Number(row.hours) : 0,
       reason: row.reason ?? null,
+      bereavementDetails: this.formatBereavementDetails(
+        row.bereavementRelationship,
+        row.bereavementRelationshipDetails,
+      ),
       requestedAt: row.requestedAt,
       updatedAt: row.updatedAt,
       decidedByUserId: row.decidedByUserId ?? null,
@@ -743,6 +781,10 @@ export class LeavesService {
         state: leaveRequestsTable.state,
         requestedAt: leaveRequestsTable.requestedAt,
         updatedAt: leaveRequestsTable.updatedAt,
+        bereavementRelationship:
+          bereavementLeaveRequestTable.relationship,
+        bereavementRelationshipDetails:
+          bereavementLeaveRequestTable.relationshipDetails,
         leaveType: {
           id: leaveTypesTable.id,
           code: leaveTypesTable.code,
@@ -753,6 +795,13 @@ export class LeavesService {
       .innerJoin(
         leaveTypesTable,
         eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id),
+      )
+      .leftJoin(
+        bereavementLeaveRequestTable,
+        eq(
+          bereavementLeaveRequestTable.leaveRequestId,
+          leaveRequestsTable.id,
+        ),
       )
       .where(and(...conditions))
       .orderBy(desc(leaveRequestsTable.requestedAt));
@@ -766,16 +815,93 @@ export class LeavesService {
       hours: row.hours ? Number(row.hours) : 0,
       reason: row.reason ?? null,
       state: row.state,
+      bereavementDetails: this.formatBereavementDetails(
+        row.bereavementRelationship,
+        row.bereavementRelationshipDetails,
+      ),
       requestedAt: row.requestedAt,
       updatedAt: row.updatedAt,
       leaveType: row.leaveType,
     }));
+  }
+
+  private isBereavementLeaveType(leaveType: {
+    code?: string | null;
+    name?: string | null;
+  }) {
+    const leaveTypeCode = leaveType.code?.toLowerCase() ?? "";
+    const leaveTypeName = leaveType.name?.toLowerCase() ?? "";
+
+    return (
+      leaveTypeCode === "bereavement" ||
+      leaveTypeCode === "bereavement_leave" ||
+      leaveTypeName.includes("bereavement")
+    );
+  }
+
+  private formatBereavementDetails(
+    relationship?: string | null,
+    relationshipDetails?: string | null,
+  ) {
+    if (!relationship) {
+      return null;
+    }
+
+    return {
+      relationship,
+      relationshipDetails: relationshipDetails ?? null,
+    };
+  }
+
+  private async syncBereavementLeaveRequestDetails(
+    tx: any,
+    leaveRequestId: number,
+    leaveType: {
+      code?: string | null;
+      name?: string | null;
+    },
+    payload: Pick<CreateLeaveRequestDto, "relationship" | "relationshipDetails">,
+  ) {
+    await tx
+      .delete(bereavementLeaveRequestTable)
+      .where(eq(bereavementLeaveRequestTable.leaveRequestId, leaveRequestId));
+
+    if (!this.isBereavementLeaveType(leaveType)) {
+      return;
+    }
+
+    if (!payload.relationship) {
+      throw new BadRequestException(
+        "Relationship is required for bereavement leave",
+      );
+    }
+
+    const relationshipDetails = payload.relationshipDetails?.trim() ?? null;
+
+    if (
+      payload.relationship === "other_immediate_family_member" &&
+      !relationshipDetails
+    ) {
+      throw new BadRequestException(
+        "Please mention your relationship with them",
+      );
+    }
+
+    await tx.insert(bereavementLeaveRequestTable).values({
+      leaveRequestId,
+      relationship: payload.relationship,
+      relationshipDetails:
+        payload.relationship === "other_immediate_family_member"
+          ? relationshipDetails
+          : null,
+    });
   }
   async createLeaveRequest(
     userId: number,
     orgId: number,
     payload: CreateLeaveRequestDto,
     actor?: AuthenticatedUser,
+    uploadedDocument?: LeaveDocumentUpload,
   ) {
     const db = this.database.connection;
     const startDate = new Date(payload.startDate);
@@ -833,6 +959,56 @@ export class LeavesService {
       if (!leaveType) {
         throw new NotFoundException(
           "Leave type not found for this organisation"
+        );
+      }
+
+      const isBereavementLeave = this.isBereavementLeaveType(leaveType);
+      const requiresDocumentEmail = this.isLeaveTypeRequiringSupportingDocument(
+        leaveType,
+      );
+
+      if (requiresDocumentEmail) {
+        if (!uploadedDocument) {
+          throw new BadRequestException(
+            "Supporting document is required for this leave type",
+          );
+        }
+
+        if (uploadedDocument.size > MAX_LEAVE_DOCUMENT_UPLOAD_BYTES) {
+          throw new BadRequestException(
+            "Uploaded document must be 10MB or smaller",
+          );
+        }
+
+        if (!ALLOWED_LEAVE_DOCUMENT_MIME_TYPES.has(uploadedDocument.mimetype)) {
+          throw new BadRequestException(
+            "Only PDF, JPG, and PNG documents are allowed",
+          );
+        }
+
+        if (
+          this.isExamOrLearningLeaveType(leaveType) &&
+          !payload.courseOrProgrammeName?.trim()
+        ) {
+          throw new BadRequestException(
+            "Course or programme name is required for Exam Leave and L&D Leave",
+          );
+        }
+      }
+
+      if (isBereavementLeave && !payload.relationship) {
+        throw new BadRequestException(
+          "Relationship is required for bereavement leave",
+        );
+      }
+
+      if (
+        isBereavementLeave &&
+        payload.relationship === "other_immediate_family_member" &&
+        !payload.relationshipDetails?.trim()
+      ) {
+        throw new BadRequestException(
+          "Please mention your relationship with them",
         );
       }
 
@@ -920,7 +1096,7 @@ export class LeavesService {
       }
 
       const overlappingRequests = await tx
-        .select({ 
+        .select({
           id: leaveRequestsTable.id,
           durationType: leaveRequestsTable.durationType,
           halfDaySegment: leaveRequestsTable.halfDaySegment,
@@ -958,9 +1134,9 @@ export class LeavesService {
           requestedHalfDaySegment !== existing.halfDaySegment
         ) {
           // No conflict - different half-day segments can coexist
-          continue; 
+          continue;
         }
-        
+
         // Any other overlap is a conflict
         throw new BadRequestException(
           "Overlapping leave request exists for the selected period"
@@ -969,7 +1145,7 @@ export class LeavesService {
 
       requiresApproval =
         leaveType.requiresApproval === undefined ||
-        leaveType.requiresApproval === null
+          leaveType.requiresApproval === null
           ? true
           : leaveType.requiresApproval;
       isPaidLeave = leaveType.paid ?? true;
@@ -1074,6 +1250,13 @@ export class LeavesService {
         })
         .returning();
 
+      await this.syncBereavementLeaveRequestDetails(
+        tx,
+        request.id,
+        leaveType,
+        payload,
+      );
+
       if (leaveType.code === COMP_OFF_LEAVE_CODE) {
         await this.linkCompOffCreditsToLeaveRequest(
           tx,
@@ -1119,13 +1302,25 @@ export class LeavesService {
         }
       }
 
-      return request;
+      return {
+        ...request,
+        bereavementDetails: this.formatBereavementDetails(
+          isBereavementLeave ? payload.relationship : null,
+          isBereavementLeave
+            ? payload.relationship === "other_immediate_family_member"
+              ? payload.relationshipDetails?.trim() ?? null
+              : null
+            : null,
+        ),
+      };
     });
 
     // Fetch user and leave type details for notification
     const [userInfo] = await db
       .select({
         name: usersTable.name,
+        email: usersTable.email,
+        managerId: usersTable.managerId,
         slackId: usersTable.slackId,
         discordId: usersTable.discordId,
       })
@@ -1136,10 +1331,22 @@ export class LeavesService {
     const [leaveTypeInfo] = await db
       .select({
         name: leaveTypesTable.name,
+        code: leaveTypesTable.code,
       })
       .from(leaveTypesTable)
       .where(eq(leaveTypesTable.id, payload.leaveTypeId))
       .limit(1);
+
+    const [managerInfo] = userInfo?.managerId
+      ? await db
+        .select({
+          name: usersTable.name,
+          email: usersTable.email,
+        })
+        .from(usersTable)
+        .where(eq(usersTable.id, userInfo.managerId))
+        .limit(1)
+      : [];
 
     const notificationPayload = {
       type: "leave_request",
@@ -1153,10 +1360,55 @@ export class LeavesService {
       userSlackId: userInfo?.slackId ?? null,
       userDiscordId: userInfo?.discordId ?? null,
       leaveTypeName: leaveTypeInfo?.name ?? "Leave",
+      leaveTypeCode: leaveTypeInfo?.code ?? null,
       reason: payload.reason ?? null,
     };
 
     await this.notifyLatestProjectSlackChannel(userId, orgId, notificationPayload);
+
+    let emailDeliveryResult: LeaveEmailDeliveryResult | null = null;
+    let specialLeaveEmailResult: LeaveEmailDeliveryResult | null = null;
+
+    if (
+      uploadedDocument &&
+      leaveTypeInfo &&
+      this.isLeaveTypeRequiringSupportingDocument(leaveTypeInfo)
+    ) {
+      emailDeliveryResult = await this.sendSupportingDocumentEmail({
+        managerEmail: managerInfo?.email ?? null,
+        employeeName: userInfo?.name ?? `User ${userId}`,
+        employeeEmail: userInfo?.email ?? null,
+        leaveTypeName: leaveTypeInfo.name,
+        startDate,
+        endDate,
+        courseOrProgrammeName: payload.courseOrProgrammeName?.trim() ?? null,
+        document: uploadedDocument,
+      });
+
+      if (!emailDeliveryResult.sent) {
+        this.logger.warn(
+          `Supporting document email could not be sent for leave request ${request.id}: ${emailDeliveryResult.reason ?? "unknown reason"}`,
+        );
+      }
+    }
+
+    if (leaveTypeInfo && this.isSpecialLeaveNotificationType(leaveTypeInfo)) {
+      specialLeaveEmailResult = await this.sendSpecialLeaveNotificationEmail({
+        toEmail: "amruta@navgurukul.org",
+        managerEmail: managerInfo?.email ?? null,
+        employeeName: userInfo?.name ?? `User ${userId}`,
+        employeeEmail: userInfo?.email ?? null,
+        leaveTypeName: leaveTypeInfo.name,
+        startDate,
+        endDate,
+      });
+
+      if (!specialLeaveEmailResult.sent) {
+        this.logger.warn(
+          `Special leave email could not be sent for leave request ${request.id}: ${specialLeaveEmailResult.reason ?? "unknown reason"}`,
+        );
+      }
+    }
 
     const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
     if (actorRole) {
@@ -1179,12 +1431,16 @@ export class LeavesService {
       });
     }
 
-    return request;
+    return {
+      ...request,
+      emailNotification: emailDeliveryResult ?? specialLeaveEmailResult,
+    };
   }
 
   async createLeaveRequestForUser(
     actor: AuthenticatedUser,
-    payload: CreateLeaveForUserDto
+    payload: CreateLeaveForUserDto,
+    uploadedDocument?: LeaveDocumentUpload,
   ) {
     const db = this.database.connection;
     checkAdminSelfAction(actor, payload.userId.toString());
@@ -1215,6 +1471,7 @@ export class LeavesService {
       targetUser.orgId,
       payload,
       actor,
+      uploadedDocument,
     );
   }
 
@@ -1335,6 +1592,13 @@ export class LeavesService {
           "No leave policy configured for the selected leave type"
         );
       }
+
+      await this.syncBereavementLeaveRequestDetails(
+        tx,
+        existingRequest.id,
+        targetLeaveType,
+        payload,
+      );
 
       const { workingDays, totalHours } = await this.calculateWorkingHours(
         actor.orgId,
@@ -1465,13 +1729,13 @@ export class LeavesService {
       const previousHours = Number(existingRequest.hours ?? 0);
       const previousLeaveTypeId = Number(existingRequest.leaveTypeId);
       const previousPaidLeave = existingRequest.leaveTypePaid ?? true;
-      const previousIsLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE || 
-                            (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+      const previousIsLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE ||
+        (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
       const previousShouldTrackBalance = previousPaidLeave || previousIsLWP;
-      
+
       const nextPaidLeave = targetLeaveType.paid ?? true;
-      const nextIsLWP = targetLeaveType.code === LWP_LEAVE_CODE || 
-                        (targetLeaveType.name?.toLowerCase().includes('without pay') ?? false);
+      const nextIsLWP = targetLeaveType.code === LWP_LEAVE_CODE ||
+        (targetLeaveType.name?.toLowerCase().includes('without pay') ?? false);
       const nextShouldTrackBalance = nextPaidLeave || nextIsLWP;
 
       if (previousShouldTrackBalance) {
@@ -1591,6 +1855,21 @@ export class LeavesService {
         });
       }
 
+      const [bereavementDetails] = await tx
+        .select({
+          relationship: bereavementLeaveRequestTable.relationship,
+          relationshipDetails:
+            bereavementLeaveRequestTable.relationshipDetails,
+        })
+        .from(bereavementLeaveRequestTable)
+        .where(
+          eq(
+            bereavementLeaveRequestTable.leaveRequestId,
+            updatedRequest.id,
+          )
+        )
+        .limit(1);
+
       return {
         id: updatedRequest.id,
         userId: updatedRequest.userId,
@@ -1603,6 +1882,10 @@ export class LeavesService {
         hours: Number(updatedRequest.hours ?? 0),
         reason: updatedRequest.reason ?? null,
         updatedAt: updatedRequest.updatedAt,
+        bereavementDetails: this.formatBereavementDetails(
+          bereavementDetails?.relationship,
+          bereavementDetails?.relationshipDetails ?? null,
+        ),
       };
     });
   }
@@ -1670,8 +1953,8 @@ export class LeavesService {
       let updatedBalance: LeaveBalanceSnapshot | null = null;
 
       const isPaidLeave = existingRequest.leaveTypePaid ?? true;
-      const isLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE || 
-                    (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+      const isLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE ||
+        (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
       const shouldRestoreBalance = isPaidLeave || isLWP;
 
       if (shouldRestoreBalance) {
@@ -1756,10 +2039,10 @@ export class LeavesService {
         restoredHours: approvedHours,
         recalculatedBalance: updatedBalance
           ? {
-              balanceHours: this.normalizeHours(updatedBalance.balanceHours),
-              pendingHours: this.normalizeHours(updatedBalance.pendingHours),
-              bookedHours: this.normalizeHours(updatedBalance.bookedHours),
-            }
+            balanceHours: this.normalizeHours(updatedBalance.balanceHours),
+            pendingHours: this.normalizeHours(updatedBalance.pendingHours),
+            bookedHours: this.normalizeHours(updatedBalance.bookedHours),
+          }
           : null,
       };
     });
@@ -2562,7 +2845,7 @@ export class LeavesService {
         0,
         Math.floor(
           (requestDates.endDate.getTime() - requestDates.startDate.getTime()) /
-            (24 * 60 * 60 * 1000)
+          (24 * 60 * 60 * 1000)
         )
       );
 
@@ -2707,8 +2990,8 @@ export class LeavesService {
 
       const updatedNotes = payload.reason
         ? `${credit.notes ? `${credit.notes} | ` : ""}Revoked: ${
-            payload.reason
-          }`
+          payload.reason
+        }`
         : credit.notes ?? null;
 
       await tx
@@ -2749,12 +3032,12 @@ export class LeavesService {
         balance:
           leaveTypeId && snapshot
             ? {
-                leaveTypeId,
-                balanceHours: snapshot.balanceHours,
-                pendingHours: snapshot.pendingHours,
-                bookedHours: snapshot.bookedHours,
-                allocatedHours: snapshot.allocatedHours,
-              }
+              leaveTypeId,
+              balanceHours: snapshot.balanceHours,
+              pendingHours: snapshot.pendingHours,
+              bookedHours: snapshot.bookedHours,
+              allocatedHours: snapshot.allocatedHours,
+            }
             : null,
       };
     });
@@ -3171,8 +3454,8 @@ export class LeavesService {
       const actorRole = isSuperAdmin
         ? 'super_admin'
         : isAdmin
-        ? 'admin'
-        : null;
+          ? 'admin'
+          : null;
 
       // Admin and super_admin can approve any request (except their own)
       if (!isAdmin && !isSuperAdmin) {
@@ -3243,11 +3526,11 @@ export class LeavesService {
         );
 
       const isPaidLeave = request.leaveTypePaid ?? true;
-      
+
       // Check if this is an LWP leave type
-      const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
-                    (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
-      
+      const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE ||
+        (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+
       // Handle balance adjustments for paid leaves and LWP
       const shouldAdjustBalance = isPaidLeave || isLWP;
 
@@ -3379,8 +3662,8 @@ export class LeavesService {
       const actorRole = isSuperAdmin
         ? 'super_admin'
         : isAdmin
-        ? 'admin'
-        : null;
+          ? 'admin'
+          : null;
 
       // Check if user has any authorization role
       if (!isAdmin && !isSuperAdmin && !isManager) {
@@ -3512,10 +3795,10 @@ export class LeavesService {
       if (action === "approve") {
         for (const request of eligible) {
           const isPaidLeave = request.leaveTypePaid ?? true;
-          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
-                        (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE ||
+            (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
           const shouldAdjustBalance = isPaidLeave || isLWP;
-          
+
           if (!shouldAdjustBalance) {
             continue;
           }
@@ -3533,10 +3816,10 @@ export class LeavesService {
       } else {
         for (const request of eligible) {
           const isPaidLeave = request.leaveTypePaid ?? true;
-          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
-                        (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE ||
+            (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
           const shouldAdjustBalance = isPaidLeave || isLWP;
-          
+
           if (!shouldAdjustBalance) {
             continue;
           }
@@ -3777,7 +4060,7 @@ export class LeavesService {
     const end = this.normalizeDateUTC(endDate);
 
     const rows = await db
-      .select({ 
+      .select({
         id: timesheetsTable.id,
         totalHours: timesheetsTable.totalHours,
         workDate: timesheetsTable.workDate,
@@ -3846,7 +4129,7 @@ export class LeavesService {
     payload: Record<string, unknown>
   ) {
     const db = this.database.connection;
-    
+
     // Get recent projects from employee's timesheet entries
     const projects = await db
       .select({
@@ -3894,18 +4177,18 @@ export class LeavesService {
     for (const project of projects) {
       const workDate = new Date(project.workDate);
       const dayOfWeek = workDate.getUTCDay(); // 0 = Sunday, 6 = Saturday
-      
+
       // Skip Saturday (6) and Sunday (0)
       if (dayOfWeek === 0 || dayOfWeek === 6) {
         continue;
       }
-      
+
       // Check if it's a holiday or festival leave day
       const dayInfo = await this.calendarService.getDayInfo(orgId, workDate);
       if (dayInfo.isHoliday) {
         continue; // Skip festival/holiday days
       }
-      
+
       // Found the last valid working date
       lastValidWorkDate = workDate;
       break;
@@ -3918,17 +4201,17 @@ export class LeavesService {
     // Get ALL projects from that last valid working day (excluding filtered projects)
     const validProjects = projects.filter(project => {
       const workDate = new Date(project.workDate);
-      
+
       // Must be from the last valid working date
       if (workDate.getTime() !== lastValidWorkDate.getTime()) {
         return false;
       }
-      
+
       // Skip Learning Saturday project
       if (project.projectName && project.projectName.toLowerCase().includes('Learning Saturdays')) {
         return false;
       }
-      
+
       return true;
     });
 
@@ -4173,7 +4456,7 @@ export class LeavesService {
     if (!balance) {
       return;
     }
-    
+
     await this.expireGrantedCompOffCredits(tx, orgId, userId, new Date());
     await this.expireStaleCompOffCredits(tx, orgId, userId, new Date());
   }
@@ -4528,9 +4811,9 @@ export class LeavesService {
     const expectedAttendance =
       effectiveEndDate >= effectiveStartDate
         ? Math.floor(
-            (effectiveEndDate.getTime() - effectiveStartDate.getTime()) /
-              (24 * 60 * 60 * 1000),
-          ) + 1
+          (effectiveEndDate.getTime() - effectiveStartDate.getTime()) /
+          (24 * 60 * 60 * 1000),
+        ) + 1
         : 0;
 
     let weekOffDays = 0;
@@ -4991,8 +5274,8 @@ export class LeavesService {
 
           // Balance rebalancing/restoration
           const isPaidLeave = leave.leaveTypePaid ?? true;
-          const isLWP = leave.leaveTypeCode === LWP_LEAVE_CODE || 
-                        (leave.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+          const isLWP = leave.leaveTypeCode === LWP_LEAVE_CODE ||
+            (leave.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
           const shouldAdjustBalance = isPaidLeave || isLWP;
 
           if (shouldAdjustBalance) {
@@ -5066,5 +5349,269 @@ export class LeavesService {
       skippedCount,
       failures,
     };
+  }
+  private isLeaveTypeRequiringSupportingDocument(leaveType: {
+    code?: string | null;
+    name?: string | null;
+  }): boolean {
+    const code = this.normalizeLeaveTypeLabel(leaveType.code);
+    const name = this.normalizeLeaveTypeLabel(leaveType.name);
+    const allowedLabels = new Set([
+      "exam",
+      "exam leave",
+      "l d",
+      "l d leave",
+      "l and d",
+      "l and d leave",
+      "learning and development",
+      "learning and development leave",
+      "vipassana course",
+      "vipassana course leave",
+      "vipassana seva",
+      "vipassana seva leave",
+      "wedding",
+      "wedding leave",
+      "election",
+      "election leave",
+    ]);
+
+    return Boolean(
+      (code && allowedLabels.has(code)) || (name && allowedLabels.has(name)),
+    );
+  }
+
+  private isSpecialLeaveNotificationType(leaveType: {
+    code?: string | null;
+    name?: string | null;
+  }): boolean {
+    const code = leaveType.code?.toLowerCase().trim() ?? "";
+    const name = leaveType.name?.toLowerCase().trim() ?? "";
+    const combined = `${code} ${name}`;
+
+    return (
+      combined.includes("maternity") ||
+      combined.includes("parental") ||
+      combined.includes("adoption") ||
+      combined.includes("srs")
+    );
+  }
+
+  private isExamOrLearningLeaveType(leaveType: {
+    code?: string | null;
+    name?: string | null;
+  }): boolean {
+    const code = this.normalizeLeaveTypeLabel(leaveType.code);
+    const name = this.normalizeLeaveTypeLabel(leaveType.name);
+    const examOrLearningLabels = new Set([
+      "exam",
+      "exam leave",
+      "l d",
+      "l d leave",
+      "l and d",
+      "l and d leave",
+      "learning and development",
+      "learning and development leave",
+    ]);
+
+    return Boolean(
+      (code && examOrLearningLabels.has(code)) ||
+      (name && examOrLearningLabels.has(name)),
+    );
+  }
+
+  private normalizeLeaveTypeLabel(value?: string | null): string {
+    return (value ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  private formatDateForEmail(dateInput: Date): string {
+    return dateInput.toLocaleDateString("en-IN", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      timeZone: "Asia/Kolkata",
+    });
+  }
+
+  private formatDateRangeForSubject(startDate: Date, endDate: Date): string {
+    const start = this.formatDateForEmail(startDate);
+    const end = this.formatDateForEmail(endDate);
+    return start === end ? start : `${start} to ${end}`;
+  }
+
+  private async sendSupportingDocumentEmail(params: {
+    managerEmail: string | null;
+    employeeName: string;
+    employeeEmail: string | null;
+    leaveTypeName: string;
+    startDate: Date;
+    endDate: Date;
+    courseOrProgrammeName: string | null;
+    document: LeaveDocumentUpload;
+  }): Promise<LeaveEmailDeliveryResult> {
+    const {
+      managerEmail,
+      employeeName,
+      employeeEmail,
+      leaveTypeName,
+      startDate,
+      endDate,
+      courseOrProgrammeName,
+      document,
+    } = params;
+
+    if (!managerEmail || !employeeEmail) {
+      this.logger.warn(
+        `Missing manager/employee email for supporting document email (employee: ${employeeName})`,
+      );
+      return {
+        sent: false,
+        reason: "Missing manager or employee email",
+      };
+    }
+
+    const smtpHost = this.configService.get<string>("SMTP_HOST");
+    const smtpPort = Number(this.configService.get<string>("SMTP_PORT") ?? "587");
+    const smtpUser = this.configService.get<string>("SMTP_USER");
+    const smtpPass = this.configService.get<string>("SMTP_PASSWORD");
+    const smtpSecure = this.configService.get<string>("SMTP_SECURE") === "true";
+    const fromAddress =
+      this.configService.get<string>("SMTP_FROM") ??
+      this.configService.get<string>("MAIL_FROM") ??
+      smtpUser;
+
+    if (!smtpHost || !smtpPort || !fromAddress) {
+      this.logger.warn("SMTP configuration is incomplete. Skipping leave document email.");
+      return {
+        sent: false,
+        reason: "SMTP configuration is incomplete",
+      };
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpSecure,
+      auth: smtpUser && smtpPass ? { user: smtpUser, pass: smtpPass } : undefined,
+    });
+
+    const dateRange = this.formatDateRangeForSubject(startDate, endDate);
+    const ccRecipients = Array.from(new Set(["amruta@navgurukul.org", employeeEmail]));
+    const lowerLeaveTypeName = leaveTypeName.toLowerCase();
+    const includeProgrammeName =
+      lowerLeaveTypeName.includes("exam") ||
+      lowerLeaveTypeName.includes("l&d") ||
+      lowerLeaveTypeName.includes("learning and development");
+
+    const lines = [
+      `Employee email: ${employeeEmail}`,
+      `Leave type: ${leaveTypeName}`,
+      `Date range: ${dateRange}`,
+    ];
+
+    if (includeProgrammeName && courseOrProgrammeName) {
+      lines.push(`Course/Programme name: ${courseOrProgrammeName}`);
+    }
+
+    try {
+      await transporter.sendMail({
+        from: fromAddress,
+        to: managerEmail,
+        cc: ccRecipients,
+        subject: `Application for ${leaveTypeName} — ${employeeName} — ${dateRange}`,
+        text: lines.join("\n"),
+        attachments: [
+          {
+            filename: document.originalname,
+            content: document.buffer,
+            contentType: document.mimetype,
+          },
+        ],
+      });
+      return { sent: true };
+    } catch (error) {
+      this.logger.error(
+        `Failed to send supporting document email: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return {
+        sent: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private async sendSpecialLeaveNotificationEmail(params: {
+    toEmail: string;
+    managerEmail: string | null;
+    employeeName: string;
+    employeeEmail: string | null;
+    leaveTypeName: string;
+    startDate: Date;
+    endDate: Date;
+  }): Promise<LeaveEmailDeliveryResult> {
+    const {
+      toEmail,
+      managerEmail,
+      employeeName,
+      employeeEmail,
+      leaveTypeName,
+      startDate,
+      endDate,
+    } = params;
+
+    const smtpHost = this.configService.get<string>("SMTP_HOST");
+    const smtpPort = Number(this.configService.get<string>("SMTP_PORT") ?? "587");
+    const smtpUser = this.configService.get<string>("SMTP_USER");
+    const smtpPass = this.configService.get<string>("SMTP_PASSWORD");
+    const smtpSecure = this.configService.get<string>("SMTP_SECURE") === "true";
+    const fromAddress =
+      this.configService.get<string>("SMTP_FROM") ??
+      this.configService.get<string>("MAIL_FROM") ??
+      smtpUser;
+
+    if (!smtpHost || !smtpPort || !fromAddress) {
+      this.logger.warn("SMTP configuration is incomplete. Skipping special leave email.");
+      return {
+        sent: false,
+        reason: "SMTP configuration is incomplete",
+      };
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpSecure,
+      auth: smtpUser && smtpPass ? { user: smtpUser, pass: smtpPass } : undefined,
+    });
+
+    const dateRange = this.formatDateRangeForSubject(startDate, endDate);
+    const ccRecipients = [managerEmail, employeeEmail].filter(
+      (email): email is string => Boolean(email),
+    );
+
+    try {
+      await transporter.sendMail({
+        from: fromAddress,
+        to: toEmail,
+        cc: ccRecipients,
+        subject: `Application for ${leaveTypeName} — ${employeeName} — ${dateRange}`,
+        text: [
+          `Employee name: ${employeeName}`,
+          `Leave type: ${leaveTypeName}`,
+          `Date range: ${dateRange}`,
+        ].join("\n"),
+      });
+      return { sent: true };
+    } catch (error) {
+      this.logger.error(
+        `Failed to send special leave notification email: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return {
+        sent: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 }
