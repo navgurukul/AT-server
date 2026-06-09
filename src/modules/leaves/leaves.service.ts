@@ -182,7 +182,7 @@ export class LeavesService {
     private readonly calendarService: CalendarService,
     private readonly auditService: AuditService,
     private readonly configService: ConfigService,
-  ) {}
+  ) { }
 
   private async consumeCompOffCredits(
     tx: DatabaseService['connection'],
@@ -2989,8 +2989,7 @@ export class LeavesService {
       }
 
       const updatedNotes = payload.reason
-        ? `${credit.notes ? `${credit.notes} | ` : ""}Revoked: ${
-          payload.reason
+        ? `${credit.notes ? `${credit.notes} | ` : ""}Revoked: ${payload.reason
         }`
         : credit.notes ?? null;
 
@@ -3476,6 +3475,18 @@ export class LeavesService {
             "Only admin or super_admin can approve or reject this leave"
           );
         }
+
+        // Managers cannot approve/reject leave requests from past salary cycles
+        const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(new Date());
+        const cycleStart = this.normalizeDateUTC(currentCycle.start);
+        const normalizedStartDate = this.normalizeDateUTC(new Date(request.startDate));
+        const normalizedEndDate = this.normalizeDateUTC(new Date(request.endDate));
+        
+        if (normalizedStartDate < cycleStart || normalizedEndDate < cycleStart) {
+          throw new ForbiddenException(
+            "Managers cannot approve or reject leave requests from past salary cycles."
+          );
+        }
       }
 
 
@@ -3721,6 +3732,9 @@ export class LeavesService {
         );
       }
 
+      const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(new Date());
+      const cycleStart = this.normalizeDateUTC(currentCycle.start);
+
       const managedCandidates = candidates.filter((candidate) => {
         checkAdminSelfAction(approver, candidate.userId.toString());
         // Always exclude user's own leave requests
@@ -3739,6 +3753,17 @@ export class LeavesService {
           if (this.isPrivilegedLeaveType(candidate.leaveTypeCode, candidate.leaveTypeName)) {
             return false;
           }
+
+          // Managers cannot approve/reject leave requests from past salary cycles
+          const normalizedStartDate = this.normalizeDateUTC(new Date(candidate.startDate));
+          const normalizedEndDate = this.normalizeDateUTC(new Date(candidate.endDate));
+          
+          if (normalizedStartDate < cycleStart || normalizedEndDate < cycleStart) {
+            throw new ForbiddenException(
+              "Managers cannot approve or reject leave requests from past salary cycles."
+            );
+          }
+
           return true;
         }
 
@@ -4458,6 +4483,7 @@ export class LeavesService {
     }
 
     await this.expireGrantedCompOffCredits(tx, orgId, userId, new Date());
+    await this.expirePendingCompOffCredits(tx, orgId, userId, new Date());
     await this.expireStaleCompOffCredits(tx, orgId, userId, new Date());
   }
 
@@ -4497,6 +4523,30 @@ export class LeavesService {
         updatedAt: referenceDate,
       })
       .where(inArray(compOffCreditsTable.id, creditIds));
+  }
+
+  // change status from 'pending' to 'expired' when expiresAt is passed 
+  private async expirePendingCompOffCredits(
+    tx: DatabaseService['connection'],
+    orgId: number,
+    userId: number,
+    referenceDate: Date
+  ) {
+    await tx
+      .update(compOffCreditsTable)
+      .set({
+        status: 'expired',
+        updatedAt: referenceDate,
+      })
+      .where(
+        and(
+          eq(compOffCreditsTable.orgId, orgId),
+          eq(compOffCreditsTable.userId, userId),
+          eq(compOffCreditsTable.status, 'pending'),
+          lt(compOffCreditsTable.expiresAt, referenceDate),
+          isNull(compOffCreditsTable.leaveRequestId),
+        )
+      );
   }
 
   private async expireStaleCompOffCredits(
