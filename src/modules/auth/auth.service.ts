@@ -19,6 +19,7 @@ import {
   timesheetsTable,
   orgsTable,
 } from '../../db/schema';
+import { LeaveAllocationService } from '../leave-allocation/leave-allocation.service';
 import { LoginDto } from './dto/login.dto';
 import { JwtPayload } from './types/jwt-payload.interface';
 import { validateUserAccess } from '../../common/utils/access-control.util';
@@ -33,6 +34,7 @@ export class AuthService {
     private readonly databaseService: DatabaseService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly leaveAllocationService: LeaveAllocationService,
   ) {
     const clientId = this.configService.get<string>('GOOGLE_CLIENT_ID');
     if (!clientId) {
@@ -84,6 +86,15 @@ export class AuthService {
     const employeeDepartmentId = user.employeeDepartmentId
       ? Number(user.employeeDepartmentId)
       : null;
+
+    const isFirstLogin = !user.lastLoginAt;
+    if (isFirstLogin) {
+      try {
+        await this.leaveAllocationService.initialize(Number(user.id));
+      } catch (error) {
+        this.logger.error(`Leave allocation failed for user ${user.id}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
 
     if (!user.googleUserId) {
       await db

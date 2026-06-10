@@ -6,11 +6,13 @@ import { DatabaseModule } from '../../database/database.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { JwtStrategy } from './strategies/jwt.strategy';
+import { LeaveAllocationModule } from '../leave-allocation/leave-allocation.module';
 
 @Module({
   imports: [
     ConfigModule,
     DatabaseModule,
+    LeaveAllocationModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
