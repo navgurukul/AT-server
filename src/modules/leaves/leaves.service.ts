@@ -930,6 +930,19 @@ export class LeavesService {
         );
         throw new BadRequestException('Leave request cannot exceed Date of Exit');
       }
+
+      // Block restricted leave types if the leave request overlaps the notice period
+      const exitDate = new Date(exitDateStr + 'T00:00:00Z');
+      const noticeStartDate = new Date(exitDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+      const noticeStartStr = getYYYYMMDD(noticeStartDate);
+
+      const overlapsNoticePeriod = startDateStr >= noticeStartStr || endDateStr >= noticeStartStr;
+      if (overlapsNoticePeriod) {
+        const restrictedLeaveTypeIds = [2, 13, 14, 15, 10, 1]; // CL (2), L&D (13), VS (14), VCL (15), Wedding (10), EL (1)
+        if (restrictedLeaveTypeIds.includes(payload.leaveTypeId)) {
+          throw new BadRequestException('Cannot apply for or modify restricted leaves during the notice period.');
+        }
+      }
     }
 
     if (endDate < startDate) {
@@ -1540,6 +1553,19 @@ export class LeavesService {
         if (startDateStr > exitDateStr || endDateStr > exitDateStr) {
           this.logger.warn(`Blocked admin leave request update: userId=${existingRequest.userId}, range=${startDateStr} to ${endDateStr}, dateOfExit=${exitDateStr}`);
           throw new BadRequestException('Leave request cannot exceed Date of Exit');
+        }
+
+        // Block restricted leave types if the leave request overlaps the notice period
+        const exitDate = new Date(exitDateStr + 'T00:00:00Z');
+        const noticeStartDate = new Date(exitDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+        const noticeStartStr = getYYYYMMDD(noticeStartDate);
+
+        const overlapsNoticePeriod = startDateStr >= noticeStartStr || endDateStr >= noticeStartStr;
+        if (overlapsNoticePeriod) {
+          const restrictedLeaveTypeIds = [2, 13, 14, 15, 10, 1]; // CL (2), L&D (13), VS (14), VCL (15), Wedding (10), EL (1)
+          if (restrictedLeaveTypeIds.includes(payload.leaveTypeId)) {
+            throw new BadRequestException('Cannot apply for or modify restricted leaves during the notice period.');
+          }
         }
       }
       checkAdminSelfAction(actor, existingRequest.userId.toString());
@@ -4420,6 +4446,11 @@ export class LeavesService {
       await tx.insert(leavePoliciesTable).values({
         orgId,
         leaveTypeId: leaveType.id,
+        validEmploymentTypes: ["full-time"],
+        requiresAlumni: null,
+        triggerEvent: "DAY_1",
+        baseAllocationDays: "0.00",
+        isProrated: false,
         accrualRule: null,
         carryForwardRule: null,
         maxBalance: null,
@@ -5289,16 +5320,36 @@ export class LeavesService {
     const failures: string[] = [];
 
     // 2. Filter in-memory using timezone-safe comparison
-    const leavesToProcess = expiredLeaves.filter((leave) => {
+    const todayStr = getYYYYMMDD(new Date());
+    const restrictedLeaveTypeIds = [2, 13, 14, 15, 10, 1]; // CL (2), L&D (13), VS (14), VCL (15), Wedding (10), EL (1)
+
+    const leavesToProcess: typeof expiredLeaves = [];
+    for (const leave of expiredLeaves) {
       const startDateStr = getYYYYMMDD(new Date(leave.startDate));
       const endDateStr = getYYYYMMDD(new Date(leave.endDate));
       const exitDateStr = getYYYYMMDD(leave.dateOfExit!);
       const isPastExit = startDateStr > exitDateStr || endDateStr > exitDateStr;
-      if (!isPastExit) {
+
+      // Check notice period eligibility
+      const exitDate = new Date(exitDateStr + 'T00:00:00Z');
+      const noticeStartDate = new Date(exitDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+      const noticeStartStr = getYYYYMMDD(noticeStartDate);
+      const isCurrentlyInNoticePeriod = todayStr >= noticeStartStr && todayStr <= exitDateStr;
+      
+      const overlapsNoticePeriod = startDateStr >= noticeStartStr || endDateStr >= noticeStartStr;
+      const isRestrictedType = restrictedLeaveTypeIds.includes(leave.leaveTypeId);
+
+      const isRestrictedInNotice = isCurrentlyInNoticePeriod && overlapsNoticePeriod && isRestrictedType;
+
+      if (isPastExit || isRestrictedInNotice) {
+        (leave as any).autoCancelReason = isPastExit
+          ? `Automated cleanup: leave range falls beyond Date of Exit (${exitDateStr})`
+          : `Automated cleanup: restricted leave type is not allowed during notice period (notice started: ${noticeStartStr})`;
+        leavesToProcess.push(leave);
+      } else {
         skippedCount++;
       }
-      return isPastExit;
-    });
+    }
 
     for (const leave of leavesToProcess) {
       try {
@@ -5375,7 +5426,7 @@ export class LeavesService {
             },
             next: {
               state: newState,
-              reason: `Automated cleanup: leave range falls beyond Date of Exit (${exitDateStr})`,
+              reason: (leave as any).autoCancelReason,
               leaveId: leave.id,
               dateOfExit: exitDateStr,
             },

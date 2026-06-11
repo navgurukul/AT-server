@@ -345,6 +345,16 @@ export const leavePolicies = pgTable("leave_policies", {
   leaveTypeId: integer("leave_type_id")
     .notNull()
     .references(() => leaveTypes.id),
+
+  // Rule Conditions
+  validEmploymentTypes: varchar("valid_employment_types", { length: 50 }).array().notNull(), 
+  requiresAlumni: boolean("requires_alumni"), // true = Alumni, false = Non-Alumni, null = Both
+  triggerEvent: varchar("trigger_event", { length: 20 }).notNull(), // 'DAY_1' or 'DAY_91'
+
+  // Allocation Math
+  baseAllocationDays: numeric("base_allocation_days", { precision: 5, scale: 2 }).notNull(),
+  isProrated: boolean("is_prorated").notNull().default(false), 
+
   accrualRule: jsonb("accrual_rule"),
   carryForwardRule: jsonb("carry_forward_rule"),
   maxBalance: numeric("max_balance", { precision: 6, scale: 2 }),
@@ -723,6 +733,28 @@ export const mvLeaveTrendsMonthly = pgTable(
   })
 );
 
+export const leaveAllocationLogs = pgTable(
+  "leave_allocation_logs",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    allocationType: varchar("allocation_type", { length: 20 }).notNull(),
+    processedAt: timestamp("processed_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => ({
+    uniqUserAllocation: uniqueIndex("uq_leave_allocation_log").on(
+      table.userId,
+      table.allocationType
+    ),
+  })
+);
+
+export const leaveAllocationLogsTable = leaveAllocationLogs;
+
 export const schema = {
   orgs,
   departments,
@@ -756,6 +788,7 @@ export const schema = {
   mvProjectCostsMonthly,
   mvUserProductivityDaily,
   mvLeaveTrendsMonthly,
+  leaveAllocationLogs,
 };
 
 // Legacy aliases to maintain compatibility with existing imports
