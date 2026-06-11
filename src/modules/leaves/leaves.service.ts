@@ -11,6 +11,7 @@ import {
   count,
   desc,
   eq,
+  ne,
   gte,
   inArray,
   lte,
@@ -90,6 +91,7 @@ interface CompOffCreditListRow {
   status: string;
   expiresAt: Date | string;
   leaveRequestId: number | null;
+  nextLeaveRequestId: number | null;
 }
 
 export interface MyCompOffCreditItem {
@@ -206,7 +208,10 @@ export class LeavesService {
         .where(
           and(
             activeCreditConditions,
-            eq(compOffCreditsTable.leaveRequestId, leaveRequestId),
+            or(
+              eq(compOffCreditsTable.leaveRequestId, leaveRequestId),
+              eq(compOffCreditsTable.nextLeaveRequestId, leaveRequestId),
+            ),
           ),
         )
         .orderBy(compOffCreditsTable.workDate)
@@ -219,7 +224,16 @@ export class LeavesService {
         and(
           activeCreditConditions,
           leaveRequestId
-            ? isNull(compOffCreditsTable.leaveRequestId)
+            ? and(
+                or(
+                  isNull(compOffCreditsTable.leaveRequestId),
+                  ne(compOffCreditsTable.leaveRequestId, leaveRequestId),
+                ),
+                or(
+                  isNull(compOffCreditsTable.nextLeaveRequestId),
+                  ne(compOffCreditsTable.nextLeaveRequestId, leaveRequestId),
+                ),
+              )
             : sql`true`,
         ),
       )
@@ -254,13 +268,26 @@ export class LeavesService {
             ? 'availed'
             : 'partial_availed';
 
+        const updateFields: any = {
+          availedHours: newAvailedHours.toString(),
+          status: newStatus,
+        };
+
+        if (
+          leaveRequestId &&
+          credit.leaveRequestId !== leaveRequestId &&
+          credit.nextLeaveRequestId !== leaveRequestId
+        ) {
+          if (credit.leaveRequestId === null) {
+            updateFields.leaveRequestId = leaveRequestId;
+          } else if (credit.nextLeaveRequestId === null) {
+            updateFields.nextLeaveRequestId = leaveRequestId;
+          }
+        }
+
         await tx
           .update(compOffCreditsTable)
-          .set({
-            availedHours: newAvailedHours.toString(),
-            status: newStatus,
-            leaveRequestId: leaveRequestId ?? credit.leaveRequestId,
-          })
+          .set(updateFields)
           .where(eq(compOffCreditsTable.id, credit.id));
 
         remainingHoursToConsume -= hoursToTake;
@@ -333,14 +360,25 @@ export class LeavesService {
     leaveEndDate: Date,
   ) {
     const normalizedLeaveEndDate = this.normalizeDateUTC(leaveEndDate);
-    const credits = await tx
-      .select()
+    const creditsWithRequest = await tx
+      .select({
+        credit: compOffCreditsTable,
+        firstRequestHours: leaveRequestsTable.hours,
+        firstRequestState: leaveRequestsTable.state,
+      })
       .from(compOffCreditsTable)
+      .leftJoin(
+        leaveRequestsTable,
+        eq(compOffCreditsTable.leaveRequestId, leaveRequestsTable.id),
+      )
       .where(
         and(
           eq(compOffCreditsTable.userId, userId),
           inArray(compOffCreditsTable.status, ['granted', 'partial_availed', 'warning']),
-          isNull(compOffCreditsTable.leaveRequestId),
+          or(
+            isNull(compOffCreditsTable.leaveRequestId),
+            isNull(compOffCreditsTable.nextLeaveRequestId),
+          ),
         ),
       )
       .orderBy(compOffCreditsTable.workDate);
@@ -348,10 +386,14 @@ export class LeavesService {
     let remainingHoursToLink = hoursToLink;
     let skippedHoursDueToExpiry = 0;
 
-    for (const credit of credits) {
+    for (const row of creditsWithRequest) {
       if (remainingHoursToLink <= 0) {
         break;
       }
+
+      const credit = row.credit;
+      const firstRequestHours = row.firstRequestHours;
+      const firstRequestState = row.firstRequestState;
 
       if (
         !this.isCompOffCreditEligibleForLeaveDate(
@@ -359,23 +401,33 @@ export class LeavesService {
           normalizedLeaveEndDate,
         )
       ) {
-        const availableHours =
-          Number(credit.creditedHours) - Number(credit.availedHours);
+        let availableHours = Number(credit.creditedHours) - Number(credit.availedHours);
+        if (credit.leaveRequestId && firstRequestState === 'pending') {
+          availableHours -= Number(firstRequestHours || 0);
+        }
         if (availableHours > 0) {
           skippedHoursDueToExpiry += availableHours;
         }
         continue;
       }
 
-      const availableHours = Number(credit.creditedHours) - Number(credit.availedHours);
+      let availableHours = Number(credit.creditedHours) - Number(credit.availedHours);
+      if (credit.leaveRequestId && firstRequestState === 'pending') {
+        availableHours -= Number(firstRequestHours || 0);
+      }
       const hoursToLinkNow = Math.min(remainingHoursToLink, availableHours);
 
       if (hoursToLinkNow > 0) {
+        const updateFields: any = {};
+        if (credit.leaveRequestId === null) {
+          updateFields.leaveRequestId = leaveRequestId;
+        } else {
+          updateFields.nextLeaveRequestId = leaveRequestId;
+        }
+
         await tx
           .update(compOffCreditsTable)
-          .set({
-            leaveRequestId,
-          })
+          .set(updateFields)
           .where(eq(compOffCreditsTable.id, credit.id));
 
         remainingHoursToLink -= hoursToLinkNow;
@@ -396,28 +448,59 @@ export class LeavesService {
     tx: DatabaseService['connection'],
     leaveRequestId: number,
   ) {
-    // Unlink comp-off credits from the leave request
+    // Find credits where the first link matches this leave request
+    const linkedToFirst = await tx
+      .select()
+      .from(compOffCreditsTable)
+      .where(eq(compOffCreditsTable.leaveRequestId, leaveRequestId));
+
+    for (const credit of linkedToFirst) {
+      // Shift nextLeaveRequestId to leaveRequestId, and set nextLeaveRequestId to null
+      await tx
+        .update(compOffCreditsTable)
+        .set({
+          leaveRequestId: credit.nextLeaveRequestId,
+          nextLeaveRequestId: null,
+        })
+        .where(eq(compOffCreditsTable.id, credit.id));
+    }
+
+    // Find credits where the second link matches this leave request
     await tx
       .update(compOffCreditsTable)
       .set({
-        leaveRequestId: null,
+        nextLeaveRequestId: null,
       })
-      .where(eq(compOffCreditsTable.leaveRequestId, leaveRequestId));
+      .where(eq(compOffCreditsTable.nextLeaveRequestId, leaveRequestId));
 
     // Now, for any affected credits, if expires_at is in the past and status is granted/partial_availed, set status to warning
     const now = new Date();
     const affectedCredits = await tx
-      .select({ id: compOffCreditsTable.id, expiresAt: compOffCreditsTable.expiresAt, status: compOffCreditsTable.status })
+      .select({
+        id: compOffCreditsTable.id,
+        expiresAt: compOffCreditsTable.expiresAt,
+        status: compOffCreditsTable.status,
+      })
       .from(compOffCreditsTable)
       .where(
         and(
-          isNull(compOffCreditsTable.leaveRequestId),
           inArray(compOffCreditsTable.status, ['granted', 'partial_availed']),
           lt(compOffCreditsTable.expiresAt, now),
-        )
+          or(
+            and(
+              eq(compOffCreditsTable.status, 'granted'),
+              isNull(compOffCreditsTable.leaveRequestId),
+            ),
+            and(
+              eq(compOffCreditsTable.status, 'partial_availed'),
+              isNull(compOffCreditsTable.nextLeaveRequestId),
+            ),
+          ),
+        ),
       );
+
     if (affectedCredits.length > 0) {
-      const ids = affectedCredits.map(c => c.id);
+      const ids = affectedCredits.map((c) => c.id);
       await tx
         .update(compOffCreditsTable)
         .set({
@@ -1278,6 +1361,16 @@ export class LeavesService {
           request.id,
           endDate,
         );
+
+        if (shouldAutoApprove) {
+          await this.consumeCompOffCredits(
+            tx,
+            userId,
+            requestedHours,
+            request.id,
+            endDate,
+          );
+        }
       }
 
       if (isPaidLeave || isLWP) {
@@ -2549,6 +2642,8 @@ export class LeavesService {
         }
       }
 
+      await this.expireGrantedCompOffForUserIfNeeded(db, targetUser.id, Number(targetUser.orgId));
+
       const rows = await this.fetchCompOffCreditRows(actor.orgId, [targetUser.id], params.status);
       const credits = this.filterCompOffCreditsBySearch(
         await this.mapCreditsToMyCompOffResponse(actor, rows),
@@ -2617,6 +2712,13 @@ export class LeavesService {
     }
 
     const userIds = visibleUsers.map(user => user.id);
+
+    await Promise.all(
+      userIds.map((id) =>
+        this.expireGrantedCompOffForUserIfNeeded(db, id, actor.orgId)
+      )
+    );
+
     const rows = await this.fetchCompOffCreditRows(actor.orgId, userIds, params.status);
 
     const rowsByUserId = new Map<number, CompOffCreditListRow[]>();
@@ -2662,6 +2764,9 @@ export class LeavesService {
       status?: ListCompOffParams["status"];
     }
   ): Promise<MyCompOffCreditsResponse> {
+    const db = this.database.connection;
+    await this.expireGrantedCompOffForUserIfNeeded(db, actor.id, actor.orgId);
+
     const credits = await this.fetchCompOffCreditRows(actor.orgId, [actor.id]);
     let results = await this.mapCreditsToMyCompOffResponse(actor, credits);
     results = this.filterCompOffCreditsBySearch(results, filters ?? {});
@@ -2753,6 +2858,7 @@ export class LeavesService {
         status: compOffCreditsTable.status,
         expiresAt: compOffCreditsTable.expiresAt,
         leaveRequestId: compOffCreditsTable.leaveRequestId,
+        nextLeaveRequestId: compOffCreditsTable.nextLeaveRequestId,
         createdAt: compOffCreditsTable.createdAt,
       })
       .from(compOffCreditsTable)
@@ -2772,6 +2878,7 @@ export class LeavesService {
       status: row.status,
       expiresAt: row.expiresAt,
       leaveRequestId: row.leaveRequestId,
+      nextLeaveRequestId: row.nextLeaveRequestId,
     }));
   }
 
@@ -2815,7 +2922,7 @@ export class LeavesService {
     }
 
     const leaveRequestIds = credits
-      .map((credit) => credit.leaveRequestId)
+      .flatMap((credit) => [credit.leaveRequestId, credit.nextLeaveRequestId])
       .filter((id): id is number => id !== null && id !== undefined);
 
     const leaveRequestDateById = new Map<number, { startDate: Date; endDate: Date }>();
@@ -2844,12 +2951,16 @@ export class LeavesService {
     const creditsByLeaveRequestId = new Map<number, typeof credits>();
 
     for (const credit of credits) {
-      if (!credit.leaveRequestId) {
-        continue;
+      if (credit.leaveRequestId) {
+        const existingCredits = creditsByLeaveRequestId.get(credit.leaveRequestId) ?? [];
+        existingCredits.push(credit);
+        creditsByLeaveRequestId.set(credit.leaveRequestId, existingCredits);
       }
-      const existingCredits = creditsByLeaveRequestId.get(credit.leaveRequestId) ?? [];
-      existingCredits.push(credit);
-      creditsByLeaveRequestId.set(credit.leaveRequestId, existingCredits);
+      if (credit.nextLeaveRequestId) {
+        const existingCredits = creditsByLeaveRequestId.get(credit.nextLeaveRequestId) ?? [];
+        existingCredits.push(credit);
+        creditsByLeaveRequestId.set(credit.nextLeaveRequestId, existingCredits);
+      }
     }
 
     for (const [leaveRequestId, linkedCredits] of creditsByLeaveRequestId.entries()) {
@@ -3843,60 +3954,55 @@ export class LeavesService {
           )
         );
 
-      if (action === "approve") {
-        for (const request of eligible) {
-          const isPaidLeave = request.leaveTypePaid ?? true;
-          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE ||
-            (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
-          const shouldAdjustBalance = isPaidLeave || isLWP;
+      for (const request of eligible) {
+        const isPaidLeave = request.leaveTypePaid ?? true;
+        const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE ||
+          (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+        const shouldAdjustBalance = isPaidLeave || isLWP;
+        const hours = Number(request.hours ?? 0);
 
-          if (!shouldAdjustBalance) {
-            continue;
-          }
-          const hours = Number(request.hours ?? 0);
+        if (shouldAdjustBalance) {
           await this.ensureLeaveBalanceRow(
             tx,
             request.userId,
             request.leaveTypeId
           );
-          await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
-            pendingHours: -hours,
-            bookedHours: hours,
-          });
-        }
-      } else {
-        for (const request of eligible) {
-          const isPaidLeave = request.leaveTypePaid ?? true;
-          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE ||
-            (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
-          const shouldAdjustBalance = isPaidLeave || isLWP;
 
-          if (!shouldAdjustBalance) {
-            continue;
-          }
-
-          const hours = Number(request.hours ?? 0);
-          if (request.state === "approved") {
-            await this.ensureLeaveBalanceRow(
-              tx,
-              request.userId,
-              request.leaveTypeId
-            );
+          if (action === "approve") {
+            if (request.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
+              await this.consumeCompOffCredits(
+                tx,
+                request.userId,
+                hours,
+                request.id,
+                new Date(request.endDate),
+              );
+            }
             await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
-              bookedHours: -hours,
-              balanceHours: hours,
+              pendingHours: -hours,
+              bookedHours: hours,
             });
           } else if (request.state === "pending") {
-            await this.ensureLeaveBalanceRow(
-              tx,
-              request.userId,
-              request.leaveTypeId
-            );
+            if (request.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
+              await this.clearCompOffCreditLinks(tx, request.id);
+            }
             await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
               pendingHours: -hours,
               balanceHours: hours,
             });
+          } else if (request.state === "approved") {
+            await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
+              bookedHours: -hours,
+              balanceHours: hours,
+            });
           }
+        }
+
+        if (
+          action === "reject" &&
+          request.leaveTypeCode === COMP_OFF_LEAVE_CODE
+        ) {
+          await this.clearCompOffCreditLinks(tx, request.id);
         }
       }
 
@@ -4538,7 +4644,16 @@ export class LeavesService {
           eq(compOffCreditsTable.userId, userId),
           inArray(compOffCreditsTable.status, ['granted', 'partial_availed']),
           lt(compOffCreditsTable.expiresAt, referenceDate),
-          isNull(compOffCreditsTable.leaveRequestId)
+          or(
+            and(
+              eq(compOffCreditsTable.status, 'granted'),
+              isNull(compOffCreditsTable.leaveRequestId),
+            ),
+            and(
+              eq(compOffCreditsTable.status, 'partial_availed'),
+              isNull(compOffCreditsTable.nextLeaveRequestId),
+            ),
+          ),
         )
       );
 
@@ -4605,7 +4720,10 @@ export class LeavesService {
           eq(compOffCreditsTable.userId, userId),
           eq(compOffCreditsTable.status, "warning"),
           // Linked warning credits should stay warning and not auto-expire.
-          isNull(compOffCreditsTable.leaveRequestId),
+          or(
+            isNull(compOffCreditsTable.leaveRequestId),
+            isNull(compOffCreditsTable.nextLeaveRequestId),
+          ),
         )
       );
 
