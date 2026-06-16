@@ -890,12 +890,14 @@ export class TimesheetsService {
 
       // Send Slack notification if configured
       if (channel) {
+        await this.deletePendingTimesheetNotifications(db, orgId, userId, pid, workDate, 'slack');
         this.logger.debug(`Enqueueing Slack notification for project ${projectMeta?.name} (ID: ${pid})`);
         await this.enqueueSlackNotification(orgId, channel, 'timesheet_entry', notificationPayload);
       }
 
       // Send Discord notification if configured
       if (discordWebhook) {
+        await this.deletePendingTimesheetNotifications(db, orgId, userId, pid, workDate, 'discord');
         this.logger.debug(`Enqueueing Discord notification for project ${projectMeta?.name} (ID: ${pid})`);
         await this.enqueueDiscordNotification(orgId, discordWebhook, 'timesheet_entry', notificationPayload);
       }
@@ -3175,6 +3177,32 @@ export class TimesheetsService {
     return Number(backfillCount ?? 0);
   }
 
+  private async deletePendingTimesheetNotifications(
+    db: DatabaseService['connection'],
+    orgId: number,
+    userId: number,
+    projectId: number,
+    workDate: Date,
+    channel?: 'slack' | 'discord'
+  ) {
+    const conditions = [
+      eq(notificationsTable.orgId, orgId),
+      eq(notificationsTable.template, 'timesheet_entry'),
+      eq(notificationsTable.state, 'pending'),
+      eq(sql<string>`${notificationsTable.payload}->>'userId'`, userId.toString()),
+      eq(sql<string>`${notificationsTable.payload}->>'projectId'`, projectId.toString()),
+      eq(sql<string>`${notificationsTable.payload}->>'workDate'`, workDate.toISOString())
+    ];
+
+    if (channel) {
+      conditions.push(eq(notificationsTable.channel, channel));
+    }
+
+    await db
+      .delete(notificationsTable)
+      .where(and(...conditions));
+  }
+
   private async enqueueSlackNotification(
     orgId: number,
     channelId: string,
@@ -4049,6 +4077,99 @@ export class TimesheetsService {
           targetUserId,
           error: errorMsg,
         };
+      }
+
+      // Perform pending notification cleanup/updates if projectId is valid
+      if (existingEntry.projectId !== null && existingEntry.projectId !== undefined) {
+        try {
+          const formattedWorkDateISO = workDate.toISOString();
+          
+          // Query all pending timesheet_entry notifications for this user, project, and date
+          const pendingNotifications = await db
+            .select()
+            .from(notificationsTable)
+            .where(
+              and(
+                eq(notificationsTable.orgId, orgId),
+                eq(notificationsTable.template, 'timesheet_entry'),
+                eq(notificationsTable.state, 'pending'),
+                eq(sql<string>`${notificationsTable.payload}->>'userId'`, targetUserId.toString()),
+                eq(sql<string>`${notificationsTable.payload}->>'projectId'`, existingEntry.projectId.toString()),
+                eq(sql<string>`${notificationsTable.payload}->>'workDate'`, formattedWorkDateISO)
+              )
+            );
+
+          if (pendingNotifications.length > 0) {
+            // Retrieve all other approved entries for this timesheet (excluding the deleted entry) and project
+            const remainingProjectEntries = await db
+              .select({
+                hoursDecimal: timesheetEntriesTable.hoursDecimal,
+                taskDescription: timesheetEntriesTable.taskDescription,
+                taskTitle: timesheetEntriesTable.taskTitle,
+              })
+              .from(timesheetEntriesTable)
+              .where(
+                and(
+                  eq(timesheetEntriesTable.timesheetId, timesheetId),
+                  eq(timesheetEntriesTable.projectId, existingEntry.projectId),
+                  eq(timesheetEntriesTable.status, 'approved'),
+                  not(eq(timesheetEntriesTable.id, entryId))
+                )
+              );
+
+            if (remainingProjectEntries.length === 0) {
+              // No entries remain for this project on this date, delete all matching pending notifications
+              await this.deletePendingTimesheetNotifications(
+                db,
+                orgId,
+                targetUserId,
+                existingEntry.projectId,
+                workDate
+              );
+              this.logger.debug(
+                `Deleted pending notifications for user ${targetUserId}, project ${existingEntry.projectId}, date ${formattedWorkDateISO}`
+              );
+            } else {
+              // Other entries remain for this project, update matching pending notifications with recalculated payload
+              const newHours = remainingProjectEntries.reduce(
+                (sum, entry) => sum + Number(entry.hoursDecimal || 0),
+                0
+              );
+              const newDescriptions = remainingProjectEntries
+                .map((entry) => {
+                  const desc = entry.taskDescription || entry.taskTitle;
+                  return desc && desc.trim().length > 0 ? desc.trim() : '';
+                })
+                .filter(Boolean);
+
+              const newDescriptionStr = newDescriptions.join("; ");
+
+              for (const notification of pendingNotifications) {
+                const updatedPayload = {
+                  ...(notification.payload as Record<string, any>),
+                  hours: newHours,
+                  description: newDescriptionStr,
+                };
+
+                await db
+                  .update(notificationsTable)
+                  .set({
+                    payload: updatedPayload,
+                    updatedAt: now,
+                  })
+                  .where(eq(notificationsTable.id, notification.id));
+              }
+              this.logger.debug(
+                `Updated ${pendingNotifications.length} pending notifications for user ${targetUserId}, project ${existingEntry.projectId}, date ${formattedWorkDateISO} with recalculated hours: ${newHours}`
+              );
+            }
+          }
+        } catch (notifCleanupError) {
+          this.logger.error(
+            `Failed to perform notification cleanup for entry ${entryId}:`,
+            notifCleanupError
+          );
+        }
       }
 
       // After deletion, check if this was the last entry for a comp-off date
