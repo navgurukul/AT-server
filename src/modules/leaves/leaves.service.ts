@@ -1963,6 +1963,16 @@ export class LeavesService {
           updatedAt: leaveRequestsTable.updatedAt,
         });
 
+      await tx
+        .delete(notificationsTable)
+        .where(
+          and(
+            eq(notificationsTable.template, 'leave_request'),
+            eq(notificationsTable.state, 'pending'),
+            sql`${notificationsTable.payload}->>'leaveId' = ${String(requestId)}`
+          )
+        );
+
       const actorRole = this.getPrivilegedActorRole(actor.roles ?? []);
       if (actorRole) {
         await this.auditService.createLog({
@@ -2117,6 +2127,16 @@ export class LeavesService {
           }
         );
       }
+
+      await tx
+        .delete(notificationsTable)
+        .where(
+          and(
+            eq(notificationsTable.template, 'leave_request'),
+            eq(notificationsTable.state, 'pending'),
+            sql`${notificationsTable.payload}->>'leaveId' = ${String(requestId)}`
+          )
+        );
 
       await tx
         .delete(approvalsTable)
@@ -3683,6 +3703,18 @@ export class LeavesService {
         .where(eq(leaveRequestsTable.id, requestId))
         .returning();
 
+      if (newState === "rejected") {
+        await tx
+          .delete(notificationsTable)
+          .where(
+            and(
+              eq(notificationsTable.template, 'leave_request'),
+              eq(notificationsTable.state, 'pending'),
+              sql`${notificationsTable.payload}->>'leaveId' = ${String(requestId)}`
+            )
+          );
+      }
+
       await tx
         .update(approvalsTable)
         .set({
@@ -3963,6 +3995,21 @@ export class LeavesService {
           updatedAt: now,
         })
         .where(inArray(leaveRequestsTable.id, eligibleIds));
+
+      if (newState === "rejected") {
+        await tx
+          .delete(notificationsTable)
+          .where(
+            and(
+              eq(notificationsTable.template, 'leave_request'),
+              eq(notificationsTable.state, 'pending'),
+              inArray(
+                sql`${notificationsTable.payload}->>'leaveId'`,
+                eligibleIds.map((id) => String(id))
+              )
+            )
+          );
+      }
 
       await tx
         .update(approvalsTable)
@@ -4304,11 +4351,7 @@ export class LeavesService {
     return !info.isWorkingDay || info.isHoliday;
   }
 
-  private async notifyLatestProjectSlackChannel(
-    userId: number,
-    orgId: number,
-    payload: Record<string, unknown>
-  ) {
+  private async getLatestActiveProjects(userId: number, orgId: number) {
     const db = this.database.connection;
 
     // Get recent projects from employee's timesheet entries
@@ -4319,6 +4362,7 @@ export class LeavesService {
         workDate: timesheetsTable.workDate,
         slackChannelId: projectsTable.slackChannelId,
         discordChannelId: projectsTable.discordChannelId,
+        projectManagerId: projectsTable.projectManagerId,
         projectManagerName: usersTable.name,
         projectManagerSlackId: usersTable.slackId,
         projectManagerDiscordId: usersTable.discordId,
@@ -4350,7 +4394,7 @@ export class LeavesService {
       .limit(50); // Get enough projects to filter through weekends
 
     if (projects.length === 0) {
-      return;
+      return [];
     }
 
     // Find the last valid working DATE (skip weekends, holidays)
@@ -4376,7 +4420,7 @@ export class LeavesService {
     }
 
     if (!lastValidWorkDate) {
-      return; // No valid working date found
+      return [];
     }
 
     // Get ALL projects from that last valid working day (excluding filtered projects)
@@ -4397,49 +4441,159 @@ export class LeavesService {
     });
 
     if (validProjects.length === 0) {
-      return; // No valid projects found
+      return [];
     }
 
     // Deduplicate by projectId
-    const uniqueProjects = Array.from(
+    return Array.from(
       new Map(validProjects.map(p => [p.projectId, p])).values()
     );
+  }
 
-    // Send notifications to ALL projects from the last valid working day
+  private async buildLeaveNotificationTargets(
+    leave: {
+      id: number;
+      userId: number;
+      orgId: number;
+      leaveTypeId: number;
+      startDate: Date | string;
+      endDate: Date | string;
+      durationType: string;
+      halfDaySegment: string | null;
+      reason: string | null;
+      state: string;
+    },
+    notificationDate?: string,
+  ): Promise<Array<{
+    projectId: number;
+    channel: "slack" | "discord";
+    toRef: Record<string, any>;
+    payload: Record<string, any>;
+  }>> {
+    const db = this.database.connection;
+
+    // Fetch user and leave type details
+    const [userInfo] = await db
+      .select({
+        name: usersTable.name,
+        email: usersTable.email,
+        slackId: usersTable.slackId,
+        discordId: usersTable.discordId,
+      })
+      .from(usersTable)
+      .where(eq(usersTable.id, leave.userId))
+      .limit(1);
+
+    const [leaveTypeInfo] = await db
+      .select({
+        name: leaveTypesTable.name,
+        code: leaveTypesTable.code,
+      })
+      .from(leaveTypesTable)
+      .where(eq(leaveTypesTable.id, leave.leaveTypeId))
+      .limit(1);
+
+    // Get active projects
+    const uniqueProjects = await this.getLatestActiveProjects(leave.userId, leave.orgId);
+
+    const targets: Array<{
+      projectId: number;
+      channel: "slack" | "discord";
+      toRef: Record<string, any>;
+      payload: Record<string, any>;
+    }> = [];
+
+    const todayStr = notificationDate || getYYYYMMDD(new Date());
+    const endDateStr = getYYYYMMDD(new Date(leave.endDate));
+    const isPastLeave = endDateStr < todayStr;
+
     for (const project of uniqueProjects) {
-      // Enhance payload with project manager information
-      const enhancedPayload = {
-        ...payload,
+      const payload = {
+        type: "leave_request",
+        leaveId: leave.id,
+        userId: leave.userId,
+        userName: userInfo?.name ?? `User ${leave.userId}`,
+        userSlackId: userInfo?.slackId ?? null,
+        userDiscordId: userInfo?.discordId ?? null,
+        leaveTypeName: leaveTypeInfo?.name ?? "Leave",
+        leaveTypeCode: leaveTypeInfo?.code ?? null,
+        startDate: leave.startDate,
+        endDate: leave.endDate,
+        durationType: leave.durationType,
+        halfDaySegment: leave.halfDaySegment,
+        state: leave.state,
+        reason: leave.reason ?? null,
         projectId: project.projectId,
         projectName: project.projectName,
+        managerId: project.projectManagerId,
+        managerSlackId: project.projectManagerSlackId,
         projectManagerName: project.projectManagerName,
         projectManagerSlackId: project.projectManagerSlackId,
         projectManagerDiscordId: project.projectManagerDiscordId,
+        notificationDate: todayStr,
+        isPastLeave,
       };
 
-      // Send Slack notification if configured
-      if (project.slackChannelId) {
-        await db.insert(notificationsTable).values({
-          orgId,
+      if (project.slackChannelId && project.slackChannelId !== '(NULL)' && project.slackChannelId !== 'null' && project.slackChannelId.trim() !== '') {
+        targets.push({
+          projectId: project.projectId,
           channel: "slack",
           toRef: { channelId: project.slackChannelId },
-          template: "leave_request",
-          payload: enhancedPayload,
-          state: "pending",
+          payload,
         });
       }
 
-      // Send Discord notification if configured
-      if (project.discordChannelId) {
-        await db.insert(notificationsTable).values({
-          orgId,
+      if (project.discordChannelId && project.discordChannelId !== '(NULL)' && project.discordChannelId !== 'null' && project.discordChannelId.trim() !== '') {
+        targets.push({
+          projectId: project.projectId,
           channel: "discord",
           toRef: { webhookUrl: project.discordChannelId },
-          template: "leave_request",
-          payload: enhancedPayload,
-          state: "pending",
+          payload,
         });
       }
+    }
+
+    return targets;
+  }
+
+  private async notifyLatestProjectSlackChannel(
+    userId: number,
+    orgId: number,
+    payload: Record<string, unknown>
+  ) {
+    const db = this.database.connection;
+    const leaveId = payload.leaveId as number;
+
+    const [leave] = await db
+      .select()
+      .from(leaveRequestsTable)
+      .where(eq(leaveRequestsTable.id, leaveId))
+      .limit(1);
+
+    if (!leave) {
+      this.logger.warn(`notifyLatestProjectSlackChannel: Leave request ${leaveId} not found`);
+      return;
+    }
+
+    const today = this.normalizeDateUTC(new Date());
+    const startDate = this.normalizeDateUTC(new Date(leave.startDate));
+    if (startDate > today) {
+      // Future leaves should not be notified on application date
+      return;
+    }
+
+    const notificationDate = getYYYYMMDD(new Date());
+    const targets = await this.buildLeaveNotificationTargets(leave, notificationDate);
+
+    for (const target of targets) {
+      await db.insert(notificationsTable).values({
+        orgId,
+        channel: target.channel,
+        toRef: target.toRef,
+        template: "leave_request",
+        payload: target.payload,
+        state: "pending",
+      });
     }
   }
 
@@ -5251,11 +5405,12 @@ export class LeavesService {
    * Queue daily leave notifications for all active leaves
    * Should be called by cron job at 9:00 AM IST every day
    */
-  async queueDailyLeaveNotifications() {
+  async queueDailyLeaveNotifications(testDate?: Date) {
     const db = this.database.connection;
-    const today = this.normalizeDateUTC(new Date());
+    const today = this.normalizeDateUTC(testDate || new Date());
+    const todayStr = getYYYYMMDD(testDate || new Date());
 
-    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    const fiveMinutesAgo = new Date((testDate ? testDate.getTime() : Date.now()) - 5 * 60 * 1000);
 
     // Today's leaves
     const todaysLeaves = await db
@@ -5288,74 +5443,74 @@ export class LeavesService {
       ).values()
     );
 
+    let processedCount = 0;
+
     for (const leave of allLeaves) {
-      const payload = {
-        leaveId: leave.id,
-        userId: leave.userId,
-        leaveTypeId: leave.leaveTypeId,
-        startDate: leave.startDate,
-        endDate: leave.endDate,
-        reason: leave.reason
-      };
+      // Determine if today is actually a leave day (within range)
+      const isTodayWithinLeave = leave.startDate <= today && leave.endDate >= today;
 
-      // check slack notification
-      const slackExists = await db
-        .select()
-        .from(notificationsTable)
-        .where(
-          and(
-            eq(notificationsTable.template, 'leave_request'),
-            eq(notificationsTable.channel, 'slack'),
-            sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
-            gte(notificationsTable.createdAt, today)
-          )
-        )
-        .limit(1);
-
-      // check discord notification
-      const discordExists = await db
-        .select()
-        .from(notificationsTable)
-        .where(
-          and(
-            eq(notificationsTable.template, 'leave_request'),
-            eq(notificationsTable.channel, 'discord'),
-            sql`${notificationsTable.payload}->>'leaveId' = ${leave.id.toString()}`,
-            gte(notificationsTable.createdAt, today)
-          )
-        )
-        .limit(1);
-
-      const notificationsToInsert = [];
-
-      if (slackExists.length === 0) {
-        notificationsToInsert.push({
-          orgId: leave.orgId,
-          channel: 'slack' as const,
-          toRef: {},
-          template: 'leave_request' as const,
-          payload,
-          state: 'pending' as const
-        });
+      // If today is a leave day, check if today is a non-working day under business rules
+      if (isTodayWithinLeave) {
+        const isTodayNonWorking = await this.isNonWorkingDay(leave.orgId, today);
+        if (isTodayNonWorking) {
+          continue; // Skip queueing notifications on non-working days
+        }
       }
 
-      if (discordExists.length === 0) {
-        notificationsToInsert.push({
-          orgId: leave.orgId,
-          channel: 'discord' as const,
-          toRef: {},
-          template: 'leave_request' as const,
-          payload,
-          state: 'pending' as const
-        });
-      }
+      // Build notification targets with notificationDate as todayStr
+      const targets = await this.buildLeaveNotificationTargets(leave, todayStr);
 
-      if (notificationsToInsert.length > 0) {
-        await db.insert(notificationsTable).values(notificationsToInsert);
+      for (const target of targets) {
+        // Duplicate protection: template + payload.leaveId + payload.notificationDate + toRef
+        let duplicateExists = false;
+
+        if (target.channel === 'slack') {
+          const slackExists = await db
+            .select()
+            .from(notificationsTable)
+            .where(
+              and(
+                eq(notificationsTable.template, 'leave_request'),
+                eq(notificationsTable.channel, 'slack'),
+                sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
+                sql`${notificationsTable.payload}->>'notificationDate' = ${todayStr}`,
+                sql`${notificationsTable.toRef}->>'channelId' = ${target.toRef.channelId}`
+              )
+            )
+            .limit(1);
+          duplicateExists = slackExists.length > 0;
+        } else if (target.channel === 'discord') {
+          const discordExists = await db
+            .select()
+            .from(notificationsTable)
+            .where(
+              and(
+                eq(notificationsTable.template, 'leave_request'),
+                eq(notificationsTable.channel, 'discord'),
+                sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
+                sql`${notificationsTable.payload}->>'notificationDate' = ${todayStr}`,
+                sql`${notificationsTable.toRef}->>'webhookUrl' = ${target.toRef.webhookUrl}`
+              )
+            )
+            .limit(1);
+          duplicateExists = discordExists.length > 0;
+        }
+
+        if (!duplicateExists) {
+          await db.insert(notificationsTable).values({
+            orgId: leave.orgId,
+            channel: target.channel,
+            toRef: target.toRef,
+            template: 'leave_request',
+            payload: target.payload,
+            state: 'pending',
+          });
+        }
       }
+      processedCount++;
     }
 
-    return { processed: allLeaves.length };
+    return { processed: processedCount };
   }
 
   private isSameDate(date1: Date, date2: Date): boolean {
@@ -5509,6 +5664,16 @@ export class LeavesService {
               updatedAt: now,
             })
             .where(eq(leaveRequestsTable.id, leave.id));
+
+          await tx
+            .delete(notificationsTable)
+            .where(
+              and(
+                eq(notificationsTable.template, 'leave_request'),
+                eq(notificationsTable.state, 'pending'),
+                sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`
+              )
+            );
 
           // Clear comp-off links if applicable
           if (leave.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
