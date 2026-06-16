@@ -984,7 +984,7 @@ export class LeavesService {
     orgId: number,
     payload: CreateLeaveRequestDto,
     actor?: AuthenticatedUser,
-    uploadedDocument?: LeaveDocumentUpload,
+    uploadedDocuments?: LeaveDocumentUpload[],
   ) {
     const db = this.database.connection;
     const startDate = new Date(payload.startDate);
@@ -1063,33 +1063,55 @@ export class LeavesService {
         leaveType,
       );
 
+      if (uploadedDocuments && uploadedDocuments.length > 1) {
+        const lowerCode = leaveType.code?.toLowerCase() || "";
+        const lowerName = leaveType.name?.toLowerCase() || "";
+        const isVipassana =
+          lowerCode === "vipassana course" ||
+          lowerCode === "vipassana course leave" ||
+          lowerCode === "vipassana seva" ||
+          lowerCode === "vipassana seva leave" ||
+          lowerName.includes("vipassana course") ||
+          lowerName.includes("vipassana seva");
+          
+        if (!isVipassana) {
+          throw new BadRequestException(
+            "Multiple documents are only allowed for Vipassana Course Leave and Vipassana Seva Leave",
+          );
+        }
+      }
+
       if (requiresDocumentEmail) {
-        if (!uploadedDocument) {
+        if (!uploadedDocuments || uploadedDocuments.length === 0) {
           throw new BadRequestException(
             "Supporting document is required for this leave type",
           );
         }
+      }
 
-        if (uploadedDocument.size > MAX_LEAVE_DOCUMENT_UPLOAD_BYTES) {
-          throw new BadRequestException(
-            "Uploaded document must be 10MB or smaller",
-          );
-        }
+      if (uploadedDocuments && uploadedDocuments.length > 0) {
+        for (const doc of uploadedDocuments) {
+          if (doc.size > MAX_LEAVE_DOCUMENT_UPLOAD_BYTES) {
+            throw new BadRequestException(
+              "Uploaded document must be 10MB or smaller",
+            );
+          }
 
-        if (!ALLOWED_LEAVE_DOCUMENT_MIME_TYPES.has(uploadedDocument.mimetype)) {
-          throw new BadRequestException(
-            "Only PDF, JPG, and PNG documents are allowed",
-          );
+          if (!ALLOWED_LEAVE_DOCUMENT_MIME_TYPES.has(doc.mimetype)) {
+            throw new BadRequestException(
+              "Only PDF, JPG, and PNG documents are allowed",
+            );
+          }
         }
+      }
 
-        if (
-          this.isExamOrLearningLeaveType(leaveType) &&
-          !payload.courseOrProgrammeName?.trim()
-        ) {
-          throw new BadRequestException(
-            "Course or programme name is required for Exam Leave and L&D Leave",
-          );
-        }
+      if (
+        this.isExamOrLearningLeaveType(leaveType) &&
+        !payload.courseOrProgrammeName?.trim()
+      ) {
+        throw new BadRequestException(
+          "Course or programme name is required for Exam Leave and L&D Leave",
+        );
       }
 
       if (isBereavementLeave && !payload.relationship) {
@@ -1475,10 +1497,12 @@ export class LeavesService {
     let emailDeliveryResult: LeaveEmailDeliveryResult | null = null;
     let specialLeaveEmailResult: LeaveEmailDeliveryResult | null = null;
 
+    const requiresDocumentEmail = leaveTypeInfo ? this.isLeaveTypeRequiringSupportingDocument(leaveTypeInfo) : false;
+    const isLearningLeave = leaveTypeInfo ? this.isLearningLeaveType(leaveTypeInfo) : false;
+
     if (
-      uploadedDocument &&
       leaveTypeInfo &&
-      this.isLeaveTypeRequiringSupportingDocument(leaveTypeInfo)
+      ((uploadedDocuments && uploadedDocuments.length > 0 && requiresDocumentEmail) || isLearningLeave)
     ) {
       emailDeliveryResult = await this.sendSupportingDocumentEmail({
         managerEmail: managerInfo?.email ?? null,
@@ -1488,7 +1512,7 @@ export class LeavesService {
         startDate,
         endDate,
         courseOrProgrammeName: payload.courseOrProgrammeName?.trim() ?? null,
-        document: uploadedDocument,
+        documents: uploadedDocuments && uploadedDocuments.length > 0 ? uploadedDocuments : null,
       });
 
       if (!emailDeliveryResult.sent) {
@@ -1546,7 +1570,7 @@ export class LeavesService {
   async createLeaveRequestForUser(
     actor: AuthenticatedUser,
     payload: CreateLeaveForUserDto,
-    uploadedDocument?: LeaveDocumentUpload,
+    uploadedDocuments?: LeaveDocumentUpload[],
   ) {
     const db = this.database.connection;
     checkAdminSelfAction(actor, payload.userId.toString());
@@ -1577,7 +1601,7 @@ export class LeavesService {
       targetUser.orgId,
       payload,
       actor,
-      uploadedDocument,
+      uploadedDocuments,
     );
   }
 
@@ -3609,7 +3633,7 @@ export class LeavesService {
         // Certain sensitive leave types must be reviewed only by admin/super_admin
         if (this.isPrivilegedLeaveType(request.leaveTypeCode, request.leaveTypeName)) {
           throw new ForbiddenException(
-            "Only admin or super_admin can approve or reject this leave"
+            "You are not authorized to approve/reject this leave. Please ask Admin to approve this leave on your behalf."
           );
         }
 
@@ -5578,12 +5602,6 @@ export class LeavesService {
     const allowedLabels = new Set([
       "exam",
       "exam leave",
-      "l d",
-      "l d leave",
-      "l and d",
-      "l and d leave",
-      "learning and development",
-      "learning and development leave",
       "vipassana course",
       "vipassana course leave",
       "vipassana seva",
@@ -5638,6 +5656,27 @@ export class LeavesService {
     );
   }
 
+  private isLearningLeaveType(leaveType: {
+    code?: string | null;
+    name?: string | null;
+  }): boolean {
+    const code = this.normalizeLeaveTypeLabel(leaveType.code);
+    const name = this.normalizeLeaveTypeLabel(leaveType.name);
+    const learningLabels = new Set([
+      "l d",
+      "l d leave",
+      "l and d",
+      "l and d leave",
+      "learning and development",
+      "learning and development leave",
+    ]);
+
+    return Boolean(
+      (code && learningLabels.has(code)) ||
+      (name && learningLabels.has(name)),
+    );
+  }
+
   private normalizeLeaveTypeLabel(value?: string | null): string {
     return (value ?? "")
       .toLowerCase()
@@ -5668,7 +5707,7 @@ export class LeavesService {
     startDate: Date;
     endDate: Date;
     courseOrProgrammeName: string | null;
-    document: LeaveDocumentUpload;
+    documents: LeaveDocumentUpload[] | null;
   }): Promise<LeaveEmailDeliveryResult> {
     const {
       managerEmail,
@@ -5678,7 +5717,7 @@ export class LeavesService {
       startDate,
       endDate,
       courseOrProgrammeName,
-      document,
+      documents,
     } = params;
 
     if (!managerEmail || !employeeEmail) {
@@ -5741,13 +5780,13 @@ export class LeavesService {
         cc: ccRecipients,
         subject: `Application for ${leaveTypeName} — ${employeeName} — ${dateRange}`,
         text: lines.join("\n"),
-        attachments: [
-          {
-            filename: document.originalname,
-            content: document.buffer,
-            contentType: document.mimetype,
-          },
-        ],
+        attachments: documents
+          ? documents.map((doc) => ({
+              filename: doc.originalname,
+              content: doc.buffer,
+              contentType: doc.mimetype,
+            }))
+          : undefined,
       });
       return { sent: true };
     } catch (error) {
