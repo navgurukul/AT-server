@@ -10,10 +10,11 @@ import {
   Post,
   Query,
   UploadedFile,
+  UploadedFiles,
   UseInterceptors,
   ValidationPipe,
 } from "@nestjs/common";
-import { FileInterceptor } from "@nestjs/platform-express";
+import { FileInterceptor, FilesInterceptor } from "@nestjs/platform-express";
 import { ApiBody, ApiConsumes, ApiQuery, ApiTags } from "@nestjs/swagger";
 
 import { Permissions } from "../../common/decorators/permissions.decorator";
@@ -52,9 +53,9 @@ const CREATE_LEAVE_MULTIPART_SCHEMA_SELF = {
     },
     relationshipDetails: { type: "string" },
     document: {
-      type: "string",
-      format: "binary",
-      description: "Supporting document for selected leave types.",
+      type: "array",
+      items: { type: "string", format: "binary" },
+      description: "Supporting document(s) for selected leave types.",
     },
   },
 };
@@ -83,9 +84,9 @@ const CREATE_LEAVE_MULTIPART_SCHEMA_ADMIN = {
     relationshipDetails: { type: "string" },
     userId: { type: "integer", example: 1 },
     document: {
-      type: "string",
-      format: "binary",
-      description: "Supporting document for selected leave types.",
+      type: "array",
+      items: { type: "string", format: "binary" },
+      description: "Supporting document(s) for selected leave types.",
     },
   },
 };
@@ -156,11 +157,11 @@ export class LeavesController {
   @Permissions("leave:create:self")
   @ApiConsumes("multipart/form-data")
   @ApiBody({ schema: CREATE_LEAVE_MULTIPART_SCHEMA_SELF })
-  @UseInterceptors(FileInterceptor("document"))
+  @UseInterceptors(FilesInterceptor("document", 10))
   requestLeave(
     @Body() payload: CreateLeaveRequestDto,
     @CurrentUser() user: AuthenticatedUser | undefined,
-    @UploadedFile() document?: { buffer: Buffer; originalname: string; mimetype: string; size: number },
+    @UploadedFiles() documents?: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>,
   ) {
     if (!user) {
       return null;
@@ -170,7 +171,7 @@ export class LeavesController {
       user.orgId,
       payload,
       undefined,
-      document,
+      documents,
     );
   }
 
@@ -386,16 +387,16 @@ export class LeavesController {
   @Roles("admin", "super_admin")
   @ApiConsumes("multipart/form-data")
   @ApiBody({ schema: CREATE_LEAVE_MULTIPART_SCHEMA_ADMIN })
-  @UseInterceptors(FileInterceptor("document"))
+  @UseInterceptors(FilesInterceptor("document", 10))
   applyLeaveForUser(
     @Body() payload: CreateLeaveForUserDto,
     @CurrentUser() actor: AuthenticatedUser | undefined,
-    @UploadedFile() document?: { buffer: Buffer; originalname: string; mimetype: string; size: number },
+    @UploadedFiles() documents?: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>,
   ) {
     if (!actor) {
       return null;
     }
-    return this.leavesService.createLeaveRequestForUser(actor, payload, document);
+    return this.leavesService.createLeaveRequestForUser(actor, payload, documents);
   }
 
   @Patch("admin/requests/:id")
