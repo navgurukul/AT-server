@@ -1315,6 +1315,9 @@ export class TimesheetsService {
     let used = counter ? Number(counter.used ?? 0) : 0;
     const previousLimit = counter ? Number(counter.limit ?? DEFAULT_BACKFILL_PER_MONTH) : null;
 
+    // Calculate the new total limit required to achieve the desired available balance (limit)
+    const targetLimit = limit + used;
+
     if (!counter) {
       used = await this.countBackfilledDaysForMonth(
         orgId,
@@ -1323,6 +1326,7 @@ export class TimesheetsService {
         now
       );
 
+      const computedLimit = limit + used;
       await db
         .insert(backfillCountersTable)
         .values({
@@ -1331,7 +1335,7 @@ export class TimesheetsService {
           year,
           month,
           used,
-          limit,
+          limit: computedLimit,
           lastUsedAt: null,
         })
         .onConflictDoUpdate({
@@ -1343,7 +1347,7 @@ export class TimesheetsService {
           ],
           set: {
             used,
-            limit,
+            limit: computedLimit,
             lastUsedAt: now,
           },
         });
@@ -1351,7 +1355,7 @@ export class TimesheetsService {
       await db
         .update(backfillCountersTable)
         .set({
-          limit,
+          limit: targetLimit,
           lastUsedAt: now,
         })
         .where(eq(backfillCountersTable.id, counter.id));
@@ -1378,7 +1382,7 @@ export class TimesheetsService {
           year,
           month,
           used,
-          limit,
+          limit: targetLimit,
         },
       });
     }
@@ -1389,8 +1393,8 @@ export class TimesheetsService {
       year,
       month,
       used,
-      limit,
-      remaining: Math.max(limit - used, 0),
+      limit: targetLimit,
+      remaining: limit,
     };
   }
 
@@ -4053,39 +4057,27 @@ export class TimesheetsService {
       }
       const workDate = timesheetData.workDate;
 
-      // Permanently delete the timesheet entry
-      try {
-        const deleteResult = await db
+      let totalHoursNum = 0;
+      let timesheetDeleted = false;
+
+      // Wrap the DB operations in a transaction
+      await db.transaction(async (tx) => {
+        // Permanently delete the timesheet entry
+        const deleteResult = await tx
           .delete(timesheetEntriesTable)
-          .where(eq(timesheetEntriesTable.id, entryId));
+          .where(eq(timesheetEntriesTable.id, entryId))
+          .returning({ id: timesheetEntriesTable.id });
 
-        if (!deleteResult) {
-          return {
-            success: false,
-            message: `Failed to delete timesheet entry with ID ${entryId}. Entry may have already been deleted or no longer exists.`,
-            entryId,
-            targetUserId,
-          };
+        if (deleteResult.length === 0) {
+          throw new Error(`Failed to delete timesheet entry with ID ${entryId}. Entry may have already been deleted.`);
         }
-      } catch (deleteError) {
-        const errorMsg = deleteError instanceof Error ? deleteError.message : 'Unknown error';
-        this.logger.error(`Database error while deleting entry ${entryId}:`, deleteError);
-        return {
-          success: false,
-          message: `Failed to delete timesheet entry from database. Error: ${errorMsg}`,
-          entryId,
-          targetUserId,
-          error: errorMsg,
-        };
-      }
 
-      // Perform pending notification cleanup/updates if projectId is valid
-      if (existingEntry.projectId !== null && existingEntry.projectId !== undefined) {
-        try {
+        // Perform pending notification cleanup/updates if projectId is valid
+        if (existingEntry.projectId !== null && existingEntry.projectId !== undefined) {
           const formattedWorkDateISO = workDate.toISOString();
           
           // Query all pending timesheet_entry notifications for this user, project, and date
-          const pendingNotifications = await db
+          const pendingNotifications = await tx
             .select()
             .from(notificationsTable)
             .where(
@@ -4101,7 +4093,7 @@ export class TimesheetsService {
 
           if (pendingNotifications.length > 0) {
             // Retrieve all other approved entries for this timesheet (excluding the deleted entry) and project
-            const remainingProjectEntries = await db
+            const remainingProjectEntries = await tx
               .select({
                 hoursDecimal: timesheetEntriesTable.hoursDecimal,
                 taskDescription: timesheetEntriesTable.taskDescription,
@@ -4120,7 +4112,7 @@ export class TimesheetsService {
             if (remainingProjectEntries.length === 0) {
               // No entries remain for this project on this date, delete all matching pending notifications
               await this.deletePendingTimesheetNotifications(
-                db,
+                tx,
                 orgId,
                 targetUserId,
                 existingEntry.projectId,
@@ -4151,7 +4143,7 @@ export class TimesheetsService {
                   description: newDescriptionStr,
                 };
 
-                await db
+                await tx
                   .update(notificationsTable)
                   .set({
                     payload: updatedPayload,
@@ -4164,42 +4156,10 @@ export class TimesheetsService {
               );
             }
           }
-        } catch (notifCleanupError) {
-          this.logger.error(
-            `Failed to perform notification cleanup for entry ${entryId}:`,
-            notifCleanupError
-          );
         }
-      }
 
-      // After deletion, check if this was the last entry for a comp-off date
-      const remainingEntries = await db
-        .select({ id: timesheetEntriesTable.id })
-        .from(timesheetEntriesTable)
-        .where(
-          and(
-            eq(timesheetEntriesTable.timesheetId, timesheetId),
-            eq(timesheetEntriesTable.status, 'approved'),
-          ),
-        )
-        .limit(1);
-
-      if (remainingEntries.length === 0) {
-        // If no entries are left, re-evaluate comp-off
-        // This will effectively revoke the comp-off if no other approved entries exist for this day
-        await this.leavesService.tryProcessCompOffForTimesheet(
-          orgId,
-          targetUserId,
-          workDate,
-          timesheetId,
-          0, // Pass 0 hours to indicate no work was done
-        );
-      }
-
-      // Recalculate total hours for the affected timesheet (sum all approved entries)
-      let totalHours: number;
-      try {
-        const [result] = await db
+        // Recalculate total hours for the affected timesheet (sum all approved entries)
+        const [result] = await tx
           .select({
             totalHours: sql<number>`COALESCE(SUM(${timesheetEntriesTable.hoursDecimal}), 0)`,
           })
@@ -4211,59 +4171,37 @@ export class TimesheetsService {
             ),
           );
 
-        totalHours = Number(result?.totalHours ?? 0);
-      } catch (recalcError) {
-        const errorMsg = recalcError instanceof Error ? recalcError.message : 'Unknown error';
-        this.logger.error(`Failed to recalculate hours for timesheet ${timesheetId}:`, recalcError);
-        return {
-          success: false,
-          message: `Timesheet entry was deleted, but failed to recalculate total hours. Error: ${errorMsg}`,
-          entryId,
-          targetUserId,
-          error: errorMsg,
-        };
-      }
+        totalHoursNum = Number(result?.totalHours ?? 0);
 
-      const totalHoursNum = Number(totalHours ?? 0);
-
-      // Get timesheet info before updating
-      const [timesheet] = await db
-        .select({
-          workDate: timesheetsTable.workDate,
-        })
-        .from(timesheetsTable)
-        .where(eq(timesheetsTable.id, timesheetId))
-        .limit(1);
-
-      if (!timesheet) {
-        return {
-          success: false,
-          message: `Timesheet with ID ${timesheetId} not found after entry deletion.`,
-          entryId,
-          targetUserId,
-        };
-      }
-
-      // If no approved entries remain, delete the timesheet; otherwise update total hours
-      try {
+        // If no approved entries remain, restore backfill usage and delete the timesheet; otherwise update total hours
         if (totalHoursNum === 0) {
-          // Permanently delete the timesheet if it has no entries
-          const deleteResult = await db
-            .delete(timesheetsTable)
-            .where(eq(timesheetsTable.id, timesheetId));
+          // 1. Restore lifeline/backfill usage if it was consumed
+          const restoreResult = await this.restoreBackfillUsageForDate(
+            tx,
+            orgId,
+            targetUserId,
+            workDate
+          );
 
-          if (!deleteResult) {
-            return {
-              success: false,
-              message: `Failed to delete empty timesheet with ID ${timesheetId}. Timesheet entry was deleted but timesheet deletion failed.`,
-              entryId,
-              targetUserId,
-              timesheetId,
-            };
+          if (restoreResult === 'counter_missing') {
+            this.logger.warn(
+              `Missing backfill counter while restoring lifeline for user ${targetUserId}, workDate ${workDate.toISOString()}`
+            );
           }
+
+          // 2. Permanently delete the timesheet if it has no entries
+          const deleteResult = await tx
+            .delete(timesheetsTable)
+            .where(eq(timesheetsTable.id, timesheetId))
+            .returning({ id: timesheetsTable.id });
+
+          if (deleteResult.length === 0) {
+            throw new Error(`Failed to delete empty timesheet with ID ${timesheetId}.`);
+          }
+          timesheetDeleted = true;
         } else {
           // Update timesheet with recalculated total hours
-          const updateResult = await db
+          const updateResult = await tx
             .update(timesheetsTable)
             .set({
               totalHours: String(totalHoursNum),
@@ -4272,33 +4210,14 @@ export class TimesheetsService {
             .where(eq(timesheetsTable.id, timesheetId));
 
           if (!updateResult) {
-            return {
-              success: false,
-              message: `Failed to update timesheet total hours after entry deletion. Entry was deleted but timesheet update failed.`,
-              entryId,
-              targetUserId,
-              timesheetId,
-            };
+            throw new Error(`Failed to update timesheet total hours after entry deletion.`);
           }
         }
-      } catch (timesheetError) {
-        const errorMsg = timesheetError instanceof Error ? timesheetError.message : 'Unknown error';
-        this.logger.error(`Failed to update/delete timesheet ${timesheetId}:`, timesheetError);
-        return {
-          success: false,
-          message: `Timesheet entry was deleted, but failed to update/delete timesheet. Error: ${errorMsg}`,
-          entryId,
-          targetUserId,
-          timesheetId,
-          error: errorMsg,
-        };
-      }
 
-      // Recalculate payable days for the cycle after deletion
-      try {
-        const cycleRange = this.getCycleRangeForWorkDate(new Date(timesheet.workDate));
+        // Recalculate payable days for the cycle after deletion
+        const cycleRange = this.getCycleRangeForWorkDate(new Date(workDate));
         await this.recalculateAndPersistPayableDaysForCycle(
-          db,
+          tx,
           orgId,
           targetUserId,
           cycleRange.cycleStart,
@@ -4306,36 +4225,45 @@ export class TimesheetsService {
           cycleRange.cycleKey,
           now,
         );
-      } catch (payableDaysError) {
-        const errorMsg = payableDaysError instanceof Error ? payableDaysError.message : 'Unknown error';
-        this.logger.error(`Failed to recalculate payable days for user ${targetUserId}:`, payableDaysError);
-        return {
-          success: false,
-          message: `Timesheet entry and record were deleted, but failed to recalculate payable days. Error: ${errorMsg}`,
-          entryId,
-          targetUserId,
-          error: errorMsg,
-          warning: 'Entry was deleted successfully. Please contact support to recalculate payable days.',
-        };
-      }
+      });
 
       // Try to reconcile comp-off credits after deletion
-      if (totalHoursNum >= 0) {
-        try {
+      try {
+        // After deletion, check if this was the last entry for a comp-off date
+        const remainingEntries = await db
+          .select({ id: timesheetEntriesTable.id })
+          .from(timesheetEntriesTable)
+          .where(
+            and(
+              eq(timesheetEntriesTable.timesheetId, timesheetId),
+              eq(timesheetEntriesTable.status, 'approved'),
+            ),
+          )
+          .limit(1);
+
+        if (remainingEntries.length === 0) {
+          // If no entries are left, re-evaluate comp-off (effectively revokes)
           await this.leavesService.tryProcessCompOffForTimesheet(
             orgId,
             targetUserId,
-            new Date(timesheet.workDate),
+            workDate,
+            timesheetId,
+            0,
+          );
+        } else if (totalHoursNum >= 0) {
+          await this.leavesService.tryProcessCompOffForTimesheet(
+            orgId,
+            targetUserId,
+            new Date(workDate),
             timesheetId,
             totalHoursNum,
           );
-        } catch (error) {
-          // Log but don't fail the deletion if comp-off processing fails
-          this.logger.warn(
-            `Failed to auto-process comp off after deletion for timesheet ${timesheetId}:`,
-            error,
-          );
         }
+      } catch (error) {
+        this.logger.warn(
+          `Failed to auto-process comp off after deletion for timesheet ${timesheetId}:`,
+          error,
+        );
       }
 
       const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
@@ -4361,18 +4289,16 @@ export class TimesheetsService {
           });
         } catch (auditError) {
           this.logger.warn(`Failed to create audit log for timesheet deletion:`, auditError);
-          // Don't throw - deletion already succeeded
         }
       }
 
       return {
         success: true,
         message: 'Timesheet entry deleted permanently',
-        timesheetDeleted: totalHoursNum === 0,
+        timesheetDeleted,
         remainingHours: totalHoursNum,
       };
     } catch (error) {
-      // Catch any unexpected errors
       const errorMsg = error instanceof Error ? error.message : 'Unknown error occurred';
       this.logger.error(`Unexpected error deleting timesheet entry ${entryId}:`, error);
       return {
@@ -4383,6 +4309,66 @@ export class TimesheetsService {
         error: errorMsg,
       };
     }
+  }
+
+  /**
+   * Restore backfill usage for a specific work date if a lifeline was consumed.
+   */
+  private async restoreBackfillUsageForDate(
+    tx: DatabaseService["connection"],
+    orgId: number,
+    userId: number,
+    workDate: Date
+  ): Promise<'restored' | 'not_consumed' | 'counter_missing'> {
+    const workDateKey = this.formatDateKey(workDate);
+
+    // 1. Look up backfill_dates
+    const [backfillRecord] = await tx
+      .select({
+        id: backfillDatesTable.id,
+        year: backfillDatesTable.year,
+        month: backfillDatesTable.month,
+      })
+      .from(backfillDatesTable)
+      .where(
+        and(
+          eq(backfillDatesTable.orgId, orgId),
+          eq(backfillDatesTable.userId, userId),
+          eq(backfillDatesTable.workDate, workDateKey)
+        )
+      )
+      .limit(1);
+
+    if (!backfillRecord) {
+      return 'not_consumed';
+    }
+
+    // 2. Delete the record in backfill_dates
+    await tx
+      .delete(backfillDatesTable)
+      .where(eq(backfillDatesTable.id, backfillRecord.id));
+
+    // 3. Decrement the backfill_counters used count
+    const updated = await tx
+      .update(backfillCountersTable)
+      .set({
+        used: sql`GREATEST(${backfillCountersTable.used} - 1, 0)`,
+      })
+      .where(
+        and(
+          eq(backfillCountersTable.orgId, orgId),
+          eq(backfillCountersTable.userId, userId),
+          eq(backfillCountersTable.year, backfillRecord.year),
+          eq(backfillCountersTable.month, backfillRecord.month)
+        )
+      )
+      .returning({ id: backfillCountersTable.id });
+
+    if (updated.length === 0) {
+      return 'counter_missing';
+    }
+
+    return 'restored';
   }
 
   private getPrivilegedActorRole(roles: string[]): 'super_admin' | 'admin' | null {
