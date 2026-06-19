@@ -812,7 +812,7 @@ export class NotifyService {
     }
   }
 
-  private async sendSlackMessage(token: string, channelId: string, text: string): Promise<boolean> {
+  public async sendSlackMessage(token: string, channelId: string, text: string): Promise<boolean> {
     try {
       const resp = await fetch("https://slack.com/api/chat.postMessage", {
         method: "POST",
@@ -1045,7 +1045,7 @@ export class NotifyService {
     }
   }
 
-  private async sendDiscordMessage(webhookUrl: string, text: string): Promise<boolean> {
+  public async sendDiscordMessage(webhookUrl: string, text: string): Promise<boolean> {
     try {
       const resp = await fetch(webhookUrl, {
         method: "POST",
