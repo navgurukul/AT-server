@@ -563,8 +563,61 @@ export class LeavesService {
       leaveType: row.leaveType,
     }));
 
+    // Calculate dynamic summary values from leave_balances
+    const earnLeaveCodes = new Set(["CL", "WL", COMP_OFF_LEAVE_CODE]);
+
+    let sumBalanceHours = 0;
+    let sumAllocatedHours = 0;
+
+    for (const b of balances) {
+      if (b.leaveType?.code && earnLeaveCodes.has(b.leaveType.code)) {
+        sumBalanceHours += b.balanceHours;
+        sumAllocatedHours += b.allocatedHours;
+      }
+    }
+
+    const availableEarnedLeaves = Number((sumBalanceHours / 8).toFixed(2));
+    const totalAllocatedEarnedLeaves = Number((sumAllocatedHours / 8).toFixed(2));
+
+    // Query leave requests dynamically for pending & approved leaves
+    const [pendingRow] = await db
+      .select({
+        totalHours: sql<string>`coalesce(sum(${leaveRequestsTable.hours}), 0)`,
+      })
+      .from(leaveRequestsTable)
+      .where(
+        and(
+          eq(leaveRequestsTable.userId, userId),
+          eq(leaveRequestsTable.state, "pending")
+        )
+      );
+
+    const [approvedRow] = await db
+      .select({
+        totalHours: sql<string>`coalesce(sum(${leaveRequestsTable.hours}), 0)`,
+      })
+      .from(leaveRequestsTable)
+      .where(
+        and(
+          eq(leaveRequestsTable.userId, userId),
+          eq(leaveRequestsTable.state, "approved")
+        )
+      );
+
+    const pendingHours = Number(pendingRow?.totalHours ?? 0);
+    const approvedHours = Number(approvedRow?.totalHours ?? 0);
+
+    const pending = Number((pendingHours / 8).toFixed(2));
+    const approved = Number((approvedHours / 8).toFixed(2));
+
     return {
       userId,
+      summary: {
+        availableEarnedLeaves,
+        totalAllocatedEarnedLeaves,
+        pending,
+        approved,
+      },
       balances,
     };
   }
