@@ -7,10 +7,13 @@ import { DatabaseModule } from "../../database/database.module";
 import { NotifyController } from "./notify.controller";
 import { NotifyService } from "./notify.service";
 
+import { CalendarModule } from "../../modules/calendar/calendar.module";
+import { TrackerReminderService } from "./reminder.service";
+
 @Module({
-  imports: [ConfigModule, DatabaseModule, ScheduleModule.forRoot()],
+  imports: [ConfigModule, DatabaseModule, ScheduleModule.forRoot(), CalendarModule],
   controllers: [NotifyController],
-  providers: [NotifyService],
+  providers: [NotifyService, TrackerReminderService],
   exports: [NotifyService],
 })
 export class NotifyModule implements OnModuleInit {
