@@ -345,6 +345,16 @@ export const leavePolicies = pgTable("leave_policies", {
   leaveTypeId: integer("leave_type_id")
     .notNull()
     .references(() => leaveTypes.id),
+
+  // Rule Conditions
+  validEmploymentTypes: varchar("valid_employment_types", { length: 50 }).array().notNull(), 
+  requiresAlumni: boolean("requires_alumni"), // true = Alumni, false = Non-Alumni, null = Both
+  triggerEvent: varchar("trigger_event", { length: 20 }).notNull(), // 'DAY_1' or 'DAY_91'
+
+  // Allocation Math
+  baseAllocationDays: numeric("base_allocation_days", { precision: 5, scale: 2 }).notNull(),
+  isProrated: boolean("is_prorated").notNull().default(false), 
+
   accrualRule: jsonb("accrual_rule"),
   carryForwardRule: jsonb("carry_forward_rule"),
   maxBalance: numeric("max_balance", { precision: 6, scale: 2 }),
@@ -405,6 +415,21 @@ export const leaveRequests = pgTable("leave_requests", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });
 
+export const bereavementLeaveRequest = pgTable(
+  "bereavement_leave_request",
+  {
+    id: serial("id").primaryKey(),
+    leaveRequestId: integer("leave_request_id")
+      .notNull()
+      .unique()
+      .references(() => leaveRequests.id, { onDelete: "cascade" }),
+    relationship: varchar("relationship", { length: 64 }).notNull(),
+    relationshipDetails: text("relationship_details"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+  }
+);
+
 export const compOffCredits = pgTable("comp_off_credits", {
   id: serial("id").primaryKey(),
   orgId: integer("org_id")
@@ -421,6 +446,7 @@ export const compOffCredits = pgTable("comp_off_credits", {
     .references(() => users.id),
   timesheetId: integer("timesheet_id").references(() => timesheets.id),
   leaveRequestId: integer("leave_request_id").references(() => leaveRequests.id),
+  nextLeaveRequestId: integer("next_leave_request_id").references(() => leaveRequests.id),
   workDate: date("work_date").notNull(),
   durationType: varchar("duration_type", { length: 20 }).notNull(),
   creditedHours: numeric("credited_hours", { precision: 5, scale: 2 }).notNull(),
@@ -708,6 +734,28 @@ export const mvLeaveTrendsMonthly = pgTable(
   })
 );
 
+export const leaveAllocationLogs = pgTable(
+  "leave_allocation_logs",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    allocationType: varchar("allocation_type", { length: 20 }).notNull(),
+    processedAt: timestamp("processed_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => ({
+    uniqUserAllocation: uniqueIndex("uq_leave_allocation_log").on(
+      table.userId,
+      table.allocationType
+    ),
+  })
+);
+
+export const leaveAllocationLogsTable = leaveAllocationLogs;
+
 export const schema = {
   orgs,
   departments,
@@ -725,6 +773,7 @@ export const schema = {
   leavePolicies,
   leaveBalances,
   leaveRequests,
+  bereavementLeaveRequest,
   compOffCredits,
   approvals,
   payrollWindows,
@@ -740,6 +789,7 @@ export const schema = {
   mvProjectCostsMonthly,
   mvUserProductivityDaily,
   mvLeaveTrendsMonthly,
+  leaveAllocationLogs,
 };
 
 // Legacy aliases to maintain compatibility with existing imports
@@ -760,6 +810,7 @@ export const leaveTypesTable = leaveTypes;
 export const leavePoliciesTable = leavePolicies;
 export const leaveBalancesTable = leaveBalances;
 export const leaveRequestsTable = leaveRequests;
+export const bereavementLeaveRequestTable = bereavementLeaveRequest;
 export const compOffCreditsTable = compOffCredits;
 export const approvalsTable = approvals;
 export const payrollWindowsTable = payrollWindows;
