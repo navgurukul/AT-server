@@ -56,10 +56,10 @@ async function bootstrap() {
 
   // --- FIX 1: Enable CORS for your frontend ---
   app.enableCors({
-    origin: true, // 'true' allows all origins temporarily. For production, replace with your frontend URL like 'https://yourfrontend.com'
-    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
-    credentials: true, 
-  });
+  origin: 'https://stub.navgurukul.org',
+  methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
+  credentials: true,
+});
 
   app.enableShutdownHooks();
   
