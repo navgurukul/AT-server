@@ -1577,7 +1577,7 @@ export class LeavesService {
 
     if (leaveTypeInfo && this.isSpecialLeaveNotificationType(leaveTypeInfo)) {
       specialLeaveEmailResult = await this.sendSpecialLeaveNotificationEmail({
-        toEmail: "amruta@navgurukul.org",
+        toEmail: "pnc@navgurukul.org",
         managerEmail: managerInfo?.email ?? null,
         employeeName: userInfo?.name ?? `User ${userId}`,
         employeeEmail: userInfo?.email ?? null,
@@ -5974,7 +5974,7 @@ export class LeavesService {
     });
 
     const dateRange = this.formatDateRangeForSubject(startDate, endDate);
-    const ccRecipients = Array.from(new Set(["amruta@navgurukul.org", employeeEmail]));
+    const ccRecipients = Array.from(new Set(["pnc@navgurukul.org", employeeEmail]));
     const lowerLeaveTypeName = leaveTypeName.toLowerCase();
     const includeProgrammeName =
       lowerLeaveTypeName.includes("exam") ||
