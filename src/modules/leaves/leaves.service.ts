@@ -2,13 +2,16 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
 import {
   and,
   count,
   desc,
   eq,
+  ne,
   gte,
   inArray,
   lte,
@@ -23,6 +26,7 @@ import { alias } from "drizzle-orm/pg-core";
 import { DatabaseService } from "../../database/database.service";
 import {
   approvalsTable,
+  bereavementLeaveRequestTable,
   compOffCreditsTable,
   leaveBalancesTable,
   leavePoliciesTable,
@@ -51,6 +55,9 @@ import { UpdateAllocatedLeaveDto } from "./dto/update-allocated-leave.dto";
 import { AuthenticatedUser } from "../../common/types/authenticated-user.interface";
 import { SalaryCycleUtil } from "src/common/utils/salary-cycle.util";
 import { checkAdminSelfAction } from '../../common/utils/self-action.utils';
+import { getYYYYMMDD } from "../../common/utils/access-control.util";
+import { Cron } from "@nestjs/schedule";
+import nodemailer from "nodemailer";
 
 interface ListLeaveRequestsParams {
   actor?: AuthenticatedUser;
@@ -65,13 +72,13 @@ interface ListCompOffParams {
   workDate?: string;
   holidayType?: string;
   status?:
-    | "pending"
-    | "granted"
-    | "expired"
-    | "revoked"
-    | "availed"
-    | "partial_availed"
-    | "warning";
+  | "pending"
+  | "granted"
+  | "expired"
+  | "revoked"
+  | "availed"
+  | "partial_availed"
+  | "warning";
 }
 
 interface CompOffCreditListRow {
@@ -84,6 +91,7 @@ interface CompOffCreditListRow {
   status: string;
   expiresAt: Date | string;
   leaveRequestId: number | null;
+  nextLeaveRequestId: number | null;
 }
 
 export interface MyCompOffCreditItem {
@@ -95,14 +103,14 @@ export interface MyCompOffCreditItem {
   availedDate: Date | string | null;
   expireDate: Date | string;
   status:
-    | "pending"
-    | "granted"
-    | "expired"
-    | "revoked"
-    | "availed"
-    | "partial_availed"
-    | "warning"
-    | string;
+  | "pending"
+  | "granted"
+  | "expired"
+  | "revoked"
+  | "availed"
+  | "partial_availed"
+  | "warning"
+  | string;
 }
 
 export interface MyCompOffCreditsSummary {
@@ -132,6 +140,13 @@ const TIMESHEET_FULL_DAY_MIN_HOURS = 6;
 const COMP_OFF_FULL_DAY_HOURS = HOURS_PER_WORKING_DAY;
 const COMP_OFF_HALF_DAY_HOURS = COMP_OFF_FULL_DAY_HOURS / 2;
 const COMP_OFF_EXPIRY_DAYS = 30;
+const MAX_LEAVE_DOCUMENT_UPLOAD_BYTES = 10 * 1024 * 1024;
+const ALLOWED_LEAVE_DOCUMENT_MIME_TYPES = new Set([
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/jpg",
+]);
 
 type LeaveBalanceDelta = Partial<{
   balanceHours: number;
@@ -148,13 +163,28 @@ interface LeaveBalanceSnapshot {
   allocatedHours: number;
 }
 
+interface LeaveDocumentUpload {
+  buffer: Buffer;
+  originalname: string;
+  mimetype: string;
+  size: number;
+}
+
+export interface LeaveEmailDeliveryResult {
+  sent: boolean;
+  reason?: string;
+}
+
 @Injectable()
 export class LeavesService {
+  private readonly logger = new Logger(LeavesService.name);
+
   constructor(
     private readonly database: DatabaseService,
     private readonly calendarService: CalendarService,
     private readonly auditService: AuditService,
-  ) {}
+    private readonly configService: ConfigService,
+  ) { }
 
   private async consumeCompOffCredits(
     tx: DatabaseService['connection'],
@@ -173,15 +203,18 @@ export class LeavesService {
 
     const linkedCredits = leaveRequestId
       ? await tx
-          .select()
-          .from(compOffCreditsTable)
-          .where(
-            and(
-              activeCreditConditions,
+        .select()
+        .from(compOffCreditsTable)
+        .where(
+          and(
+            activeCreditConditions,
+            or(
               eq(compOffCreditsTable.leaveRequestId, leaveRequestId),
+              eq(compOffCreditsTable.nextLeaveRequestId, leaveRequestId),
             ),
-          )
-          .orderBy(compOffCreditsTable.workDate)
+          ),
+        )
+        .orderBy(compOffCreditsTable.workDate)
       : [];
 
     const unlinkedCredits = await tx
@@ -191,7 +224,16 @@ export class LeavesService {
         and(
           activeCreditConditions,
           leaveRequestId
-            ? isNull(compOffCreditsTable.leaveRequestId)
+            ? and(
+                or(
+                  isNull(compOffCreditsTable.leaveRequestId),
+                  ne(compOffCreditsTable.leaveRequestId, leaveRequestId),
+                ),
+                or(
+                  isNull(compOffCreditsTable.nextLeaveRequestId),
+                  ne(compOffCreditsTable.nextLeaveRequestId, leaveRequestId),
+                ),
+              )
             : sql`true`,
         ),
       )
@@ -226,13 +268,26 @@ export class LeavesService {
             ? 'availed'
             : 'partial_availed';
 
+        const updateFields: any = {
+          availedHours: newAvailedHours.toString(),
+          status: newStatus,
+        };
+
+        if (
+          leaveRequestId &&
+          credit.leaveRequestId !== leaveRequestId &&
+          credit.nextLeaveRequestId !== leaveRequestId
+        ) {
+          if (credit.leaveRequestId === null) {
+            updateFields.leaveRequestId = leaveRequestId;
+          } else if (credit.nextLeaveRequestId === null) {
+            updateFields.nextLeaveRequestId = leaveRequestId;
+          }
+        }
+
         await tx
           .update(compOffCreditsTable)
-          .set({
-            availedHours: newAvailedHours.toString(),
-            status: newStatus,
-            leaveRequestId: leaveRequestId ?? credit.leaveRequestId,
-          })
+          .set(updateFields)
           .where(eq(compOffCreditsTable.id, credit.id));
 
         remainingHoursToConsume -= hoursToTake;
@@ -286,14 +341,14 @@ export class LeavesService {
     });
 
     await tx
-    .update(compOffCreditsTable)
-    .set({
-      status: 'pending',
-      timesheetId: null,
-      creditedHours: '0',
-      timesheetHours: null,
-    })
-    .where(eq(compOffCreditsTable.id, grantedCredit.id));
+      .update(compOffCreditsTable)
+      .set({
+        status: 'pending',
+        timesheetId: null,
+        creditedHours: '0',
+        timesheetHours: null,
+      })
+      .where(eq(compOffCreditsTable.id, grantedCredit.id));
     return true;
   }
 
@@ -305,14 +360,25 @@ export class LeavesService {
     leaveEndDate: Date,
   ) {
     const normalizedLeaveEndDate = this.normalizeDateUTC(leaveEndDate);
-    const credits = await tx
-      .select()
+    const creditsWithRequest = await tx
+      .select({
+        credit: compOffCreditsTable,
+        firstRequestHours: leaveRequestsTable.hours,
+        firstRequestState: leaveRequestsTable.state,
+      })
       .from(compOffCreditsTable)
+      .leftJoin(
+        leaveRequestsTable,
+        eq(compOffCreditsTable.leaveRequestId, leaveRequestsTable.id),
+      )
       .where(
         and(
           eq(compOffCreditsTable.userId, userId),
           inArray(compOffCreditsTable.status, ['granted', 'partial_availed', 'warning']),
-          isNull(compOffCreditsTable.leaveRequestId),
+          or(
+            isNull(compOffCreditsTable.leaveRequestId),
+            isNull(compOffCreditsTable.nextLeaveRequestId),
+          ),
         ),
       )
       .orderBy(compOffCreditsTable.workDate);
@@ -320,10 +386,14 @@ export class LeavesService {
     let remainingHoursToLink = hoursToLink;
     let skippedHoursDueToExpiry = 0;
 
-    for (const credit of credits) {
+    for (const row of creditsWithRequest) {
       if (remainingHoursToLink <= 0) {
         break;
       }
+
+      const credit = row.credit;
+      const firstRequestHours = row.firstRequestHours;
+      const firstRequestState = row.firstRequestState;
 
       if (
         !this.isCompOffCreditEligibleForLeaveDate(
@@ -331,23 +401,33 @@ export class LeavesService {
           normalizedLeaveEndDate,
         )
       ) {
-        const availableHours =
-          Number(credit.creditedHours) - Number(credit.availedHours);
+        let availableHours = Number(credit.creditedHours) - Number(credit.availedHours);
+        if (credit.leaveRequestId && firstRequestState === 'pending') {
+          availableHours -= Number(firstRequestHours || 0);
+        }
         if (availableHours > 0) {
           skippedHoursDueToExpiry += availableHours;
         }
         continue;
       }
 
-      const availableHours = Number(credit.creditedHours) - Number(credit.availedHours);
+      let availableHours = Number(credit.creditedHours) - Number(credit.availedHours);
+      if (credit.leaveRequestId && firstRequestState === 'pending') {
+        availableHours -= Number(firstRequestHours || 0);
+      }
       const hoursToLinkNow = Math.min(remainingHoursToLink, availableHours);
 
       if (hoursToLinkNow > 0) {
+        const updateFields: any = {};
+        if (credit.leaveRequestId === null) {
+          updateFields.leaveRequestId = leaveRequestId;
+        } else {
+          updateFields.nextLeaveRequestId = leaveRequestId;
+        }
+
         await tx
           .update(compOffCreditsTable)
-          .set({
-            leaveRequestId,
-          })
+          .set(updateFields)
           .where(eq(compOffCreditsTable.id, credit.id));
 
         remainingHoursToLink -= hoursToLinkNow;
@@ -368,28 +448,59 @@ export class LeavesService {
     tx: DatabaseService['connection'],
     leaveRequestId: number,
   ) {
-    // Unlink comp-off credits from the leave request
+    // Find credits where the first link matches this leave request
+    const linkedToFirst = await tx
+      .select()
+      .from(compOffCreditsTable)
+      .where(eq(compOffCreditsTable.leaveRequestId, leaveRequestId));
+
+    for (const credit of linkedToFirst) {
+      // Shift nextLeaveRequestId to leaveRequestId, and set nextLeaveRequestId to null
+      await tx
+        .update(compOffCreditsTable)
+        .set({
+          leaveRequestId: credit.nextLeaveRequestId,
+          nextLeaveRequestId: null,
+        })
+        .where(eq(compOffCreditsTable.id, credit.id));
+    }
+
+    // Find credits where the second link matches this leave request
     await tx
       .update(compOffCreditsTable)
       .set({
-        leaveRequestId: null,
+        nextLeaveRequestId: null,
       })
-      .where(eq(compOffCreditsTable.leaveRequestId, leaveRequestId));
+      .where(eq(compOffCreditsTable.nextLeaveRequestId, leaveRequestId));
 
     // Now, for any affected credits, if expires_at is in the past and status is granted/partial_availed, set status to warning
     const now = new Date();
     const affectedCredits = await tx
-      .select({ id: compOffCreditsTable.id, expiresAt: compOffCreditsTable.expiresAt, status: compOffCreditsTable.status })
+      .select({
+        id: compOffCreditsTable.id,
+        expiresAt: compOffCreditsTable.expiresAt,
+        status: compOffCreditsTable.status,
+      })
       .from(compOffCreditsTable)
       .where(
         and(
-          isNull(compOffCreditsTable.leaveRequestId),
           inArray(compOffCreditsTable.status, ['granted', 'partial_availed']),
           lt(compOffCreditsTable.expiresAt, now),
-        )
+          or(
+            and(
+              eq(compOffCreditsTable.status, 'granted'),
+              isNull(compOffCreditsTable.leaveRequestId),
+            ),
+            and(
+              eq(compOffCreditsTable.status, 'partial_availed'),
+              isNull(compOffCreditsTable.nextLeaveRequestId),
+            ),
+          ),
+        ),
       );
+
     if (affectedCredits.length > 0) {
-      const ids = affectedCredits.map(c => c.id);
+      const ids = affectedCredits.map((c) => c.id);
       await tx
         .update(compOffCreditsTable)
         .set({
@@ -452,8 +563,61 @@ export class LeavesService {
       leaveType: row.leaveType,
     }));
 
+    // Calculate dynamic summary values from leave_balances
+    const earnLeaveCodes = new Set(["CL", "WL", COMP_OFF_LEAVE_CODE]);
+
+    let sumBalanceHours = 0;
+    let sumAllocatedHours = 0;
+
+    for (const b of balances) {
+      if (b.leaveType?.code && earnLeaveCodes.has(b.leaveType.code)) {
+        sumBalanceHours += b.balanceHours;
+        sumAllocatedHours += b.allocatedHours;
+      }
+    }
+
+    const availableEarnedLeaves = Number((sumBalanceHours / 8).toFixed(2));
+    const totalAllocatedEarnedLeaves = Number((sumAllocatedHours / 8).toFixed(2));
+
+    // Query leave requests dynamically for pending & approved leaves
+    const [pendingRow] = await db
+      .select({
+        totalHours: sql<string>`coalesce(sum(${leaveRequestsTable.hours}), 0)`,
+      })
+      .from(leaveRequestsTable)
+      .where(
+        and(
+          eq(leaveRequestsTable.userId, userId),
+          eq(leaveRequestsTable.state, "pending")
+        )
+      );
+
+    const [approvedRow] = await db
+      .select({
+        totalHours: sql<string>`coalesce(sum(${leaveRequestsTable.hours}), 0)`,
+      })
+      .from(leaveRequestsTable)
+      .where(
+        and(
+          eq(leaveRequestsTable.userId, userId),
+          eq(leaveRequestsTable.state, "approved")
+        )
+      );
+
+    const pendingHours = Number(pendingRow?.totalHours ?? 0);
+    const approvedHours = Number(approvedRow?.totalHours ?? 0);
+
+    const pending = Number((pendingHours / 8).toFixed(2));
+    const approved = Number((approvedHours / 8).toFixed(2));
+
     return {
       userId,
+      summary: {
+        availableEarnedLeaves,
+        totalAllocatedEarnedLeaves,
+        pending,
+        approved,
+      },
       balances,
     };
   }
@@ -597,7 +761,7 @@ export class LeavesService {
       // Admin and superadmin can see all employee leaves (except their own)
       const isAdmin = params.actor.roles?.includes("admin");
       const isSuperAdmin = params.actor.roles?.includes("super_admin");
-      
+
       if (!isAdmin && !isSuperAdmin) {
         // Manager: Only show leave requests from their direct reports (mentees)
         const mentees = await db
@@ -643,6 +807,10 @@ export class LeavesService {
         requestedAt: leaveRequestsTable.requestedAt,
         updatedAt: leaveRequestsTable.updatedAt,
         decidedByUserId: leaveRequestsTable.decidedByUserId,
+        bereavementRelationship:
+          bereavementLeaveRequestTable.relationship,
+        bereavementRelationshipDetails:
+          bereavementLeaveRequestTable.relationshipDetails,
         leaveTypeName: leaveTypesTable.name,
         leaveTypeCode: leaveTypesTable.code,
         requesterName: usersTable.name,
@@ -665,6 +833,13 @@ export class LeavesService {
       .leftJoin(
         decidedByUser,
         eq(leaveRequestsTable.decidedByUserId, decidedByUser.id),
+      )
+      .leftJoin(
+        bereavementLeaveRequestTable,
+        eq(
+          bereavementLeaveRequestTable.leaveRequestId,
+          leaveRequestsTable.id,
+        ),
       );
 
     const query = filters.length > 0 ? baseQuery.where(and(...filters)) : baseQuery;
@@ -695,6 +870,10 @@ export class LeavesService {
       halfDaySegment: row.halfDaySegment ?? null,
       hours: row.hours ? Number(row.hours) : 0,
       reason: row.reason ?? null,
+      bereavementDetails: this.formatBereavementDetails(
+        row.bereavementRelationship,
+        row.bereavementRelationshipDetails,
+      ),
       requestedAt: row.requestedAt,
       updatedAt: row.updatedAt,
       decidedByUserId: row.decidedByUserId ?? null,
@@ -738,6 +917,10 @@ export class LeavesService {
         state: leaveRequestsTable.state,
         requestedAt: leaveRequestsTable.requestedAt,
         updatedAt: leaveRequestsTable.updatedAt,
+        bereavementRelationship:
+          bereavementLeaveRequestTable.relationship,
+        bereavementRelationshipDetails:
+          bereavementLeaveRequestTable.relationshipDetails,
         leaveType: {
           id: leaveTypesTable.id,
           code: leaveTypesTable.code,
@@ -748,6 +931,13 @@ export class LeavesService {
       .innerJoin(
         leaveTypesTable,
         eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id),
+      )
+      .leftJoin(
+        bereavementLeaveRequestTable,
+        eq(
+          bereavementLeaveRequestTable.leaveRequestId,
+          leaveRequestsTable.id,
+        ),
       )
       .where(and(...conditions))
       .orderBy(desc(leaveRequestsTable.requestedAt));
@@ -761,29 +951,145 @@ export class LeavesService {
       hours: row.hours ? Number(row.hours) : 0,
       reason: row.reason ?? null,
       state: row.state,
+      bereavementDetails: this.formatBereavementDetails(
+        row.bereavementRelationship,
+        row.bereavementRelationshipDetails,
+      ),
       requestedAt: row.requestedAt,
       updatedAt: row.updatedAt,
       leaveType: row.leaveType,
     }));
+  }
+
+  private isBereavementLeaveType(leaveType: {
+    code?: string | null;
+    name?: string | null;
+  }) {
+    const leaveTypeCode = leaveType.code?.toLowerCase() ?? "";
+    const leaveTypeName = leaveType.name?.toLowerCase() ?? "";
+
+    return (
+      leaveTypeCode === "bereavement" ||
+      leaveTypeCode === "bereavement_leave" ||
+      leaveTypeName.includes("bereavement")
+    );
+  }
+
+  private formatBereavementDetails(
+    relationship?: string | null,
+    relationshipDetails?: string | null,
+  ) {
+    if (!relationship) {
+      return null;
+    }
+
+    return {
+      relationship,
+      relationshipDetails: relationshipDetails ?? null,
+    };
+  }
+
+  private async syncBereavementLeaveRequestDetails(
+    tx: any,
+    leaveRequestId: number,
+    leaveType: {
+      code?: string | null;
+      name?: string | null;
+    },
+    payload: Pick<CreateLeaveRequestDto, "relationship" | "relationshipDetails">,
+  ) {
+    await tx
+      .delete(bereavementLeaveRequestTable)
+      .where(eq(bereavementLeaveRequestTable.leaveRequestId, leaveRequestId));
+
+    if (!this.isBereavementLeaveType(leaveType)) {
+      return;
+    }
+
+    if (!payload.relationship) {
+      throw new BadRequestException(
+        "Relationship is required for bereavement leave",
+      );
+    }
+
+    const relationshipDetails = payload.relationshipDetails?.trim() ?? null;
+
+    if (
+      payload.relationship === "other_immediate_family_member" &&
+      !relationshipDetails
+    ) {
+      throw new BadRequestException(
+        "Please mention your relationship with them",
+      );
+    }
+
+    await tx.insert(bereavementLeaveRequestTable).values({
+      leaveRequestId,
+      relationship: payload.relationship,
+      relationshipDetails:
+        payload.relationship === "other_immediate_family_member"
+          ? relationshipDetails
+          : null,
+    });
   }
   async createLeaveRequest(
     userId: number,
     orgId: number,
     payload: CreateLeaveRequestDto,
     actor?: AuthenticatedUser,
+    uploadedDocuments?: LeaveDocumentUpload[],
   ) {
     const db = this.database.connection;
     const startDate = new Date(payload.startDate);
     const endDate = new Date(payload.endDate);
+
+    const [user] = await db
+      .select({
+        id: usersTable.id,
+        dateOfExit: usersTable.dateOfExit,
+      })
+      .from(usersTable)
+      .where(eq(usersTable.id, userId))
+      .limit(1);
+
+    if (!user) {
+      throw new NotFoundException(`User with ID ${userId} not found`);
+    }
+
+    if (user.dateOfExit) {
+      const startDateStr = getYYYYMMDD(startDate);
+      const endDateStr = getYYYYMMDD(endDate);
+      const exitDateStr = getYYYYMMDD(user.dateOfExit);
+      if (startDateStr > exitDateStr || endDateStr > exitDateStr) {
+        this.logger.warn(
+          `Blocked leave request: userId=${userId}, range=${startDateStr} to ${endDateStr}, dateOfExit=${exitDateStr}`
+        );
+        throw new BadRequestException('Leave request cannot exceed Date of Exit');
+      }
+
+      // Block restricted leave types if the leave request overlaps the notice period
+      const exitDate = new Date(exitDateStr + 'T00:00:00Z');
+      const noticeStartDate = new Date(exitDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+      const noticeStartStr = getYYYYMMDD(noticeStartDate);
+
+      const overlapsNoticePeriod = startDateStr >= noticeStartStr || endDateStr >= noticeStartStr;
+      if (overlapsNoticePeriod) {
+        const restrictedLeaveTypeIds = [2, 13, 14, 15, 10, 1]; // CL (2), L&D (13), VS (14), VCL (15), Wedding (10), EL (1)
+        if (restrictedLeaveTypeIds.includes(payload.leaveTypeId)) {
+          throw new BadRequestException('Cannot apply for or modify restricted leaves during the notice period.');
+        }
+      }
+    }
+
+    if (endDate < startDate) {
+      throw new BadRequestException("End date cannot be before start date");
+    }
+
     let requiresApproval = true;
     let isPaidLeave = true;
     let requestedDurationType: "half_day" | "full_day" | "custom" = "full_day";
     let requestedHours = 0;
     let requestedHalfDaySegment: "first_half" | "second_half" | null = null;
-
-    if (endDate < startDate) {
-      throw new BadRequestException("End date cannot be before start date");
-    }
 
     this.enforcePastDateWindowForNonPrivilegedActor(startDate, endDate, actor);
 
@@ -802,6 +1108,78 @@ export class LeavesService {
       if (!leaveType) {
         throw new NotFoundException(
           "Leave type not found for this organisation"
+        );
+      }
+
+      const isBereavementLeave = this.isBereavementLeaveType(leaveType);
+      const requiresDocumentEmail = this.isLeaveTypeRequiringSupportingDocument(
+        leaveType,
+      );
+
+      if (uploadedDocuments && uploadedDocuments.length > 1) {
+        const lowerCode = leaveType.code?.toLowerCase() || "";
+        const lowerName = leaveType.name?.toLowerCase() || "";
+        const isVipassana =
+          lowerCode === "vipassana course" ||
+          lowerCode === "vipassana course leave" ||
+          lowerCode === "vipassana seva" ||
+          lowerCode === "vipassana seva leave" ||
+          lowerName.includes("vipassana course") ||
+          lowerName.includes("vipassana seva");
+          
+        if (!isVipassana) {
+          throw new BadRequestException(
+            "Multiple documents are only allowed for Vipassana Course Leave and Vipassana Seva Leave",
+          );
+        }
+      }
+
+      if (requiresDocumentEmail) {
+        if (!uploadedDocuments || uploadedDocuments.length === 0) {
+          throw new BadRequestException(
+            "Supporting document is required for this leave type",
+          );
+        }
+      }
+
+      if (uploadedDocuments && uploadedDocuments.length > 0) {
+        for (const doc of uploadedDocuments) {
+          if (doc.size > MAX_LEAVE_DOCUMENT_UPLOAD_BYTES) {
+            throw new BadRequestException(
+              "Uploaded document must be 10MB or smaller",
+            );
+          }
+
+          if (!ALLOWED_LEAVE_DOCUMENT_MIME_TYPES.has(doc.mimetype)) {
+            throw new BadRequestException(
+              "Only PDF, JPG, and PNG documents are allowed",
+            );
+          }
+        }
+      }
+
+      if (
+        this.isExamOrLearningLeaveType(leaveType) &&
+        !payload.courseOrProgrammeName?.trim()
+      ) {
+        throw new BadRequestException(
+          "Course or programme name is required for Exam Leave and L&D Leave",
+        );
+      }
+
+      if (isBereavementLeave && !payload.relationship) {
+        throw new BadRequestException(
+          "Relationship is required for bereavement leave",
+        );
+      }
+
+      if (
+        isBereavementLeave &&
+        payload.relationship === "other_immediate_family_member" &&
+        !payload.relationshipDetails?.trim()
+      ) {
+        throw new BadRequestException(
+          "Please mention your relationship with them",
         );
       }
 
@@ -889,7 +1267,7 @@ export class LeavesService {
       }
 
       const overlappingRequests = await tx
-        .select({ 
+        .select({
           id: leaveRequestsTable.id,
           durationType: leaveRequestsTable.durationType,
           halfDaySegment: leaveRequestsTable.halfDaySegment,
@@ -927,9 +1305,9 @@ export class LeavesService {
           requestedHalfDaySegment !== existing.halfDaySegment
         ) {
           // No conflict - different half-day segments can coexist
-          continue; 
+          continue;
         }
-        
+
         // Any other overlap is a conflict
         throw new BadRequestException(
           "Overlapping leave request exists for the selected period"
@@ -938,7 +1316,7 @@ export class LeavesService {
 
       requiresApproval =
         leaveType.requiresApproval === undefined ||
-        leaveType.requiresApproval === null
+          leaveType.requiresApproval === null
           ? true
           : leaveType.requiresApproval;
       isPaidLeave = leaveType.paid ?? true;
@@ -1043,6 +1421,13 @@ export class LeavesService {
         })
         .returning();
 
+      await this.syncBereavementLeaveRequestDetails(
+        tx,
+        request.id,
+        leaveType,
+        payload,
+      );
+
       if (leaveType.code === COMP_OFF_LEAVE_CODE) {
         await this.linkCompOffCreditsToLeaveRequest(
           tx,
@@ -1051,6 +1436,16 @@ export class LeavesService {
           request.id,
           endDate,
         );
+
+        if (shouldAutoApprove) {
+          await this.consumeCompOffCredits(
+            tx,
+            userId,
+            requestedHours,
+            request.id,
+            endDate,
+          );
+        }
       }
 
       if (isPaidLeave || isLWP) {
@@ -1088,13 +1483,25 @@ export class LeavesService {
         }
       }
 
-      return request;
+      return {
+        ...request,
+        bereavementDetails: this.formatBereavementDetails(
+          isBereavementLeave ? payload.relationship : null,
+          isBereavementLeave
+            ? payload.relationship === "other_immediate_family_member"
+              ? payload.relationshipDetails?.trim() ?? null
+              : null
+            : null,
+        ),
+      };
     });
 
     // Fetch user and leave type details for notification
     const [userInfo] = await db
       .select({
         name: usersTable.name,
+        email: usersTable.email,
+        managerId: usersTable.managerId,
         slackId: usersTable.slackId,
         discordId: usersTable.discordId,
       })
@@ -1105,10 +1512,22 @@ export class LeavesService {
     const [leaveTypeInfo] = await db
       .select({
         name: leaveTypesTable.name,
+        code: leaveTypesTable.code,
       })
       .from(leaveTypesTable)
       .where(eq(leaveTypesTable.id, payload.leaveTypeId))
       .limit(1);
+
+    const [managerInfo] = userInfo?.managerId
+      ? await db
+        .select({
+          name: usersTable.name,
+          email: usersTable.email,
+        })
+        .from(usersTable)
+        .where(eq(usersTable.id, userInfo.managerId))
+        .limit(1)
+      : [];
 
     const notificationPayload = {
       type: "leave_request",
@@ -1122,10 +1541,57 @@ export class LeavesService {
       userSlackId: userInfo?.slackId ?? null,
       userDiscordId: userInfo?.discordId ?? null,
       leaveTypeName: leaveTypeInfo?.name ?? "Leave",
+      leaveTypeCode: leaveTypeInfo?.code ?? null,
       reason: payload.reason ?? null,
     };
 
     await this.notifyLatestProjectSlackChannel(userId, orgId, notificationPayload);
+
+    let emailDeliveryResult: LeaveEmailDeliveryResult | null = null;
+    let specialLeaveEmailResult: LeaveEmailDeliveryResult | null = null;
+
+    const requiresDocumentEmail = leaveTypeInfo ? this.isLeaveTypeRequiringSupportingDocument(leaveTypeInfo) : false;
+    const isLearningLeave = leaveTypeInfo ? this.isLearningLeaveType(leaveTypeInfo) : false;
+
+    if (
+      leaveTypeInfo &&
+      ((uploadedDocuments && uploadedDocuments.length > 0 && requiresDocumentEmail) || isLearningLeave)
+    ) {
+      emailDeliveryResult = await this.sendSupportingDocumentEmail({
+        managerEmail: managerInfo?.email ?? null,
+        employeeName: userInfo?.name ?? `User ${userId}`,
+        employeeEmail: userInfo?.email ?? null,
+        leaveTypeName: leaveTypeInfo.name,
+        startDate,
+        endDate,
+        courseOrProgrammeName: payload.courseOrProgrammeName?.trim() ?? null,
+        documents: uploadedDocuments && uploadedDocuments.length > 0 ? uploadedDocuments : null,
+      });
+
+      if (!emailDeliveryResult.sent) {
+        this.logger.warn(
+          `Supporting document email could not be sent for leave request ${request.id}: ${emailDeliveryResult.reason ?? "unknown reason"}`,
+        );
+      }
+    }
+
+    if (leaveTypeInfo && this.isSpecialLeaveNotificationType(leaveTypeInfo)) {
+      specialLeaveEmailResult = await this.sendSpecialLeaveNotificationEmail({
+        toEmail: "pnc@navgurukul.org",
+        managerEmail: managerInfo?.email ?? null,
+        employeeName: userInfo?.name ?? `User ${userId}`,
+        employeeEmail: userInfo?.email ?? null,
+        leaveTypeName: leaveTypeInfo.name,
+        startDate,
+        endDate,
+      });
+
+      if (!specialLeaveEmailResult.sent) {
+        this.logger.warn(
+          `Special leave email could not be sent for leave request ${request.id}: ${specialLeaveEmailResult.reason ?? "unknown reason"}`,
+        );
+      }
+    }
 
     const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
     if (actorRole) {
@@ -1148,12 +1614,16 @@ export class LeavesService {
       });
     }
 
-    return request;
+    return {
+      ...request,
+      emailNotification: emailDeliveryResult ?? specialLeaveEmailResult,
+    };
   }
 
   async createLeaveRequestForUser(
     actor: AuthenticatedUser,
-    payload: CreateLeaveForUserDto
+    payload: CreateLeaveForUserDto,
+    uploadedDocuments?: LeaveDocumentUpload[],
   ) {
     const db = this.database.connection;
     checkAdminSelfAction(actor, payload.userId.toString());
@@ -1184,6 +1654,7 @@ export class LeavesService {
       targetUser.orgId,
       payload,
       actor,
+      uploadedDocuments,
     );
   }
 
@@ -1227,17 +1698,45 @@ export class LeavesService {
           durationType: leaveRequestsTable.durationType,
           halfDaySegment: leaveRequestsTable.halfDaySegment,
           reason: leaveRequestsTable.reason,
+          dateOfExit: usersTable.dateOfExit,
         })
         .from(leaveRequestsTable)
         .innerJoin(
           leaveTypesTable,
           eq(leaveTypesTable.id, leaveRequestsTable.leaveTypeId)
         )
+        .innerJoin(
+          usersTable,
+          eq(leaveRequestsTable.userId, usersTable.id)
+        )
         .where(eq(leaveRequestsTable.id, requestId))
         .limit(1);
 
       if (!existingRequest) {
         throw new NotFoundException("Leave request not found");
+      }
+
+      if (existingRequest.dateOfExit) {
+        const startDateStr = getYYYYMMDD(startDate);
+        const endDateStr = getYYYYMMDD(endDate);
+        const exitDateStr = getYYYYMMDD(existingRequest.dateOfExit);
+        if (startDateStr > exitDateStr || endDateStr > exitDateStr) {
+          this.logger.warn(`Blocked admin leave request update: userId=${existingRequest.userId}, range=${startDateStr} to ${endDateStr}, dateOfExit=${exitDateStr}`);
+          throw new BadRequestException('Leave request cannot exceed Date of Exit');
+        }
+
+        // Block restricted leave types if the leave request overlaps the notice period
+        const exitDate = new Date(exitDateStr + 'T00:00:00Z');
+        const noticeStartDate = new Date(exitDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+        const noticeStartStr = getYYYYMMDD(noticeStartDate);
+
+        const overlapsNoticePeriod = startDateStr >= noticeStartStr || endDateStr >= noticeStartStr;
+        if (overlapsNoticePeriod) {
+          const restrictedLeaveTypeIds = [2, 13, 14, 15, 10, 1]; // CL (2), L&D (13), VS (14), VCL (15), Wedding (10), EL (1)
+          if (restrictedLeaveTypeIds.includes(payload.leaveTypeId)) {
+            throw new BadRequestException('Cannot apply for or modify restricted leaves during the notice period.');
+          }
+        }
       }
       checkAdminSelfAction(actor, existingRequest.userId.toString());
 
@@ -1289,6 +1788,13 @@ export class LeavesService {
           "No leave policy configured for the selected leave type"
         );
       }
+
+      await this.syncBereavementLeaveRequestDetails(
+        tx,
+        existingRequest.id,
+        targetLeaveType,
+        payload,
+      );
 
       const { workingDays, totalHours } = await this.calculateWorkingHours(
         actor.orgId,
@@ -1419,13 +1925,13 @@ export class LeavesService {
       const previousHours = Number(existingRequest.hours ?? 0);
       const previousLeaveTypeId = Number(existingRequest.leaveTypeId);
       const previousPaidLeave = existingRequest.leaveTypePaid ?? true;
-      const previousIsLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE || 
-                            (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+      const previousIsLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE ||
+        (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
       const previousShouldTrackBalance = previousPaidLeave || previousIsLWP;
-      
+
       const nextPaidLeave = targetLeaveType.paid ?? true;
-      const nextIsLWP = targetLeaveType.code === LWP_LEAVE_CODE || 
-                        (targetLeaveType.name?.toLowerCase().includes('without pay') ?? false);
+      const nextIsLWP = targetLeaveType.code === LWP_LEAVE_CODE ||
+        (targetLeaveType.name?.toLowerCase().includes('without pay') ?? false);
       const nextShouldTrackBalance = nextPaidLeave || nextIsLWP;
 
       if (previousShouldTrackBalance) {
@@ -1510,6 +2016,16 @@ export class LeavesService {
           updatedAt: leaveRequestsTable.updatedAt,
         });
 
+      await tx
+        .delete(notificationsTable)
+        .where(
+          and(
+            eq(notificationsTable.template, 'leave_request'),
+            eq(notificationsTable.state, 'pending'),
+            sql`${notificationsTable.payload}->>'leaveId' = ${String(requestId)}`
+          )
+        );
+
       const actorRole = this.getPrivilegedActorRole(actor.roles ?? []);
       if (actorRole) {
         await this.auditService.createLog({
@@ -1545,6 +2061,21 @@ export class LeavesService {
         });
       }
 
+      const [bereavementDetails] = await tx
+        .select({
+          relationship: bereavementLeaveRequestTable.relationship,
+          relationshipDetails:
+            bereavementLeaveRequestTable.relationshipDetails,
+        })
+        .from(bereavementLeaveRequestTable)
+        .where(
+          eq(
+            bereavementLeaveRequestTable.leaveRequestId,
+            updatedRequest.id,
+          )
+        )
+        .limit(1);
+
       return {
         id: updatedRequest.id,
         userId: updatedRequest.userId,
@@ -1557,6 +2088,10 @@ export class LeavesService {
         hours: Number(updatedRequest.hours ?? 0),
         reason: updatedRequest.reason ?? null,
         updatedAt: updatedRequest.updatedAt,
+        bereavementDetails: this.formatBereavementDetails(
+          bereavementDetails?.relationship,
+          bereavementDetails?.relationshipDetails ?? null,
+        ),
       };
     });
   }
@@ -1624,8 +2159,8 @@ export class LeavesService {
       let updatedBalance: LeaveBalanceSnapshot | null = null;
 
       const isPaidLeave = existingRequest.leaveTypePaid ?? true;
-      const isLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE || 
-                    (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+      const isLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE ||
+        (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
       const shouldRestoreBalance = isPaidLeave || isLWP;
 
       if (shouldRestoreBalance) {
@@ -1645,6 +2180,16 @@ export class LeavesService {
           }
         );
       }
+
+      await tx
+        .delete(notificationsTable)
+        .where(
+          and(
+            eq(notificationsTable.template, 'leave_request'),
+            eq(notificationsTable.state, 'pending'),
+            sql`${notificationsTable.payload}->>'leaveId' = ${String(requestId)}`
+          )
+        );
 
       await tx
         .delete(approvalsTable)
@@ -1710,10 +2255,10 @@ export class LeavesService {
         restoredHours: approvedHours,
         recalculatedBalance: updatedBalance
           ? {
-              balanceHours: this.normalizeHours(updatedBalance.balanceHours),
-              pendingHours: this.normalizeHours(updatedBalance.pendingHours),
-              bookedHours: this.normalizeHours(updatedBalance.bookedHours),
-            }
+            balanceHours: this.normalizeHours(updatedBalance.balanceHours),
+            pendingHours: this.normalizeHours(updatedBalance.pendingHours),
+            bookedHours: this.normalizeHours(updatedBalance.bookedHours),
+          }
           : null,
       };
     });
@@ -2194,6 +2739,8 @@ export class LeavesService {
         }
       }
 
+      await this.expireGrantedCompOffForUserIfNeeded(db, targetUser.id, Number(targetUser.orgId));
+
       const rows = await this.fetchCompOffCreditRows(actor.orgId, [targetUser.id], params.status);
       const credits = this.filterCompOffCreditsBySearch(
         await this.mapCreditsToMyCompOffResponse(actor, rows),
@@ -2262,6 +2809,13 @@ export class LeavesService {
     }
 
     const userIds = visibleUsers.map(user => user.id);
+
+    await Promise.all(
+      userIds.map((id) =>
+        this.expireGrantedCompOffForUserIfNeeded(db, id, actor.orgId)
+      )
+    );
+
     const rows = await this.fetchCompOffCreditRows(actor.orgId, userIds, params.status);
 
     const rowsByUserId = new Map<number, CompOffCreditListRow[]>();
@@ -2307,6 +2861,9 @@ export class LeavesService {
       status?: ListCompOffParams["status"];
     }
   ): Promise<MyCompOffCreditsResponse> {
+    const db = this.database.connection;
+    await this.expireGrantedCompOffForUserIfNeeded(db, actor.id, actor.orgId);
+
     const credits = await this.fetchCompOffCreditRows(actor.orgId, [actor.id]);
     let results = await this.mapCreditsToMyCompOffResponse(actor, credits);
     results = this.filterCompOffCreditsBySearch(results, filters ?? {});
@@ -2398,6 +2955,7 @@ export class LeavesService {
         status: compOffCreditsTable.status,
         expiresAt: compOffCreditsTable.expiresAt,
         leaveRequestId: compOffCreditsTable.leaveRequestId,
+        nextLeaveRequestId: compOffCreditsTable.nextLeaveRequestId,
         createdAt: compOffCreditsTable.createdAt,
       })
       .from(compOffCreditsTable)
@@ -2417,6 +2975,7 @@ export class LeavesService {
       status: row.status,
       expiresAt: row.expiresAt,
       leaveRequestId: row.leaveRequestId,
+      nextLeaveRequestId: row.nextLeaveRequestId,
     }));
   }
 
@@ -2460,7 +3019,7 @@ export class LeavesService {
     }
 
     const leaveRequestIds = credits
-      .map((credit) => credit.leaveRequestId)
+      .flatMap((credit) => [credit.leaveRequestId, credit.nextLeaveRequestId])
       .filter((id): id is number => id !== null && id !== undefined);
 
     const leaveRequestDateById = new Map<number, { startDate: Date; endDate: Date }>();
@@ -2489,12 +3048,16 @@ export class LeavesService {
     const creditsByLeaveRequestId = new Map<number, typeof credits>();
 
     for (const credit of credits) {
-      if (!credit.leaveRequestId) {
-        continue;
+      if (credit.leaveRequestId) {
+        const existingCredits = creditsByLeaveRequestId.get(credit.leaveRequestId) ?? [];
+        existingCredits.push(credit);
+        creditsByLeaveRequestId.set(credit.leaveRequestId, existingCredits);
       }
-      const existingCredits = creditsByLeaveRequestId.get(credit.leaveRequestId) ?? [];
-      existingCredits.push(credit);
-      creditsByLeaveRequestId.set(credit.leaveRequestId, existingCredits);
+      if (credit.nextLeaveRequestId) {
+        const existingCredits = creditsByLeaveRequestId.get(credit.nextLeaveRequestId) ?? [];
+        existingCredits.push(credit);
+        creditsByLeaveRequestId.set(credit.nextLeaveRequestId, existingCredits);
+      }
     }
 
     for (const [leaveRequestId, linkedCredits] of creditsByLeaveRequestId.entries()) {
@@ -2516,7 +3079,7 @@ export class LeavesService {
         0,
         Math.floor(
           (requestDates.endDate.getTime() - requestDates.startDate.getTime()) /
-            (24 * 60 * 60 * 1000)
+          (24 * 60 * 60 * 1000)
         )
       );
 
@@ -2660,9 +3223,8 @@ export class LeavesService {
       }
 
       const updatedNotes = payload.reason
-        ? `${credit.notes ? `${credit.notes} | ` : ""}Revoked: ${
-            payload.reason
-          }`
+        ? `${credit.notes ? `${credit.notes} | ` : ""}Revoked: ${payload.reason
+        }`
         : credit.notes ?? null;
 
       await tx
@@ -2703,12 +3265,12 @@ export class LeavesService {
         balance:
           leaveTypeId && snapshot
             ? {
-                leaveTypeId,
-                balanceHours: snapshot.balanceHours,
-                pendingHours: snapshot.pendingHours,
-                bookedHours: snapshot.bookedHours,
-                allocatedHours: snapshot.allocatedHours,
-              }
+              leaveTypeId,
+              balanceHours: snapshot.balanceHours,
+              pendingHours: snapshot.pendingHours,
+              bookedHours: snapshot.bookedHours,
+              allocatedHours: snapshot.allocatedHours,
+            }
             : null,
       };
     });
@@ -3125,8 +3687,8 @@ export class LeavesService {
       const actorRole = isSuperAdmin
         ? 'super_admin'
         : isAdmin
-        ? 'admin'
-        : null;
+          ? 'admin'
+          : null;
 
       // Admin and super_admin can approve any request (except their own)
       if (!isAdmin && !isSuperAdmin) {
@@ -3144,7 +3706,19 @@ export class LeavesService {
         // Certain sensitive leave types must be reviewed only by admin/super_admin
         if (this.isPrivilegedLeaveType(request.leaveTypeCode, request.leaveTypeName)) {
           throw new ForbiddenException(
-            "Only admin or super_admin can approve or reject this leave"
+            "You are not authorized to approve/reject this leave. Please ask Admin to approve this leave on your behalf."
+          );
+        }
+
+        // Managers cannot approve/reject leave requests from past salary cycles
+        const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(new Date());
+        const cycleStart = this.normalizeDateUTC(currentCycle.start);
+        const normalizedStartDate = this.normalizeDateUTC(new Date(request.startDate));
+        const normalizedEndDate = this.normalizeDateUTC(new Date(request.endDate));
+        
+        if (normalizedStartDate < cycleStart || normalizedEndDate < cycleStart) {
+          throw new ForbiddenException(
+            "Managers cannot approve or reject leave requests from past salary cycles."
           );
         }
       }
@@ -3182,6 +3756,18 @@ export class LeavesService {
         .where(eq(leaveRequestsTable.id, requestId))
         .returning();
 
+      if (newState === "rejected") {
+        await tx
+          .delete(notificationsTable)
+          .where(
+            and(
+              eq(notificationsTable.template, 'leave_request'),
+              eq(notificationsTable.state, 'pending'),
+              sql`${notificationsTable.payload}->>'leaveId' = ${String(requestId)}`
+            )
+          );
+      }
+
       await tx
         .update(approvalsTable)
         .set({
@@ -3197,11 +3783,11 @@ export class LeavesService {
         );
 
       const isPaidLeave = request.leaveTypePaid ?? true;
-      
+
       // Check if this is an LWP leave type
-      const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
-                    (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
-      
+      const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE ||
+        (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+
       // Handle balance adjustments for paid leaves and LWP
       const shouldAdjustBalance = isPaidLeave || isLWP;
 
@@ -3333,8 +3919,8 @@ export class LeavesService {
       const actorRole = isSuperAdmin
         ? 'super_admin'
         : isAdmin
-        ? 'admin'
-        : null;
+          ? 'admin'
+          : null;
 
       // Check if user has any authorization role
       if (!isAdmin && !isSuperAdmin && !isManager) {
@@ -3392,6 +3978,9 @@ export class LeavesService {
         );
       }
 
+      const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(new Date());
+      const cycleStart = this.normalizeDateUTC(currentCycle.start);
+
       const managedCandidates = candidates.filter((candidate) => {
         checkAdminSelfAction(approver, candidate.userId.toString());
         // Always exclude user's own leave requests
@@ -3410,6 +3999,17 @@ export class LeavesService {
           if (this.isPrivilegedLeaveType(candidate.leaveTypeCode, candidate.leaveTypeName)) {
             return false;
           }
+
+          // Managers cannot approve/reject leave requests from past salary cycles
+          const normalizedStartDate = this.normalizeDateUTC(new Date(candidate.startDate));
+          const normalizedEndDate = this.normalizeDateUTC(new Date(candidate.endDate));
+          
+          if (normalizedStartDate < cycleStart || normalizedEndDate < cycleStart) {
+            throw new ForbiddenException(
+              "Managers cannot approve or reject leave requests from past salary cycles."
+            );
+          }
+
           return true;
         }
 
@@ -3449,6 +4049,21 @@ export class LeavesService {
         })
         .where(inArray(leaveRequestsTable.id, eligibleIds));
 
+      if (newState === "rejected") {
+        await tx
+          .delete(notificationsTable)
+          .where(
+            and(
+              eq(notificationsTable.template, 'leave_request'),
+              eq(notificationsTable.state, 'pending'),
+              inArray(
+                sql`${notificationsTable.payload}->>'leaveId'`,
+                eligibleIds.map((id) => String(id))
+              )
+            )
+          );
+      }
+
       await tx
         .update(approvalsTable)
         .set({
@@ -3463,60 +4078,55 @@ export class LeavesService {
           )
         );
 
-      if (action === "approve") {
-        for (const request of eligible) {
-          const isPaidLeave = request.leaveTypePaid ?? true;
-          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
-                        (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
-          const shouldAdjustBalance = isPaidLeave || isLWP;
-          
-          if (!shouldAdjustBalance) {
-            continue;
-          }
-          const hours = Number(request.hours ?? 0);
+      for (const request of eligible) {
+        const isPaidLeave = request.leaveTypePaid ?? true;
+        const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE ||
+          (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+        const shouldAdjustBalance = isPaidLeave || isLWP;
+        const hours = Number(request.hours ?? 0);
+
+        if (shouldAdjustBalance) {
           await this.ensureLeaveBalanceRow(
             tx,
             request.userId,
             request.leaveTypeId
           );
-          await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
-            pendingHours: -hours,
-            bookedHours: hours,
-          });
-        }
-      } else {
-        for (const request of eligible) {
-          const isPaidLeave = request.leaveTypePaid ?? true;
-          const isLWP = request.leaveTypeCode === LWP_LEAVE_CODE || 
-                        (request.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
-          const shouldAdjustBalance = isPaidLeave || isLWP;
-          
-          if (!shouldAdjustBalance) {
-            continue;
-          }
 
-          const hours = Number(request.hours ?? 0);
-          if (request.state === "approved") {
-            await this.ensureLeaveBalanceRow(
-              tx,
-              request.userId,
-              request.leaveTypeId
-            );
+          if (action === "approve") {
+            if (request.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
+              await this.consumeCompOffCredits(
+                tx,
+                request.userId,
+                hours,
+                request.id,
+                new Date(request.endDate),
+              );
+            }
             await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
-              bookedHours: -hours,
-              balanceHours: hours,
+              pendingHours: -hours,
+              bookedHours: hours,
             });
           } else if (request.state === "pending") {
-            await this.ensureLeaveBalanceRow(
-              tx,
-              request.userId,
-              request.leaveTypeId
-            );
+            if (request.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
+              await this.clearCompOffCreditLinks(tx, request.id);
+            }
             await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
               pendingHours: -hours,
               balanceHours: hours,
             });
+          } else if (request.state === "approved") {
+            await this.adjustLeaveBalance(tx, request.userId, request.leaveTypeId, {
+              bookedHours: -hours,
+              balanceHours: hours,
+            });
           }
+        }
+
+        if (
+          action === "reject" &&
+          request.leaveTypeCode === COMP_OFF_LEAVE_CODE
+        ) {
+          await this.clearCompOffCreditLinks(tx, request.id);
         }
       }
 
@@ -3731,7 +4341,7 @@ export class LeavesService {
     const end = this.normalizeDateUTC(endDate);
 
     const rows = await db
-      .select({ 
+      .select({
         id: timesheetsTable.id,
         totalHours: timesheetsTable.totalHours,
         workDate: timesheetsTable.workDate,
@@ -3794,13 +4404,9 @@ export class LeavesService {
     return !info.isWorkingDay || info.isHoliday;
   }
 
-  private async notifyLatestProjectSlackChannel(
-    userId: number,
-    orgId: number,
-    payload: Record<string, unknown>
-  ) {
+  private async getLatestActiveProjects(userId: number, orgId: number) {
     const db = this.database.connection;
-    
+
     // Get recent projects from employee's timesheet entries
     const projects = await db
       .select({
@@ -3809,6 +4415,7 @@ export class LeavesService {
         workDate: timesheetsTable.workDate,
         slackChannelId: projectsTable.slackChannelId,
         discordChannelId: projectsTable.discordChannelId,
+        projectManagerId: projectsTable.projectManagerId,
         projectManagerName: usersTable.name,
         projectManagerSlackId: usersTable.slackId,
         projectManagerDiscordId: usersTable.discordId,
@@ -3840,7 +4447,7 @@ export class LeavesService {
       .limit(50); // Get enough projects to filter through weekends
 
     if (projects.length === 0) {
-      return;
+      return [];
     }
 
     // Find the last valid working DATE (skip weekends, holidays)
@@ -3848,88 +4455,198 @@ export class LeavesService {
     for (const project of projects) {
       const workDate = new Date(project.workDate);
       const dayOfWeek = workDate.getUTCDay(); // 0 = Sunday, 6 = Saturday
-      
+
       // Skip Saturday (6) and Sunday (0)
       if (dayOfWeek === 0 || dayOfWeek === 6) {
         continue;
       }
-      
+
       // Check if it's a holiday or festival leave day
       const dayInfo = await this.calendarService.getDayInfo(orgId, workDate);
       if (dayInfo.isHoliday) {
         continue; // Skip festival/holiday days
       }
-      
+
       // Found the last valid working date
       lastValidWorkDate = workDate;
       break;
     }
 
     if (!lastValidWorkDate) {
-      return; // No valid working date found
+      return [];
     }
 
     // Get ALL projects from that last valid working day (excluding filtered projects)
     const validProjects = projects.filter(project => {
       const workDate = new Date(project.workDate);
-      
+
       // Must be from the last valid working date
       if (workDate.getTime() !== lastValidWorkDate.getTime()) {
         return false;
       }
-      
+
       // Skip Learning Saturday project
       if (project.projectName && project.projectName.toLowerCase().includes('Learning Saturdays')) {
         return false;
       }
-      
+
       return true;
     });
 
     if (validProjects.length === 0) {
-      return; // No valid projects found
+      return [];
     }
 
     // Deduplicate by projectId
-    const uniqueProjects = Array.from(
+    return Array.from(
       new Map(validProjects.map(p => [p.projectId, p])).values()
     );
+  }
 
-    // Send notifications to ALL projects from the last valid working day
+  private async buildLeaveNotificationTargets(
+    leave: {
+      id: number;
+      userId: number;
+      orgId: number;
+      leaveTypeId: number;
+      startDate: Date | string;
+      endDate: Date | string;
+      durationType: string;
+      halfDaySegment: string | null;
+      reason: string | null;
+      state: string;
+    },
+    notificationDate?: string,
+  ): Promise<Array<{
+    projectId: number;
+    channel: "slack" | "discord";
+    toRef: Record<string, any>;
+    payload: Record<string, any>;
+  }>> {
+    const db = this.database.connection;
+
+    // Fetch user and leave type details
+    const [userInfo] = await db
+      .select({
+        name: usersTable.name,
+        email: usersTable.email,
+        slackId: usersTable.slackId,
+        discordId: usersTable.discordId,
+      })
+      .from(usersTable)
+      .where(eq(usersTable.id, leave.userId))
+      .limit(1);
+
+    const [leaveTypeInfo] = await db
+      .select({
+        name: leaveTypesTable.name,
+        code: leaveTypesTable.code,
+      })
+      .from(leaveTypesTable)
+      .where(eq(leaveTypesTable.id, leave.leaveTypeId))
+      .limit(1);
+
+    // Get active projects
+    const uniqueProjects = await this.getLatestActiveProjects(leave.userId, leave.orgId);
+
+    const targets: Array<{
+      projectId: number;
+      channel: "slack" | "discord";
+      toRef: Record<string, any>;
+      payload: Record<string, any>;
+    }> = [];
+
+    const todayStr = notificationDate || getYYYYMMDD(new Date());
+    const endDateStr = getYYYYMMDD(new Date(leave.endDate));
+    const isPastLeave = endDateStr < todayStr;
+
     for (const project of uniqueProjects) {
-      // Enhance payload with project manager information
-      const enhancedPayload = {
-        ...payload,
+      const payload = {
+        type: "leave_request",
+        leaveId: leave.id,
+        userId: leave.userId,
+        userName: userInfo?.name ?? `User ${leave.userId}`,
+        userSlackId: userInfo?.slackId ?? null,
+        userDiscordId: userInfo?.discordId ?? null,
+        leaveTypeName: leaveTypeInfo?.name ?? "Leave",
+        leaveTypeCode: leaveTypeInfo?.code ?? null,
+        startDate: leave.startDate,
+        endDate: leave.endDate,
+        durationType: leave.durationType,
+        halfDaySegment: leave.halfDaySegment,
+        state: leave.state,
+        reason: leave.reason ?? null,
         projectId: project.projectId,
         projectName: project.projectName,
+        managerId: project.projectManagerId,
+        managerSlackId: project.projectManagerSlackId,
         projectManagerName: project.projectManagerName,
         projectManagerSlackId: project.projectManagerSlackId,
         projectManagerDiscordId: project.projectManagerDiscordId,
+        notificationDate: todayStr,
+        isPastLeave,
       };
 
-      // Send Slack notification if configured
-      if (project.slackChannelId) {
-        await db.insert(notificationsTable).values({
-          orgId,
+      if (project.slackChannelId && project.slackChannelId !== '(NULL)' && project.slackChannelId !== 'null' && project.slackChannelId.trim() !== '') {
+        targets.push({
+          projectId: project.projectId,
           channel: "slack",
           toRef: { channelId: project.slackChannelId },
-          template: "leave_request",
-          payload: enhancedPayload,
-          state: "pending",
+          payload,
         });
       }
 
-      // Send Discord notification if configured
-      if (project.discordChannelId) {
-        await db.insert(notificationsTable).values({
-          orgId,
+      if (project.discordChannelId && project.discordChannelId !== '(NULL)' && project.discordChannelId !== 'null' && project.discordChannelId.trim() !== '') {
+        targets.push({
+          projectId: project.projectId,
           channel: "discord",
           toRef: { webhookUrl: project.discordChannelId },
-          template: "leave_request",
-          payload: enhancedPayload,
-          state: "pending",
+          payload,
         });
       }
+    }
+
+    return targets;
+  }
+
+  private async notifyLatestProjectSlackChannel(
+    userId: number,
+    orgId: number,
+    payload: Record<string, unknown>
+  ) {
+    const db = this.database.connection;
+    const leaveId = payload.leaveId as number;
+
+    const [leave] = await db
+      .select()
+      .from(leaveRequestsTable)
+      .where(eq(leaveRequestsTable.id, leaveId))
+      .limit(1);
+
+    if (!leave) {
+      this.logger.warn(`notifyLatestProjectSlackChannel: Leave request ${leaveId} not found`);
+      return;
+    }
+
+    const today = this.normalizeDateUTC(new Date());
+    const startDate = this.normalizeDateUTC(new Date(leave.startDate));
+    if (startDate > today) {
+      // Future leaves should not be notified on application date
+      return;
+    }
+
+    const notificationDate = getYYYYMMDD(new Date());
+    const targets = await this.buildLeaveNotificationTargets(leave, notificationDate);
+
+    for (const target of targets) {
+      await db.insert(notificationsTable).values({
+        orgId,
+        channel: target.channel,
+        toRef: target.toRef,
+        template: "leave_request",
+        payload: target.payload,
+        state: "pending",
+      });
     }
   }
 
@@ -4066,6 +4783,11 @@ export class LeavesService {
       await tx.insert(leavePoliciesTable).values({
         orgId,
         leaveTypeId: leaveType.id,
+        validEmploymentTypes: ["full-time"],
+        requiresAlumni: null,
+        triggerEvent: "DAY_1",
+        baseAllocationDays: "0.00",
+        isProrated: false,
         accrualRule: null,
         carryForwardRule: null,
         maxBalance: null,
@@ -4127,8 +4849,9 @@ export class LeavesService {
     if (!balance) {
       return;
     }
-    
+
     await this.expireGrantedCompOffCredits(tx, orgId, userId, new Date());
+    await this.expirePendingCompOffCredits(tx, orgId, userId, new Date());
     await this.expireStaleCompOffCredits(tx, orgId, userId, new Date());
   }
 
@@ -4152,7 +4875,16 @@ export class LeavesService {
           eq(compOffCreditsTable.userId, userId),
           inArray(compOffCreditsTable.status, ['granted', 'partial_availed']),
           lt(compOffCreditsTable.expiresAt, referenceDate),
-          isNull(compOffCreditsTable.leaveRequestId)
+          or(
+            and(
+              eq(compOffCreditsTable.status, 'granted'),
+              isNull(compOffCreditsTable.leaveRequestId),
+            ),
+            and(
+              eq(compOffCreditsTable.status, 'partial_availed'),
+              isNull(compOffCreditsTable.nextLeaveRequestId),
+            ),
+          ),
         )
       );
 
@@ -4168,6 +4900,30 @@ export class LeavesService {
         updatedAt: referenceDate,
       })
       .where(inArray(compOffCreditsTable.id, creditIds));
+  }
+
+  // change status from 'pending' to 'expired' when expiresAt is passed 
+  private async expirePendingCompOffCredits(
+    tx: DatabaseService['connection'],
+    orgId: number,
+    userId: number,
+    referenceDate: Date
+  ) {
+    await tx
+      .update(compOffCreditsTable)
+      .set({
+        status: 'expired',
+        updatedAt: referenceDate,
+      })
+      .where(
+        and(
+          eq(compOffCreditsTable.orgId, orgId),
+          eq(compOffCreditsTable.userId, userId),
+          eq(compOffCreditsTable.status, 'pending'),
+          lt(compOffCreditsTable.expiresAt, referenceDate),
+          isNull(compOffCreditsTable.leaveRequestId),
+        )
+      );
   }
 
   private async expireStaleCompOffCredits(
@@ -4195,7 +4951,10 @@ export class LeavesService {
           eq(compOffCreditsTable.userId, userId),
           eq(compOffCreditsTable.status, "warning"),
           // Linked warning credits should stay warning and not auto-expire.
-          isNull(compOffCreditsTable.leaveRequestId),
+          or(
+            isNull(compOffCreditsTable.leaveRequestId),
+            isNull(compOffCreditsTable.nextLeaveRequestId),
+          ),
         )
       );
 
@@ -4482,9 +5241,9 @@ export class LeavesService {
     const expectedAttendance =
       effectiveEndDate >= effectiveStartDate
         ? Math.floor(
-            (effectiveEndDate.getTime() - effectiveStartDate.getTime()) /
-              (24 * 60 * 60 * 1000),
-          ) + 1
+          (effectiveEndDate.getTime() - effectiveStartDate.getTime()) /
+          (24 * 60 * 60 * 1000),
+        ) + 1
         : 0;
 
     let weekOffDays = 0;
@@ -4699,11 +5458,12 @@ export class LeavesService {
    * Queue daily leave notifications for all active leaves
    * Should be called by cron job at 9:00 AM IST every day
    */
-  async queueDailyLeaveNotifications() {
+  async queueDailyLeaveNotifications(testDate?: Date) {
     const db = this.database.connection;
-    const today = this.normalizeDateUTC(new Date());
+    const today = this.normalizeDateUTC(testDate || new Date());
+    const todayStr = getYYYYMMDD(testDate || new Date());
 
-    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    const fiveMinutesAgo = new Date((testDate ? testDate.getTime() : Date.now()) - 5 * 60 * 1000);
 
     // Today's leaves
     const todaysLeaves = await db
@@ -4736,74 +5496,74 @@ export class LeavesService {
       ).values()
     );
 
+    let processedCount = 0;
+
     for (const leave of allLeaves) {
-      const payload = {
-        leaveId: leave.id,
-        userId: leave.userId,
-        leaveTypeId: leave.leaveTypeId,
-        startDate: leave.startDate,
-        endDate: leave.endDate,
-        reason: leave.reason
-      };
+      // Determine if today is actually a leave day (within range)
+      const isTodayWithinLeave = leave.startDate <= today && leave.endDate >= today;
 
-      // check slack notification
-      const slackExists = await db
-        .select()
-        .from(notificationsTable)
-        .where(
-          and(
-            eq(notificationsTable.template, 'leave_request'),
-            eq(notificationsTable.channel, 'slack'),
-            sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
-            gte(notificationsTable.createdAt, today)
-          )
-        )
-        .limit(1);
-
-      // check discord notification
-      const discordExists = await db
-        .select()
-        .from(notificationsTable)
-        .where(
-          and(
-            eq(notificationsTable.template, 'leave_request'),
-            eq(notificationsTable.channel, 'discord'),
-            sql`${notificationsTable.payload}->>'leaveId' = ${leave.id.toString()}`,
-            gte(notificationsTable.createdAt, today)
-          )
-        )
-        .limit(1);
-
-      const notificationsToInsert = [];
-
-      if (slackExists.length === 0) {
-        notificationsToInsert.push({
-          orgId: leave.orgId,
-          channel: 'slack' as const,
-          toRef: {},
-          template: 'leave_request' as const,
-          payload,
-          state: 'pending' as const
-        });
+      // If today is a leave day, check if today is a non-working day under business rules
+      if (isTodayWithinLeave) {
+        const isTodayNonWorking = await this.isNonWorkingDay(leave.orgId, today);
+        if (isTodayNonWorking) {
+          continue; // Skip queueing notifications on non-working days
+        }
       }
 
-      if (discordExists.length === 0) {
-        notificationsToInsert.push({
-          orgId: leave.orgId,
-          channel: 'discord' as const,
-          toRef: {},
-          template: 'leave_request' as const,
-          payload,
-          state: 'pending' as const
-        });
-      }
+      // Build notification targets with notificationDate as todayStr
+      const targets = await this.buildLeaveNotificationTargets(leave, todayStr);
 
-      if (notificationsToInsert.length > 0) {
-        await db.insert(notificationsTable).values(notificationsToInsert);
+      for (const target of targets) {
+        // Duplicate protection: template + payload.leaveId + payload.notificationDate + toRef
+        let duplicateExists = false;
+
+        if (target.channel === 'slack') {
+          const slackExists = await db
+            .select()
+            .from(notificationsTable)
+            .where(
+              and(
+                eq(notificationsTable.template, 'leave_request'),
+                eq(notificationsTable.channel, 'slack'),
+                sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
+                sql`${notificationsTable.payload}->>'notificationDate' = ${todayStr}`,
+                sql`${notificationsTable.toRef}->>'channelId' = ${target.toRef.channelId}`
+              )
+            )
+            .limit(1);
+          duplicateExists = slackExists.length > 0;
+        } else if (target.channel === 'discord') {
+          const discordExists = await db
+            .select()
+            .from(notificationsTable)
+            .where(
+              and(
+                eq(notificationsTable.template, 'leave_request'),
+                eq(notificationsTable.channel, 'discord'),
+                sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
+                sql`${notificationsTable.payload}->>'notificationDate' = ${todayStr}`,
+                sql`${notificationsTable.toRef}->>'webhookUrl' = ${target.toRef.webhookUrl}`
+              )
+            )
+            .limit(1);
+          duplicateExists = discordExists.length > 0;
+        }
+
+        if (!duplicateExists) {
+          await db.insert(notificationsTable).values({
+            orgId: leave.orgId,
+            channel: target.channel,
+            toRef: target.toRef,
+            template: 'leave_request',
+            payload: target.payload,
+            state: 'pending',
+          });
+        }
       }
+      processedCount++;
     }
 
-    return { processed: allLeaves.length };
+    return { processed: processedCount };
   }
 
   private isSameDate(date1: Date, date2: Date): boolean {
@@ -4859,5 +5619,475 @@ export class LeavesService {
     const isAuthorized = (result.rows[0] as { is_authorized: boolean })
       .is_authorized;
     return isAuthorized;
+  }
+
+  @Cron('0 2 * * *', {
+    name: 'auto-reject-exited-leaves',
+    timeZone: 'Asia/Kolkata',
+  })
+  async autoRejectExitedUserLeavesCron() {
+    this.logger.log('Running automated leave cleanup for exited employees...');
+    const result = await this.autoRejectExitedUserLeaves();
+    this.logger.log(
+      `Automated leave cleanup completed: processed ${result.processedCount} leaves, skipped ${result.skippedCount} leaves.`
+    );
+  }
+
+  async autoRejectExitedUserLeaves(orgId?: number): Promise<{ processedCount: number; skippedCount: number; failures: string[] }> {
+    const db = this.database.connection;
+    const now = new Date();
+
+    // 1. Fetch active/pending leaves for users with dateOfExit
+    const expiredLeaves = await db
+      .select({
+        id: leaveRequestsTable.id,
+        userId: leaveRequestsTable.userId,
+        orgId: leaveRequestsTable.orgId,
+        leaveTypeId: leaveRequestsTable.leaveTypeId,
+        startDate: leaveRequestsTable.startDate,
+        endDate: leaveRequestsTable.endDate,
+        hours: leaveRequestsTable.hours,
+        state: leaveRequestsTable.state,
+        dateOfExit: usersTable.dateOfExit,
+        email: usersTable.email,
+        leaveTypeCode: leaveTypesTable.code,
+        leaveTypeName: leaveTypesTable.name,
+        leaveTypePaid: leaveTypesTable.paid,
+      })
+      .from(leaveRequestsTable)
+      .innerJoin(usersTable, eq(leaveRequestsTable.userId, usersTable.id))
+      .innerJoin(leaveTypesTable, eq(leaveRequestsTable.leaveTypeId, leaveTypesTable.id))
+      .where(
+        and(
+          inArray(leaveRequestsTable.state, ['pending', 'approved']),
+          isNotNull(usersTable.dateOfExit),
+          orgId ? eq(leaveRequestsTable.orgId, orgId) : undefined
+        )
+      );
+
+    let processedCount = 0;
+    let skippedCount = 0;
+    const failures: string[] = [];
+
+    // 2. Filter in-memory using timezone-safe comparison
+    const todayStr = getYYYYMMDD(new Date());
+    const restrictedLeaveTypeIds = [2, 13, 14, 15, 10, 1]; // CL (2), L&D (13), VS (14), VCL (15), Wedding (10), EL (1)
+
+    const leavesToProcess: typeof expiredLeaves = [];
+    for (const leave of expiredLeaves) {
+      const startDateStr = getYYYYMMDD(new Date(leave.startDate));
+      const endDateStr = getYYYYMMDD(new Date(leave.endDate));
+      const exitDateStr = getYYYYMMDD(leave.dateOfExit!);
+      const isPastExit = startDateStr > exitDateStr || endDateStr > exitDateStr;
+
+      // Check notice period eligibility
+      const exitDate = new Date(exitDateStr + 'T00:00:00Z');
+      const noticeStartDate = new Date(exitDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+      const noticeStartStr = getYYYYMMDD(noticeStartDate);
+      const isCurrentlyInNoticePeriod = todayStr >= noticeStartStr && todayStr <= exitDateStr;
+      
+      const overlapsNoticePeriod = startDateStr >= noticeStartStr || endDateStr >= noticeStartStr;
+      const isRestrictedType = restrictedLeaveTypeIds.includes(leave.leaveTypeId);
+
+      const isRestrictedInNotice = isCurrentlyInNoticePeriod && overlapsNoticePeriod && isRestrictedType;
+
+      if (isPastExit || isRestrictedInNotice) {
+        (leave as any).autoCancelReason = isPastExit
+          ? `Automated cleanup: leave range falls beyond Date of Exit (${exitDateStr})`
+          : `Automated cleanup: restricted leave type is not allowed during notice period (notice started: ${noticeStartStr})`;
+        leavesToProcess.push(leave);
+      } else {
+        skippedCount++;
+      }
+    }
+
+    for (const leave of leavesToProcess) {
+      try {
+        await db.transaction(async (tx) => {
+          const previousState = leave.state;
+          const newState = previousState === 'approved' ? 'cancelled' : 'rejected';
+          const exitDateStr = getYYYYMMDD(leave.dateOfExit!);
+          const requestedHours = Number(leave.hours ?? 0);
+
+          // Update the leave request state
+          await tx
+            .update(leaveRequestsTable)
+            .set({
+              state: newState,
+              updatedAt: now,
+            })
+            .where(eq(leaveRequestsTable.id, leave.id));
+
+          await tx
+            .delete(notificationsTable)
+            .where(
+              and(
+                eq(notificationsTable.template, 'leave_request'),
+                eq(notificationsTable.state, 'pending'),
+                sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`
+              )
+            );
+
+          // Clear comp-off links if applicable
+          if (leave.leaveTypeCode === COMP_OFF_LEAVE_CODE) {
+            await this.clearCompOffCreditLinks(tx, leave.id);
+          }
+
+          // Balance rebalancing/restoration
+          const isPaidLeave = leave.leaveTypePaid ?? true;
+          const isLWP = leave.leaveTypeCode === LWP_LEAVE_CODE ||
+            (leave.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+          const shouldAdjustBalance = isPaidLeave || isLWP;
+
+          if (shouldAdjustBalance) {
+            if (previousState === 'pending') {
+              await this.adjustLeaveBalance(tx, leave.userId, leave.leaveTypeId, {
+                pendingHours: -requestedHours,
+                balanceHours: requestedHours,
+              });
+            } else if (previousState === 'approved') {
+              await this.adjustLeaveBalance(tx, leave.userId, leave.leaveTypeId, {
+                bookedHours: -requestedHours,
+                balanceHours: requestedHours,
+              });
+            }
+          }
+
+          // Recalculate payable days for approved leaves only
+          if (previousState === 'approved') {
+            const affectedCycles = this.getCycleRangesForDateWindow(
+              new Date(leave.startDate),
+              new Date(leave.endDate),
+            );
+            for (const cycle of affectedCycles) {
+              await this.recalculateAndPersistPayableDaysForCycle(
+                tx,
+                leave.orgId,
+                leave.userId,
+                cycle.cycleStart,
+                cycle.cycleEnd,
+                cycle.cycleKey,
+                now,
+              );
+            }
+          }
+
+          // System Audit Log
+          await this.auditService.createLog({
+            tx,
+            orgId: leave.orgId,
+            actorUserId: null, // SYSTEM constant
+            actorRole: 'system', // Attributed to system
+            action: 'leave_auto_rejected',
+            subjectType: 'leave_request',
+            targetUserId: leave.userId,
+            prev: {
+              state: previousState,
+            },
+            next: {
+              state: newState,
+              reason: (leave as any).autoCancelReason,
+              leaveId: leave.id,
+              dateOfExit: exitDateStr,
+            },
+          });
+
+          this.logger.log(
+            `Automated leave cleanup: successfully processed auto-${newState} for leaveId=${leave.id}, userId=${leave.userId}, dateOfExit=${exitDateStr}`
+          );
+        });
+
+        processedCount++;
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        this.logger.error(`Automated leave cleanup: failed for leaveId=${leave.id}, error=${errorMsg}`);
+        failures.push(`leaveId=${leave.id}: ${errorMsg}`);
+      }
+    }
+
+    return {
+      processedCount,
+      skippedCount,
+      failures,
+    };
+  }
+  private isLeaveTypeRequiringSupportingDocument(leaveType: {
+    code?: string | null;
+    name?: string | null;
+  }): boolean {
+    const code = this.normalizeLeaveTypeLabel(leaveType.code);
+    const name = this.normalizeLeaveTypeLabel(leaveType.name);
+    const allowedLabels = new Set([
+      "exam",
+      "exam leave",
+      "vipassana course",
+      "vipassana course leave",
+      "vipassana seva",
+      "vipassana seva leave",
+      "wedding",
+      "wedding leave",
+      "election",
+      "election leave",
+    ]);
+
+    return Boolean(
+      (code && allowedLabels.has(code)) || (name && allowedLabels.has(name)),
+    );
+  }
+
+  private isSpecialLeaveNotificationType(leaveType: {
+    code?: string | null;
+    name?: string | null;
+  }): boolean {
+    const code = leaveType.code?.toLowerCase().trim() ?? "";
+    const name = leaveType.name?.toLowerCase().trim() ?? "";
+    const combined = `${code} ${name}`;
+
+    return (
+      combined.includes("maternity") ||
+      combined.includes("parental") ||
+      combined.includes("adoption") ||
+      combined.includes("srs")
+    );
+  }
+
+  private isExamOrLearningLeaveType(leaveType: {
+    code?: string | null;
+    name?: string | null;
+  }): boolean {
+    const code = this.normalizeLeaveTypeLabel(leaveType.code);
+    const name = this.normalizeLeaveTypeLabel(leaveType.name);
+    const examOrLearningLabels = new Set([
+      "exam",
+      "exam leave",
+      "l d",
+      "l d leave",
+      "l and d",
+      "l and d leave",
+      "learning and development",
+      "learning and development leave",
+    ]);
+
+    return Boolean(
+      (code && examOrLearningLabels.has(code)) ||
+      (name && examOrLearningLabels.has(name)),
+    );
+  }
+
+  private isLearningLeaveType(leaveType: {
+    code?: string | null;
+    name?: string | null;
+  }): boolean {
+    const code = this.normalizeLeaveTypeLabel(leaveType.code);
+    const name = this.normalizeLeaveTypeLabel(leaveType.name);
+    const learningLabels = new Set([
+      "l d",
+      "l d leave",
+      "l and d",
+      "l and d leave",
+      "learning and development",
+      "learning and development leave",
+    ]);
+
+    return Boolean(
+      (code && learningLabels.has(code)) ||
+      (name && learningLabels.has(name)),
+    );
+  }
+
+  private normalizeLeaveTypeLabel(value?: string | null): string {
+    return (value ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  private formatDateForEmail(dateInput: Date): string {
+    return dateInput.toLocaleDateString("en-IN", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      timeZone: "Asia/Kolkata",
+    });
+  }
+
+  private formatDateRangeForSubject(startDate: Date, endDate: Date): string {
+    const start = this.formatDateForEmail(startDate);
+    const end = this.formatDateForEmail(endDate);
+    return start === end ? start : `${start} to ${end}`;
+  }
+
+  private async sendSupportingDocumentEmail(params: {
+    managerEmail: string | null;
+    employeeName: string;
+    employeeEmail: string | null;
+    leaveTypeName: string;
+    startDate: Date;
+    endDate: Date;
+    courseOrProgrammeName: string | null;
+    documents: LeaveDocumentUpload[] | null;
+  }): Promise<LeaveEmailDeliveryResult> {
+    const {
+      managerEmail,
+      employeeName,
+      employeeEmail,
+      leaveTypeName,
+      startDate,
+      endDate,
+      courseOrProgrammeName,
+      documents,
+    } = params;
+
+    if (!managerEmail || !employeeEmail) {
+      this.logger.warn(
+        `Missing manager/employee email for supporting document email (employee: ${employeeName})`,
+      );
+      return {
+        sent: false,
+        reason: "Missing manager or employee email",
+      };
+    }
+
+    const smtpHost = this.configService.get<string>("SMTP_HOST");
+    const smtpPort = Number(this.configService.get<string>("SMTP_PORT") ?? "587");
+    const smtpUser = this.configService.get<string>("SMTP_USER");
+    const smtpPass = this.configService.get<string>("SMTP_PASSWORD");
+    const smtpSecure = this.configService.get<string>("SMTP_SECURE") === "true";
+    const fromAddress =
+      this.configService.get<string>("SMTP_FROM") ??
+      this.configService.get<string>("MAIL_FROM") ??
+      smtpUser;
+
+    if (!smtpHost || !smtpPort || !fromAddress) {
+      this.logger.warn("SMTP configuration is incomplete. Skipping leave document email.");
+      return {
+        sent: false,
+        reason: "SMTP configuration is incomplete",
+      };
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpSecure,
+      auth: smtpUser && smtpPass ? { user: smtpUser, pass: smtpPass } : undefined,
+    });
+
+    const dateRange = this.formatDateRangeForSubject(startDate, endDate);
+    const ccRecipients = Array.from(new Set(["pnc@navgurukul.org", employeeEmail]));
+    const lowerLeaveTypeName = leaveTypeName.toLowerCase();
+    const includeProgrammeName =
+      lowerLeaveTypeName.includes("exam") ||
+      lowerLeaveTypeName.includes("l&d") ||
+      lowerLeaveTypeName.includes("learning and development");
+
+    const lines = [
+      `Employee email: ${employeeEmail}`,
+      `Leave type: ${leaveTypeName}`,
+      `Date range: ${dateRange}`,
+    ];
+
+    if (includeProgrammeName && courseOrProgrammeName) {
+      lines.push(`Course/Programme name: ${courseOrProgrammeName}`);
+    }
+
+    try {
+      await transporter.sendMail({
+        from: fromAddress,
+        to: managerEmail,
+        cc: ccRecipients,
+        subject: `Application for ${leaveTypeName} — ${employeeName} — ${dateRange}`,
+        text: lines.join("\n"),
+        attachments: documents
+          ? documents.map((doc) => ({
+              filename: doc.originalname,
+              content: doc.buffer,
+              contentType: doc.mimetype,
+            }))
+          : undefined,
+      });
+      return { sent: true };
+    } catch (error) {
+      this.logger.error(
+        `Failed to send supporting document email: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return {
+        sent: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private async sendSpecialLeaveNotificationEmail(params: {
+    toEmail: string;
+    managerEmail: string | null;
+    employeeName: string;
+    employeeEmail: string | null;
+    leaveTypeName: string;
+    startDate: Date;
+    endDate: Date;
+  }): Promise<LeaveEmailDeliveryResult> {
+    const {
+      toEmail,
+      managerEmail,
+      employeeName,
+      employeeEmail,
+      leaveTypeName,
+      startDate,
+      endDate,
+    } = params;
+
+    const smtpHost = this.configService.get<string>("SMTP_HOST");
+    const smtpPort = Number(this.configService.get<string>("SMTP_PORT") ?? "587");
+    const smtpUser = this.configService.get<string>("SMTP_USER");
+    const smtpPass = this.configService.get<string>("SMTP_PASSWORD");
+    const smtpSecure = this.configService.get<string>("SMTP_SECURE") === "true";
+    const fromAddress =
+      this.configService.get<string>("SMTP_FROM") ??
+      this.configService.get<string>("MAIL_FROM") ??
+      smtpUser;
+
+    if (!smtpHost || !smtpPort || !fromAddress) {
+      this.logger.warn("SMTP configuration is incomplete. Skipping special leave email.");
+      return {
+        sent: false,
+        reason: "SMTP configuration is incomplete",
+      };
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpSecure,
+      auth: smtpUser && smtpPass ? { user: smtpUser, pass: smtpPass } : undefined,
+    });
+
+    const dateRange = this.formatDateRangeForSubject(startDate, endDate);
+    const ccRecipients = [managerEmail, employeeEmail].filter(
+      (email): email is string => Boolean(email),
+    );
+
+    try {
+      await transporter.sendMail({
+        from: fromAddress,
+        to: toEmail,
+        cc: ccRecipients,
+        subject: `Application for ${leaveTypeName} — ${employeeName} — ${dateRange}`,
+        text: [
+          `Employee name: ${employeeName}`,
+          `Leave type: ${leaveTypeName}`,
+          `Date range: ${dateRange}`,
+        ].join("\n"),
+      });
+      return { sent: true };
+    } catch (error) {
+      this.logger.error(
+        `Failed to send special leave notification email: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return {
+        sent: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 }

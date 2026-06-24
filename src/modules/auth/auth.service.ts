@@ -17,9 +17,12 @@ import {
   backfillCountersTable,
   backfillDatesTable,
   timesheetsTable,
+  orgsTable,
 } from '../../db/schema';
+import { LeaveAllocationService } from '../leave-allocation/leave-allocation.service';
 import { LoginDto } from './dto/login.dto';
 import { JwtPayload } from './types/jwt-payload.interface';
+import { validateUserAccess } from '../../common/utils/access-control.util';
 
 @Injectable()
 export class AuthService {
@@ -31,6 +34,7 @@ export class AuthService {
     private readonly databaseService: DatabaseService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly leaveAllocationService: LeaveAllocationService,
   ) {
     const clientId = this.configService.get<string>('GOOGLE_CLIENT_ID');
     if (!clientId) {
@@ -54,23 +58,43 @@ export class AuthService {
     }
 
     const db = this.databaseService.connection;
-    const [user] = await db
-      .select()
+    const [userResult] = await db
+      .select({
+        user: usersTable,
+        timezone: orgsTable.timezone,
+      })
       .from(usersTable)
+      .leftJoin(orgsTable, eq(usersTable.orgId, orgsTable.id))
       .where(eq(usersTable.email, tokenEmail));
 
-    if (!user) {
+    if (!userResult || !userResult.user) {
       throw new UnauthorizedException('Please login using your Team ID. Your email was not found in the PnC sheet. Please contact the PnC Team for assistance.');
     }
 
-    if (user.status === 'suspended') {
-      throw new UnauthorizedException('Account suspended. Reach out to HR.');
-    }
+    const { user, timezone } = userResult;
+
+    // Validate access using our centralized validation utility
+    validateUserAccess({
+      id: Number(user.id),
+      email: user.email,
+      status: user.status,
+      dateOfExit: user.dateOfExit,
+      timezone,
+    });
 
     const now = new Date();
     const employeeDepartmentId = user.employeeDepartmentId
       ? Number(user.employeeDepartmentId)
       : null;
+
+    const isFirstLogin = !user.lastLoginAt;
+    if (isFirstLogin) {
+      try {
+        await this.leaveAllocationService.initialize(Number(user.id));
+      } catch (error) {
+        this.logger.error(`Leave allocation failed for user ${user.id}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
 
     if (!user.googleUserId) {
       await db
@@ -174,20 +198,37 @@ export class AuthService {
     }
 
     const db = this.databaseService.connection;
-    const [userRecord] = await db
+    const [userResult] = await db
       .select({
-        id: usersTable.id,
-        email: usersTable.email,
-        orgId: usersTable.orgId,
-        managerId: usersTable.managerId,
-        employeeDepartmentId: usersTable.employeeDepartmentId,
+        user: {
+          id: usersTable.id,
+          email: usersTable.email,
+          orgId: usersTable.orgId,
+          managerId: usersTable.managerId,
+          employeeDepartmentId: usersTable.employeeDepartmentId,
+          status: usersTable.status,
+          dateOfExit: usersTable.dateOfExit,
+        },
+        timezone: orgsTable.timezone,
       })
       .from(usersTable)
+      .leftJoin(orgsTable, eq(usersTable.orgId, orgsTable.id))
       .where(eq(usersTable.id, payload.sub));
 
-    if (!userRecord) {
+    if (!userResult || !userResult.user) {
       throw new UnauthorizedException('User no longer exists');
     }
+
+    const { user: userRecord, timezone } = userResult;
+
+    // Validate access using our centralized validation utility
+    validateUserAccess({
+      id: Number(userRecord.id),
+      email: userRecord.email,
+      status: userRecord.status,
+      dateOfExit: userRecord.dateOfExit,
+      timezone,
+    });
 
     const roles = await this.getUserRoles(payload.sub);
     const permissions = await this.getUserPermissions(payload.sub);

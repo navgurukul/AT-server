@@ -27,6 +27,7 @@ import { RbacModule } from './modules/rbac/rbac.module';
 import { ReportsModule } from './modules/reports/reports.module';
 import { TimesheetsModule } from './modules/timesheets/timesheets.module';
 import { UsersModule } from './modules/users/users.module';
+import { LeaveAllocationModule } from './modules/leave-allocation/leave-allocation.module';
 
 @Module({
   imports: [
@@ -54,6 +55,7 @@ import { UsersModule } from './modules/users/users.module';
     AuditModule,
     JobsModule,
     DepartmentsModule,
+    LeaveAllocationModule,
   ],
   controllers: [AppController],
   providers: [
