@@ -111,7 +111,7 @@ export class TrackerReminderService {
 
         // Chunk and send Slack messages
         const slackToken = this.config.get<string>('SLACK_BOT_TOKEN');
-        const slackChannelId = 'C0ABFJDLGDB'; // #slack-notification-testing
+        const slackChannelId = 'C06UM62V4GM'; // #slack-notification-testing
 
         if (slackToken) {
           const slackUsers = fullDayMissed.filter(u => u.slackId);
