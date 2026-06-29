@@ -1545,7 +1545,11 @@ export class LeavesService {
       reason: payload.reason ?? null,
     };
 
-    await this.notifyLatestProjectSlackChannel(userId, orgId, notificationPayload);
+    try {
+      await this.queueNotificationsForLeave(request, new Date());
+    } catch (err) {
+      this.logger.error(`Failed to queue notifications on leave creation for request ${request.id}: ${err}`);
+    }
 
     let emailDeliveryResult: LeaveEmailDeliveryResult | null = null;
     let specialLeaveEmailResult: LeaveEmailDeliveryResult | null = null;
@@ -3628,7 +3632,7 @@ export class LeavesService {
     approver: AuthenticatedUser
   ) {
     const db = this.database.connection;
-    return await db.transaction(async (tx) => {
+    const result = await db.transaction(async (tx) => {
       const [request] = await tx
         .select({
           id: leaveRequestsTable.id,
@@ -3867,6 +3871,10 @@ export class LeavesService {
 
       return updated;
     });
+
+
+
+    return result;
   }
   async bulkReviewLeaveRequests(
     payload: BulkReviewLeaveIdsDto,
@@ -3883,7 +3891,7 @@ export class LeavesService {
 
     const db = this.database.connection;
 
-    return await db.transaction(async (tx) => {
+    const result = await db.transaction(async (tx) => {
       if (!approver) {
         throw new ForbiddenException(
           "You are not authorized to review these leave requests"
@@ -4190,8 +4198,13 @@ export class LeavesService {
         updatedRequestIds: eligibleIds,
         evaluatedRequestIds: evaluatedIds,
         skipped,
+        eligible,
       };
     });
+
+
+
+    return result;
   }
 
   private getPrivilegedActorRole(roles: string[]): 'super_admin' | 'admin' | null {
@@ -4517,6 +4530,7 @@ export class LeavesService {
       state: string;
     },
     notificationDate?: string,
+    actualRunDate?: Date,
   ): Promise<Array<{
     projectId: number;
     channel: "slack" | "discord";
@@ -4557,8 +4571,9 @@ export class LeavesService {
     }> = [];
 
     const todayStr = notificationDate || getYYYYMMDD(new Date());
+    const actualTodayStr = getYYYYMMDD(actualRunDate || new Date());
     const endDateStr = getYYYYMMDD(new Date(leave.endDate));
-    const isPastLeave = endDateStr < todayStr;
+    const isPastLeave = endDateStr < actualTodayStr;
 
     for (const project of uniqueProjects) {
       const payload = {
@@ -4609,6 +4624,120 @@ export class LeavesService {
     return targets;
   }
 
+  async queueNotificationsForLeave(
+    leave: {
+      id: number;
+      orgId: number;
+      userId: number;
+      leaveTypeId: number;
+      startDate: Date | string;
+      endDate: Date | string;
+      durationType: string;
+      halfDaySegment: string | null;
+      reason: string | null;
+      state: string;
+      requestedAt?: Date | null;
+      createdAt?: Date | null;
+    },
+    runDate: Date,
+  ): Promise<number> {
+    const db = this.database.connection;
+    const today = this.normalizeDateUTC(runDate);
+
+    // If leave is rejected or cancelled, do not queue notifications
+    if (leave.state === 'rejected' || leave.state === 'cancelled') {
+      return 0;
+    }
+
+    const appliedDate = this.normalizeDateUTC(
+      new Date(leave.requestedAt || leave.createdAt || runDate)
+    );
+
+    const start = this.normalizeDateUTC(new Date(leave.startDate));
+    const end = this.normalizeDateUTC(new Date(leave.endDate));
+
+    let queuedCount = 0;
+
+    for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+      const currentLeaveDay = new Date(d);
+      const isPastLeaveDay = currentLeaveDay.getTime() < appliedDate.getTime();
+
+      let shouldNotifyToday = false;
+      if (isPastLeaveDay) {
+        const nextDayAfterApplied = new Date(appliedDate);
+        nextDayAfterApplied.setUTCDate(nextDayAfterApplied.getUTCDate() + 1);
+        shouldNotifyToday = today.getTime() === nextDayAfterApplied.getTime();
+      } else {
+        shouldNotifyToday = today.getTime() === currentLeaveDay.getTime();
+      }
+
+      if (!shouldNotifyToday) {
+        continue;
+      }
+
+      // Check if it's a non-working day / holiday
+      const isNonWorking = await this.isNonWorkingDay(leave.orgId, currentLeaveDay);
+      if (isNonWorking) {
+        continue;
+      }
+
+      // Build notification targets with notificationDate as currentLeaveDay string
+      const leaveDayStr = getYYYYMMDD(currentLeaveDay);
+      const targets = await this.buildLeaveNotificationTargets(leave, leaveDayStr, today);
+
+      for (const target of targets) {
+        let duplicateExists = false;
+
+        if (target.channel === 'slack') {
+          const slackExists = await db
+            .select()
+            .from(notificationsTable)
+            .where(
+              and(
+                eq(notificationsTable.template, 'leave_request'),
+                eq(notificationsTable.channel, 'slack'),
+                sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
+                sql`${notificationsTable.payload}->>'notificationDate' = ${leaveDayStr}`,
+                sql`${notificationsTable.toRef}->>'channelId' = ${target.toRef.channelId}`
+              )
+            )
+            .limit(1);
+          duplicateExists = slackExists.length > 0;
+        } else if (target.channel === 'discord') {
+          const discordExists = await db
+            .select()
+            .from(notificationsTable)
+            .where(
+              and(
+                eq(notificationsTable.template, 'leave_request'),
+                eq(notificationsTable.channel, 'discord'),
+                sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
+                sql`${notificationsTable.payload}->>'notificationDate' = ${leaveDayStr}`,
+                sql`${notificationsTable.toRef}->>'webhookUrl' = ${target.toRef.webhookUrl}`
+              )
+            )
+            .limit(1);
+          duplicateExists = discordExists.length > 0;
+        }
+
+        if (!duplicateExists) {
+          await db.insert(notificationsTable).values({
+            orgId: leave.orgId,
+            channel: target.channel,
+            toRef: target.toRef,
+            template: 'leave_request',
+            payload: target.payload,
+            state: 'pending',
+          });
+          queuedCount++;
+        }
+      }
+    }
+
+    return queuedCount;
+  }
+
+
   private async notifyLatestProjectSlackChannel(
     userId: number,
     orgId: number,
@@ -4628,6 +4757,10 @@ export class LeavesService {
       return;
     }
 
+    if (leave.state !== 'approved') {
+      return;
+    }
+
     const today = this.normalizeDateUTC(new Date());
     const startDate = this.normalizeDateUTC(new Date(leave.startDate));
     if (startDate > today) {
@@ -4639,14 +4772,50 @@ export class LeavesService {
     const targets = await this.buildLeaveNotificationTargets(leave, notificationDate);
 
     for (const target of targets) {
-      await db.insert(notificationsTable).values({
-        orgId,
-        channel: target.channel,
-        toRef: target.toRef,
-        template: "leave_request",
-        payload: target.payload,
-        state: "pending",
-      });
+      let duplicateExists = false;
+
+      if (target.channel === 'slack') {
+        const slackExists = await db
+          .select()
+          .from(notificationsTable)
+          .where(
+            and(
+              eq(notificationsTable.template, 'leave_request'),
+              eq(notificationsTable.channel, 'slack'),
+              sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
+              sql`${notificationsTable.payload}->>'notificationDate' = ${notificationDate}`,
+              sql`${notificationsTable.toRef}->>'channelId' = ${target.toRef.channelId}`
+            )
+          )
+          .limit(1);
+        duplicateExists = slackExists.length > 0;
+      } else if (target.channel === 'discord') {
+        const discordExists = await db
+          .select()
+          .from(notificationsTable)
+          .where(
+            and(
+              eq(notificationsTable.template, 'leave_request'),
+              eq(notificationsTable.channel, 'discord'),
+              sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
+              sql`${notificationsTable.payload}->>'notificationDate' = ${notificationDate}`,
+              sql`${notificationsTable.toRef}->>'webhookUrl' = ${target.toRef.webhookUrl}`
+            )
+          )
+          .limit(1);
+        duplicateExists = discordExists.length > 0;
+      }
+
+      if (!duplicateExists) {
+        await db.insert(notificationsTable).values({
+          orgId,
+          channel: target.channel,
+          toRef: target.toRef,
+          template: "leave_request",
+          payload: target.payload,
+          state: "pending",
+        });
+      }
     }
   }
 
@@ -5461,106 +5630,43 @@ export class LeavesService {
   async queueDailyLeaveNotifications(testDate?: Date) {
     const db = this.database.connection;
     const today = this.normalizeDateUTC(testDate || new Date());
-    const todayStr = getYYYYMMDD(testDate || new Date());
 
-    const fiveMinutesAgo = new Date((testDate ? testDate.getTime() : Date.now()) - 5 * 60 * 1000);
+    const yesterdayStart = new Date(today);
+    yesterdayStart.setUTCDate(yesterdayStart.getUTCDate() - 1);
+    const yesterdayEnd = new Date(yesterdayStart);
+    yesterdayEnd.setUTCHours(23, 59, 59, 999);
 
-    // Today's leaves
-    const todaysLeaves = await db
+    const leaves = await db
       .select()
       .from(leaveRequestsTable)
       .where(
         and(
-          lte(leaveRequestsTable.startDate, today),
-          gte(leaveRequestsTable.endDate, today),
-          eq(leaveRequestsTable.state, 'approved')
+          ne(leaveRequestsTable.state, 'rejected'),
+          ne(leaveRequestsTable.state, 'cancelled'),
+          or(
+            and(
+              lte(leaveRequestsTable.startDate, today),
+              gte(leaveRequestsTable.endDate, today)
+            ),
+            and(
+              sql`coalesce(${leaveRequestsTable.requestedAt}, ${leaveRequestsTable.createdAt}) >= ${yesterdayStart}`,
+              sql`coalesce(${leaveRequestsTable.requestedAt}, ${leaveRequestsTable.createdAt}) <= ${yesterdayEnd}`
+            )
+          )
         )
       );
-
-    // Recently approved past leaves
-    const recentlyApprovedPastLeaves = await db
-      .select()
-      .from(leaveRequestsTable)
-      .where(
-        and(
-          lt(leaveRequestsTable.startDate, today),
-          eq(leaveRequestsTable.state, 'approved'),
-          gte(leaveRequestsTable.updatedAt, fiveMinutesAgo)
-        )
-      );
-
-    // Remove duplicates by id
-    const allLeaves = Array.from(
-      new Map(
-        [...todaysLeaves, ...recentlyApprovedPastLeaves].map(l => [l.id, l])
-      ).values()
-    );
 
     let processedCount = 0;
 
-    for (const leave of allLeaves) {
-      // Determine if today is actually a leave day (within range)
-      const isTodayWithinLeave = leave.startDate <= today && leave.endDate >= today;
-
-      // If today is a leave day, check if today is a non-working day under business rules
-      if (isTodayWithinLeave) {
-        const isTodayNonWorking = await this.isNonWorkingDay(leave.orgId, today);
-        if (isTodayNonWorking) {
-          continue; // Skip queueing notifications on non-working days
+    for (const leave of leaves) {
+      try {
+        const queued = await this.queueNotificationsForLeave(leave, today);
+        if (queued > 0) {
+          processedCount++;
         }
+      } catch (err) {
+        this.logger.error(`Error queueing notifications for leave request ${leave.id}: ${err}`);
       }
-
-      // Build notification targets with notificationDate as todayStr
-      const targets = await this.buildLeaveNotificationTargets(leave, todayStr);
-
-      for (const target of targets) {
-        // Duplicate protection: template + payload.leaveId + payload.notificationDate + toRef
-        let duplicateExists = false;
-
-        if (target.channel === 'slack') {
-          const slackExists = await db
-            .select()
-            .from(notificationsTable)
-            .where(
-              and(
-                eq(notificationsTable.template, 'leave_request'),
-                eq(notificationsTable.channel, 'slack'),
-                sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
-                sql`${notificationsTable.payload}->>'notificationDate' = ${todayStr}`,
-                sql`${notificationsTable.toRef}->>'channelId' = ${target.toRef.channelId}`
-              )
-            )
-            .limit(1);
-          duplicateExists = slackExists.length > 0;
-        } else if (target.channel === 'discord') {
-          const discordExists = await db
-            .select()
-            .from(notificationsTable)
-            .where(
-              and(
-                eq(notificationsTable.template, 'leave_request'),
-                eq(notificationsTable.channel, 'discord'),
-                sql`${notificationsTable.payload}->>'leaveId' = ${String(leave.id)}`,
-                sql`${notificationsTable.payload}->>'notificationDate' = ${todayStr}`,
-                sql`${notificationsTable.toRef}->>'webhookUrl' = ${target.toRef.webhookUrl}`
-              )
-            )
-            .limit(1);
-          duplicateExists = discordExists.length > 0;
-        }
-
-        if (!duplicateExists) {
-          await db.insert(notificationsTable).values({
-            orgId: leave.orgId,
-            channel: target.channel,
-            toRef: target.toRef,
-            template: 'leave_request',
-            payload: target.payload,
-            state: 'pending',
-          });
-        }
-      }
-      processedCount++;
     }
 
     return { processed: processedCount };
