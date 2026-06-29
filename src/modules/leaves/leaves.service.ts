@@ -1581,7 +1581,7 @@ export class LeavesService {
 
     if (leaveTypeInfo && this.isSpecialLeaveNotificationType(leaveTypeInfo)) {
       specialLeaveEmailResult = await this.sendSpecialLeaveNotificationEmail({
-        toEmail: "amruta@navgurukul.org",
+        toEmail: this.configService.get<string>("HR_EMAIL") as string,
         managerEmail: managerInfo?.email ?? null,
         employeeName: userInfo?.name ?? `User ${userId}`,
         employeeEmail: userInfo?.email ?? null,
@@ -1754,6 +1754,14 @@ export class LeavesService {
         throw new BadRequestException(
           `Only pending leave requests can be edited (current state: ${existingRequest.state})`
         );
+      }
+
+      const isCompOffLeave =
+        existingRequest.leaveTypeCode === COMP_OFF_LEAVE_CODE ||
+        (existingRequest.leaveTypeName?.toLowerCase().includes("comp off") ?? false);
+
+      if (isCompOffLeave) {
+        throw new BadRequestException("Comp-off leave requests cannot be edited");
       }
 
       const [targetLeaveType] = await tx
@@ -2157,6 +2165,14 @@ export class LeavesService {
         throw new BadRequestException(
           `Only approved leave requests can be deleted (current state: ${existingRequest.state})`
         );
+      }
+
+      const isCompOffLeave =
+        existingRequest.leaveTypeCode === COMP_OFF_LEAVE_CODE ||
+        (existingRequest.leaveTypeName?.toLowerCase().includes("comp off") ?? false);
+
+      if (isCompOffLeave) {
+        throw new BadRequestException("Comp-off leave requests cannot be deleted");
       }
 
       const approvedHours = Number(existingRequest.hours ?? 0);
@@ -5260,6 +5276,8 @@ export class LeavesService {
       cycleEnd = new Date(Date.UTC(year, month, 25));
     }
 
+    // console.log("Salary cycle end date and time -> UTC:", cycleEnd.toISOString(), "| Local:", cycleEnd.toString());
+    
     return {
       cycleStart,
       cycleEnd,
@@ -6080,7 +6098,8 @@ export class LeavesService {
     });
 
     const dateRange = this.formatDateRangeForSubject(startDate, endDate);
-    const ccRecipients = Array.from(new Set(["amruta@navgurukul.org", employeeEmail]));
+    const hrEmail = this.configService.get<string>("HR_EMAIL") as string;
+    const ccRecipients = Array.from(new Set([hrEmail, employeeEmail]));
     const lowerLeaveTypeName = leaveTypeName.toLowerCase();
     const includeProgrammeName =
       lowerLeaveTypeName.includes("exam") ||

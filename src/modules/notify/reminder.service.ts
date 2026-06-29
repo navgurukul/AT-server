@@ -93,13 +93,14 @@ export class TrackerReminderService {
             }
           }
 
-          if (loggedHours >= 6) {
+          if (loggedHours >= 6 || (hasLeaveCoverage && !hasPartialLeave) || (hasPartialLeave && loggedHours >= 3)) {
             continue;
           }
 
           if ((!userTimesheet || loggedHours < 3) && !hasLeaveCoverage) {
             fullDayMissed.push(user);
-          } else if ((loggedHours >= 3 && loggedHours < 6) || hasPartialLeave) {
+          } 
+          else if ((loggedHours >= 3 && loggedHours < 6) || hasPartialLeave) {
             partialEntry.push(user);
           }
         }
@@ -111,9 +112,9 @@ export class TrackerReminderService {
 
         // Chunk and send Slack messages
         const slackToken = this.config.get<string>('SLACK_BOT_TOKEN');
-        const slackChannelId = 'C0ABFJDLGDB'; // #slack-notification-testing
+        const slackChannelId = this.config.get<string>('SLACK_CHANNEL_ID');
 
-        if (slackToken) {
+        if (slackToken && slackChannelId) {
           const slackUsers = fullDayMissed.filter(u => u.slackId);
           const slackPartialUsers = partialEntry.filter(u => u.slackId);
           
@@ -137,38 +138,18 @@ export class TrackerReminderService {
             this.logger.log(`Sent Slack reminders for org ${org.id}`);
           }
         } else {
-          this.logger.warn(`Could not send Slack reminder. Missing token.`);
+          this.logger.warn(`Could not send Slack reminder. Missing token or channel ID.`);
         }
 
-        // Chunk and send Discord messages
-        const discordChannelId = '935925786945417279'; // #general
-        const discordBotToken = this.config.get<string>('DISCORD_BOT_TOKEN');
-        const discordWebhook = this.config.get<string>('DISCORD_WEBHOOK_URL');
+        // Chunk and send Discord messages via Webhook
+        const discordWebhook = this.config.get<string>('DISCORD_WEBHOOK');
 
-        if (discordBotToken || discordWebhook) {
+        if (discordWebhook) {
           const discordUsers = fullDayMissed.filter(u => u.discordId);
           const discordPartialUsers = partialEntry.filter(u => u.discordId);
 
           const sendDiscordMessage = async (message: string) => {
-            if (discordBotToken) {
-              try {
-                const resp = await fetch(`https://discord.com/api/v10/channels/${discordChannelId}/messages`, {
-                  method: 'POST',
-                  headers: {
-                    'Authorization': `Bot ${discordBotToken}`,
-                    'Content-Type': 'application/json'
-                  },
-                  body: JSON.stringify({ content: message })
-                });
-                if (!resp.ok) {
-                  this.logger.warn(`Discord bot API error: ${resp.statusText}`);
-                }
-              } catch (err) {
-                this.logger.error(`Discord bot send failed: ${err instanceof Error ? err.message : err}`);
-              }
-            } else if (discordWebhook) {
-              await this.notify.sendDiscordMessage(discordWebhook, message);
-            }
+            await this.notify.sendDiscordMessage(discordWebhook, message);
           };
 
           const sendChunkedDiscord = async (users: typeof discordUsers, prefix: string) => {
@@ -188,10 +169,10 @@ export class TrackerReminderService {
             await sendChunkedDiscord(discordPartialUsers, "Following people have filled a partial entry or leave for today:\n");
           }
           if (discordUsers.length > 0 || discordPartialUsers.length > 0) {
-            this.logger.log(`Sent Discord reminders for org ${org.id}`);
+            this.logger.log(`Sent Discord reminders via Webhook for org ${org.id}`);
           }
         } else {
-          this.logger.warn(`Could not send Discord reminder. Missing token/webhook.`);
+          this.logger.warn(`Could not send Discord reminder. Missing webhook URL.`);
         }
       }
     } catch (error) {
