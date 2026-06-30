@@ -27,6 +27,7 @@ import { CreateTimesheetDto } from './dto/create-timesheet.dto';
 import { CreateTimesheetAdminDto } from './dto/create-timesheet-admin.dto';
 import { checkAdminSelfAction } from '../../common/utils/self-action.utils';
 import { getYYYYMMDD } from '../../common/utils/access-control.util';
+import { TimesheetSyncService } from './timesheet-sync.service';
 
 interface ListTimesheetParams {
   userId?: number;
@@ -76,6 +77,7 @@ export class TimesheetsService {
     private readonly calendarService: CalendarService,
     private readonly leavesService: LeavesService,
     private readonly auditService: AuditService,
+    private readonly timesheetSyncService: TimesheetSyncService,
   ) {}
 
   private async enforceLeaveBasedDailyHoursLimit(
@@ -913,6 +915,12 @@ export class TimesheetsService {
       cycleRange.cycleKey,
       now,
     );
+
+    try {
+      await this.timesheetSyncService.syncTimesheetToGoogleSheet(userId, workDate);
+    } catch (error: any) {
+      this.logger.warn(`Google sync failed for user ${userId} on date ${workDate}: ${error.message}`);
+    }
 
     return {
       ...result.timesheet,
@@ -3990,6 +3998,17 @@ export class TimesheetsService {
       );
     }
 
+    try {
+      const oldWorkDate = new Date(existingEntry.workDate);
+      const newWorkDate = updateData.date ? new Date(updateData.date) : oldWorkDate;
+      await this.timesheetSyncService.syncTimesheetToGoogleSheet(targetUserId, oldWorkDate);
+      if (oldWorkDate.getTime() !== newWorkDate.getTime()) {
+        await this.timesheetSyncService.syncTimesheetToGoogleSheet(targetUserId, newWorkDate);
+      }
+    } catch (error: any) {
+      this.logger.warn(`Google sync failed for user ${targetUserId} during update: ${error.message}`);
+    }
+
     return updatedEntry;
   }
 
@@ -4290,6 +4309,12 @@ export class TimesheetsService {
         } catch (auditError) {
           this.logger.warn(`Failed to create audit log for timesheet deletion:`, auditError);
         }
+      }
+
+      try {
+        await this.timesheetSyncService.syncTimesheetToGoogleSheet(targetUserId, workDate);
+      } catch (error: any) {
+        this.logger.warn(`Google sync failed for user ${targetUserId} during deletion: ${error.message}`);
       }
 
       return {
