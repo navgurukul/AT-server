@@ -5156,9 +5156,13 @@ export class LeavesService {
     for (const credit of credits) {
       // Compute salary cycle end for this credit's expiry date.
       const expiryDate = new Date(credit.expiresAt as string | Date);
-      const { cycleEnd } = this.getCycleRangeForWorkDate(expiryDate);
-      // Only expire if referenceDate (now) > cycleEnd
-      if (referenceDate > cycleEnd) {
+      const expirationThreshold = SalaryCycleUtil.getCurrentSalaryCycle(expiryDate).end;
+
+      // console.log(`expiryDate: `, expiryDate);
+      // console.log(`expirationThreshold: ${expirationThreshold.toLocaleString("en-IN", {timeZone: "Asia/Kolkata",})}`);
+
+      // Only expire if referenceDate (now) > expirationThreshold
+      if (referenceDate > expirationThreshold) {
         const creditedHours = Number(credit.creditedHours ?? 0);
         const availedHours = Number(credit.availedHours ?? 0);
         const remainingHours = Math.max(0, creditedHours - availedHours);
@@ -5276,8 +5280,6 @@ export class LeavesService {
       cycleEnd = new Date(Date.UTC(year, month, 25));
     }
 
-    // console.log("Salary cycle end date and time -> UTC:", cycleEnd.toISOString(), "| Local:", cycleEnd.toString());
-    
     return {
       cycleStart,
       cycleEnd,

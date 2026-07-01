@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
-import { and, eq, lte, gte, sql, or } from 'drizzle-orm';
+import { and, eq, lte, gte, sql, or, isNull, ne } from 'drizzle-orm';
 
 import { DatabaseService } from '../../database/database.service';
 import { CalendarService } from '../calendar/calendar.service';
@@ -45,11 +45,18 @@ export class TrackerReminderService {
           continue;
         }
 
-        // Fetch active employees
+        // Fetch employees based on exit date and employment type
         const activeUsers = await db.select().from(usersTable).where(
           and(
             eq(usersTable.orgId, org.id),
-            eq(usersTable.status, 'active')
+            or(
+              isNull(usersTable.dateOfExit),
+              gte(usersTable.dateOfExit, todayStr)
+            ),
+            or(
+              isNull(usersTable.employmentType),
+              ne(usersTable.employmentType, 'Part Time/Hourly Consultant')
+            )
           )
         );
 
