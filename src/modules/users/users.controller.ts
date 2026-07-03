@@ -85,6 +85,13 @@ export class UsersController {
     };
   }
 
+  @Get('managers-with-reportees')
+  @ApiQuery({ name: 'email', required: false })
+  @Permissions('users:view')
+  getManagersWithReportees(@Query('email') email?: string) {
+    return this.usersService.getManagersWithReportees({ email });
+  }
+
   @Get('managers')
   @ApiQuery({ name: 'q', required: false })
   @ApiQuery({ name: 'page', required: false })
