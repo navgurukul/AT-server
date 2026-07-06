@@ -1570,6 +1570,76 @@ async syncManagerRolesCron() {
     };
   }
 
+  async getManagersWithReportees(params: { email?: string }) {
+    const db = this.database.connection;
+
+    const allUsersQuery = db
+      .select({
+        id: usersTable.id,
+        name: usersTable.name,
+        email: usersTable.email,
+        managerId: usersTable.managerId,
+        departmentName: employeeDepartmentsTable.name,
+      })
+      .from(usersTable)
+      .leftJoin(
+        employeeDepartmentsTable,
+        eq(usersTable.employeeDepartmentId, employeeDepartmentsTable.id),
+      );
+
+    const allUsers = await allUsersQuery;
+
+    const reporteeCountMap = new Map<number, number>();
+    const managerIds = new Set<number>();
+
+    for (const user of allUsers) {
+      if (user.managerId !== null && user.managerId !== undefined) {
+        managerIds.add(user.managerId);
+        reporteeCountMap.set(
+          user.managerId,
+          (reporteeCountMap.get(user.managerId) || 0) + 1,
+        );
+      }
+    }
+
+    const searchEmail = params.email ? params.email.toLowerCase() : null;
+    const managersMap = new Map<number, any>();
+
+    for (const user of allUsers) {
+      if (managerIds.has(user.id)) {
+        if (searchEmail && !user.email.toLowerCase().includes(searchEmail)) {
+          continue;
+        }
+
+        managersMap.set(user.id, {
+          manager: user.name,
+          email: user.email,
+          department: user.departmentName || null,
+          reporteesCount: reporteeCountMap.get(user.id) || 0,
+          reportees: [],
+        });
+      }
+    }
+
+    for (const user of allUsers) {
+      if (
+        user.managerId !== null &&
+        user.managerId !== undefined &&
+        managersMap.has(user.managerId)
+      ) {
+        const manager = managersMap.get(user.managerId);
+        manager.reportees.push({
+          name: user.name,
+          email: user.email,
+          department: user.departmentName || null,
+          reporteesCount: reporteeCountMap.get(user.id) || 0,
+        });
+      }
+    }
+
+    return Array.from(managersMap.values());
+  }
+
   private getPrivilegedActorRole(roles: string[]): 'super_admin' | 'admin' | null {
     if (roles.includes('super_admin')) {
       return 'super_admin';
