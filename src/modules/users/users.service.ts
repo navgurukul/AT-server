@@ -45,6 +45,35 @@ export interface ManagerRoleSyncResult {
   alreadyAssigned: number;
 }
 
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let index = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (index < items.length) {
+      const i = index++;
+      await worker(items[i]);
+    }
+  });
+  await Promise.all(runners);
+}
+
+function datesEqual(a: Date | null | undefined, b: Date | null | undefined): boolean {
+  if (a == null && b == null) return true;
+  if (a == null || b == null) return false;
+  return new Date(a).getTime() === new Date(b).getTime();
+}
+
+function valuesEqual(a: unknown, b: unknown): boolean {
+  if (a instanceof Date || b instanceof Date) {
+    return datesEqual(a as Date, b as Date);
+  }
+  // treat null and undefined-from-db uniformly
+  return (a ?? null) === (b ?? null);
+}
+
 @Injectable()
 export class UsersService {
   constructor(
@@ -923,357 +952,380 @@ export class UsersService {
 
   async syncUsersFromSheet(): Promise<SheetSyncResult> {
     const db = this.database.connection;
-
-    const serviceAccountEmail = process.env.GOOGLE_SA_CLIENT_EMAIL;
-    const serviceAccountKeyRaw = process.env.GOOGLE_SA_PRIVATE_KEY;
-    const spreadsheetId =
-      process.env.GOOGLE_SHEETS_SPREADSHEET_ID ??
-      '1sHDVjrejDg9T2TT0qGt853nU1EXBbOncMv61HB7bqD8';
-    const range =
-      process.env.GOOGLE_SHEETS_RANGE ?? 'PnC data for AT!A2:O1000';
-
-    if (!serviceAccountEmail || !serviceAccountKeyRaw) {
-      throw new BadRequestException(
-        'Google service-account credentials are not configured',
+ 
+  const serviceAccountEmail = process.env.GOOGLE_SA_CLIENT_EMAIL;
+  const serviceAccountKeyRaw = process.env.GOOGLE_SA_PRIVATE_KEY;
+  const spreadsheetId =
+    process.env.GOOGLE_SHEETS_SPREADSHEET_ID ??
+    '1sHDVjrejDg9T2TT0qGt853nU1EXBbOncMv61HB7bqD8';
+  const range = process.env.GOOGLE_SHEETS_RANGE ?? 'PnC data for AT!A2:O1000';
+ 
+  if (!serviceAccountEmail || !serviceAccountKeyRaw) {
+    throw new BadRequestException(
+      'Google service-account credentials are not configured',
+    );
+  }
+ 
+  const serviceAccountKey = serviceAccountKeyRaw.replace(/\\n/g, '\n');
+ 
+  const jwtClient = new JWT({
+    email: serviceAccountEmail,
+    key: serviceAccountKey,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+  });
+ 
+  const { access_token: accessToken } = await jwtClient.authorize();
+  if (!accessToken) {
+    throw new BadRequestException('Unable to obtain Google access token');
+  }
+ 
+  const sheetUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(
+    range,
+  )}?majorDimension=ROWS`;
+  const sheetResponse = await fetch(sheetUrl, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+ 
+  if (!sheetResponse.ok) {
+    throw new BadRequestException(
+      `Unable to fetch Google Sheet data (${sheetResponse.status})`,
+    );
+  }
+ 
+  const sheetData = (await sheetResponse.json()) as { values?: string[][] };
+  const rows = sheetData.values ?? [];
+  if (rows.length === 0) {
+    return { created: 0, updated: 0, missingManagers: [] };
+  }
+ 
+  // ---------- column indexes ----------
+  const COL_EMAIL = 0;
+  const COL_NAME = 1;
+  const COL_WORK_LOCATION = 2;
+  const COL_EMPLOYEE_DEPARTMENT = 3;
+  const COL_DATE_OF_JOINING = 5;
+  const COL_EMPLOYMENT_TYPE = 6;
+  const COL_EMPLOYMENT_STATUS = 7;
+  const COL_DATE_OF_EXIT = 8;
+  const COL_SLACK_ID = 9;
+  const COL_REPORTING_MANAGER_EMAIL = 11;
+  const COL_ALUMNI = 12;
+  const COL_GENDER = 13;
+  const COL_DISCORD = 14;
+ 
+  // ---------- PASS 1: parse the whole sheet in memory (no awaits) ----------
+  type ParsedRow = {
+    email: string;
+    name: string | null;
+    workLocationType: string | null | undefined;
+    employeeDepartmentName: string | null | undefined;
+    dateOfJoining: Date | null | undefined;
+    employmentType: string | null | undefined;
+    employmentStatus: string | null | undefined;
+    dateOfExit: Date | null | undefined;
+    slackId: string | null | undefined;
+    managerEmail: string | null | undefined;
+    alumniStatus: string | null | undefined;
+    gender: string | null | undefined;
+    discordId: string | null | undefined;
+  };
+ 
+  const parsedRows: ParsedRow[] = [];
+  for (const row of rows) {
+    if (!row || row.length === 0) continue;
+    const emailCell = this.normalizeSheetString(row[COL_EMAIL]);
+    if (!emailCell) continue;
+ 
+    parsedRows.push({
+      email: emailCell.toLowerCase(),
+      name: this.normalizeSheetString(row[COL_NAME]) ?? null,
+      workLocationType: this.normalizeSheetString(row[COL_WORK_LOCATION]),
+      employeeDepartmentName: this.normalizeSheetString(
+        row[COL_EMPLOYEE_DEPARTMENT],
+      ),
+      dateOfJoining: this.parseSheetDate(row[COL_DATE_OF_JOINING]),
+      employmentType: this.normalizeSheetString(row[COL_EMPLOYMENT_TYPE]),
+      employmentStatus: this.normalizeSheetString(row[COL_EMPLOYMENT_STATUS]),
+      dateOfExit: this.parseSheetDate(row[COL_DATE_OF_EXIT]),
+      slackId: this.normalizeSheetString(row[COL_SLACK_ID]),
+      managerEmail:
+        this.normalizeSheetString(row[COL_REPORTING_MANAGER_EMAIL])?.toLowerCase() ??
+        this.normalizeSheetString(row[COL_REPORTING_MANAGER_EMAIL]),
+      alumniStatus: this.normalizeSheetString(row[COL_ALUMNI]),
+      gender: this.normalizeSheetString(row[COL_GENDER]),
+      discordId: this.normalizeSheetString(row[COL_DISCORD]),
+    });
+  }
+ 
+  // ---------- Load existing users WITH the synced fields so we can diff ----------
+  const existingUsers = await db
+    .select({
+      id: usersTable.id,
+      orgId: usersTable.orgId,
+      email: usersTable.email,
+      workLocationType: usersTable.workLocationType,
+      employeeDepartmentId: usersTable.employeeDepartmentId,
+      dateOfJoining: usersTable.dateOfJoining,
+      employmentType: usersTable.employmentType,
+      employmentStatus: usersTable.employmentStatus,
+      status: usersTable.status,
+      dateOfExit: usersTable.dateOfExit,
+      slackId: usersTable.slackId,
+      managerId: usersTable.managerId,
+      alumniStatus: usersTable.alumniStatus,
+      gender: usersTable.gender,
+      discordId: usersTable.discordId,
+    })
+    .from(usersTable);
+ 
+  type UserRecord = (typeof existingUsers)[number];
+  const userByEmail = new Map<string, UserRecord>(
+    existingUsers.map((u) => [u.email.toLowerCase(), u]),
+  );
+ 
+  // ---------- Departments: single bulk insert for missing ones ----------
+  const employeeDepartmentRows = await db
+    .select({
+      id: employeeDepartmentsTable.id,
+      name: employeeDepartmentsTable.name,
+    })
+    .from(employeeDepartmentsTable);
+ 
+  const employeeDepartmentCache = new Map(
+    employeeDepartmentRows.map((d) => [d.name.toLowerCase(), Number(d.id)]),
+  );
+ 
+  const missingDepts: string[] = [];
+  const seenDeptKeys = new Set<string>();
+  for (const r of parsedRows) {
+    const name = r.employeeDepartmentName;
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (!employeeDepartmentCache.has(key) && !seenDeptKeys.has(key)) {
+      seenDeptKeys.add(key);
+      missingDepts.push(name);
+    }
+  }
+ 
+  if (missingDepts.length > 0) {
+    const createdDepts = await db
+      .insert(employeeDepartmentsTable)
+      .values(missingDepts.map((name) => ({ name })))
+      .returning({
+        id: employeeDepartmentsTable.id,
+        name: employeeDepartmentsTable.name,
+      });
+    for (const d of createdDepts) {
+      employeeDepartmentCache.set(d.name.toLowerCase(), Number(d.id));
+    }
+  }
+ 
+  // ---------- Users: single bulk insert for all new users (rows + managers) ----------
+  let created = 0;
+  const missingManagers = new Set<string>();
+  const usersForPayableRecalc = new Map<number, number>();
+  const historicalRecalcs: { userId: number; date: Date }[] = [];
+ 
+  type NewUserSeed = {
+    email: string;
+    name: string;
+    employmentStatus: string | undefined;
+  };
+  const newUserSeeds = new Map<string, NewUserSeed>();
+ 
+  for (const r of parsedRows) {
+    if (!userByEmail.has(r.email) && !newUserSeeds.has(r.email)) {
+      newUserSeeds.set(r.email, {
+        email: r.email,
+        name: r.name?.trim().length ? r.name.trim() : r.email,
+        employmentStatus: r.employmentStatus ?? undefined,
+      });
+    }
+    // managers referenced in the sheet may not exist yet either
+    const managerEmail = r.managerEmail;
+    if (
+      managerEmail &&
+      !userByEmail.has(managerEmail) &&
+      !newUserSeeds.has(managerEmail)
+    ) {
+      newUserSeeds.set(managerEmail, {
+        email: managerEmail,
+        name: managerEmail,
+        employmentStatus: 'active',
+      });
+    }
+  }
+ 
+  if (newUserSeeds.size > 0) {
+    const now = new Date();
+    const initialStatusByEmail = new Map<string, 'active' | 'inactive'>();
+    for (const seed of newUserSeeds.values()) {
+      initialStatusByEmail.set(
+        seed.email,
+        this.isActiveEmployment(seed.employmentStatus) ? 'active' : 'inactive',
       );
     }
 
-    const serviceAccountKey = serviceAccountKeyRaw.replace(/\\n/g, '\n');
+    const insertValues = Array.from(newUserSeeds.values()).map((seed) => ({
+      orgId: 1,
+      email: seed.email,
+      name: seed.name,
+      passwordHash: this.generatePlaceholderPassword(seed.email),
+      status: initialStatusByEmail.get(seed.email) ?? 'inactive',
+      rolePrimary: 'employee' as const,
+      createdAt: now,
+      updatedAt: now,
+    }));
 
-    const jwtClient = new JWT({
-      email: serviceAccountEmail,
-      key: serviceAccountKey,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
-    });
-
-    const { access_token: accessToken } = await jwtClient.authorize();
-
-    if (!accessToken) {
-      throw new BadRequestException('Unable to obtain Google access token');
-    }
-
-    const sheetUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(
-      range,
-    )}?majorDimension=ROWS`;
-    const sheetResponse = await fetch(sheetUrl, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-    });
-
-    if (!sheetResponse.ok) {
-      throw new BadRequestException(
-        `Unable to fetch Google Sheet data (${sheetResponse.status})`,
-      );
-    }
-
-    const sheetData = (await sheetResponse.json()) as {
-      values?: string[][];
-    };
-
-    const rows = sheetData.values ?? [];
-    if (rows.length === 0) {
-      return { created: 0, updated: 0, missingManagers: [] };
-    }
-
-    const existingUsers = await db
-      .select({
+    const createdUsers = await db
+      .insert(usersTable)
+      .values(insertValues)
+      .returning({
         id: usersTable.id,
         orgId: usersTable.orgId,
         email: usersTable.email,
-      })
-      .from(usersTable);
+      });
 
-    const userByEmail = new Map(
-      existingUsers.map((user) => [user.email.toLowerCase(), user]),
-    );
-
-    const employeeDepartmentRows = await db
-      .select({
-        id: employeeDepartmentsTable.id,
-        name: employeeDepartmentsTable.name,
-      })
-      .from(employeeDepartmentsTable);
-
-    const employeeDepartmentCache = new Map(
-      employeeDepartmentRows.map((dept) => [dept.name.toLowerCase(), dept.id]),
-    );
-
-    const ensureEmployeeDepartmentId = async (name: string) => {
-      const key = name.toLowerCase();
-      if (employeeDepartmentCache.has(key)) {
-        return employeeDepartmentCache.get(key)!;
-      }
-      const [createdDept] = await db
-        .insert(employeeDepartmentsTable)
-        .values({ name })
-        .returning({ id: employeeDepartmentsTable.id });
-      const id = Number(createdDept.id);
-      employeeDepartmentCache.set(key, id);
-      return id;
-    };
-
-    const COL_EMAIL = 0;
-    const COL_NAME = 1;
-    const COL_WORK_LOCATION = 2;
-    const COL_EMPLOYEE_DEPARTMENT = 3;
-    const COL_DATE_OF_JOINING = 5;
-    const COL_EMPLOYMENT_TYPE = 6;
-    const COL_EMPLOYMENT_STATUS = 7;
-    const COL_DATE_OF_EXIT = 8;
-    const COL_SLACK_ID = 9;
-    const COL_REPORTING_MANAGER_EMAIL = 11;
-    const COL_ALUMNI = 12;
-    const COL_GENDER = 13;
-    const COL_DISCORD = 14;
-
-    const departmentNamesToEnsure = new Set<string>();
-    for (const row of rows) {
-      const deptName = this.normalizeSheetString(row?.[COL_EMPLOYEE_DEPARTMENT]);
-      if (deptName) {
-        departmentNamesToEnsure.add(deptName);
-      }
-    }
-
-    for (const deptName of departmentNamesToEnsure) {
-      await ensureEmployeeDepartmentId(deptName);
-    }
-
-    let created = 0;
-    let updated = 0;
-    const missingManagers = new Set<string>();
-    const usersForPayableRecalc = new Map<number, number>();
-
-    const ensureUser = async (
-      email: string,
-      displayName: string | null,
-      employmentStatus: string | undefined,
-    ) => {
-      const normalizedEmail = email.toLowerCase();
-      const existing = userByEmail.get(normalizedEmail);
-      if (existing) {
-        return existing;
-      }
-
-      const name = displayName?.trim().length
-        ? displayName.trim()
-        : normalizedEmail;
-
-      const status = this.isActiveEmployment(employmentStatus)
-        ? 'active'
-        : 'inactive';
-
-      const now = new Date();
-      const [createdUser] = await db
-        .insert(usersTable)
-        .values({
-          orgId: 1,
-          email: normalizedEmail,
-          name,
-          passwordHash: this.generatePlaceholderPassword(normalizedEmail),
-          status,
-          rolePrimary: 'employee',
-          createdAt: now,
-          updatedAt: now,
-        })
-        .returning({
-          id: usersTable.id,
-          orgId: usersTable.orgId,
-          email: usersTable.email,
-        });
-
-      const record = {
-        id: Number(createdUser.id),
-        orgId: Number(createdUser.orgId),
-        email: createdUser.email,
+    for (const u of createdUsers) {
+      const email = u.email.toLowerCase();
+      const record: UserRecord = {
+        id: Number(u.id),
+        orgId: Number(u.orgId),
+        email: u.email,
+        workLocationType: null,
+        employeeDepartmentId: null,
+        dateOfJoining: null,
+        employmentType: null,
+        employmentStatus: null,
+        status: initialStatusByEmail.get(email) ?? 'inactive',
+        dateOfExit: null,
+        slackId: null,
+        managerId: null,
+        alumniStatus: null,
+        gender: null,
+        discordId: null,
       };
-      userByEmail.set(normalizedEmail, record);
+      userByEmail.set(email, record);
       created += 1;
-
-      // Ensure newly created users get payable_days calculated for current cycle
+      // new users always get payable-days calculated
       usersForPayableRecalc.set(record.id, record.orgId);
-
-      return record;
+    }
+  }
+ 
+  // ---------- PASS 2: build update payloads by DIFFING against existing values ----------
+  type PendingUpdate = { userId: number; payload: Record<string, unknown> };
+  const pendingUpdates: PendingUpdate[] = [];
+  let updated = 0;
+ 
+  for (const r of parsedRows) {
+    const userRecord = userByEmail.get(r.email);
+    if (!userRecord) continue; // shouldn't happen
+ 
+    const payload: Record<string, unknown> = {};
+ 
+    const maybeSet = (field: keyof UserRecord & string, value: unknown) => {
+      if (value === undefined) return;
+      if (!valuesEqual(userRecord[field], value)) {
+        payload[field] = value;
+      }
     };
-
-    for (const row of rows) {
-      if (!row || row.length === 0) {
-        continue;
-      }
-
-      const emailCell = this.normalizeSheetString(row[COL_EMAIL]);
-      if (!emailCell) {
-        continue;
-      }
-
-      const nameCell = this.normalizeSheetString(row[COL_NAME]);
-      const employmentStatus = this.normalizeSheetString(
-        row[COL_EMPLOYMENT_STATUS],
-      );
-      const userRecord = await ensureUser(
-        emailCell,
-        nameCell ?? null,
-        employmentStatus ?? undefined,
-      );
-
-      const updatePayload: Record<string, unknown> = {};
-
-      const workLocationType = this.normalizeSheetString(
-        row[COL_WORK_LOCATION],
-      );
-      if (workLocationType !== undefined) {
-        updatePayload.workLocationType = workLocationType;
-      }
-
-      const employeeDepartmentName = this.normalizeSheetString(
-        row[COL_EMPLOYEE_DEPARTMENT],
-      );
-      if (employeeDepartmentName !== undefined) {
-        if (employeeDepartmentName === null) {
-          updatePayload.employeeDepartmentId = null;
-        } else {
-          const deptId = await ensureEmployeeDepartmentId(
-            employeeDepartmentName,
-          );
-          updatePayload.employeeDepartmentId = deptId;
-        }
-      }
-
-      const dateOfJoining = this.parseSheetDate(row[COL_DATE_OF_JOINING]);
-      if (dateOfJoining !== undefined) {
-        updatePayload.dateOfJoining = dateOfJoining;
-      }
-
-      const employmentType = this.normalizeSheetString(
-        row[COL_EMPLOYMENT_TYPE],
-      );
-      if (employmentType !== undefined) {
-        updatePayload.employmentType = employmentType;
-      }
-
-      if (employmentStatus !== undefined) {
-        updatePayload.employmentStatus = employmentStatus;
-        updatePayload.status = this.isActiveEmployment(employmentStatus)
+ 
+    maybeSet('workLocationType', r.workLocationType);
+ 
+    if (r.employeeDepartmentName !== undefined) {
+      const deptId =
+        r.employeeDepartmentName === null
+          ? null
+          : employeeDepartmentCache.get(r.employeeDepartmentName.toLowerCase()) ??
+            null;
+      maybeSet('employeeDepartmentId', deptId);
+    }
+ 
+    maybeSet('dateOfJoining', r.dateOfJoining);
+    maybeSet('employmentType', r.employmentType);
+ 
+    if (r.employmentStatus !== undefined) {
+      maybeSet('employmentStatus', r.employmentStatus);
+      maybeSet(
+        'status',
+        this.isActiveEmployment(r.employmentStatus ?? undefined)
           ? 'active'
-          : 'inactive';
-      }
-
-      const dateOfExit = this.parseSheetDate(row[COL_DATE_OF_EXIT]);
-      if (dateOfExit !== undefined) {
-        updatePayload.dateOfExit = dateOfExit;
-      }
-
-      const slackId = this.normalizeSheetString(row[COL_SLACK_ID]);
-      if (slackId !== undefined) {
-        updatePayload.slackId = slackId;
-      }
-
-      const managerEmailCell = this.normalizeSheetString(
-        row[COL_REPORTING_MANAGER_EMAIL],
+          : 'inactive',
       );
-      if (managerEmailCell !== undefined) {
-        if (managerEmailCell === null) {
-          updatePayload.managerId = null;
+    }
+ 
+    maybeSet('dateOfExit', r.dateOfExit);
+    maybeSet('slackId', r.slackId);
+ 
+    if (r.managerEmail !== undefined) {
+      if (r.managerEmail === null) {
+        maybeSet('managerId', null);
+      } else {
+        const managerRecord = userByEmail.get(r.managerEmail);
+        if (managerRecord) {
+          maybeSet('managerId', managerRecord.id);
         } else {
-          try {
-            const managerRecord = await ensureUser(
-              managerEmailCell,
-              null,
-              'active',
-            );
-            updatePayload.managerId = managerRecord.id;
-          } catch (error) {
-            missingManagers.add(managerEmailCell);
-          }
+          missingManagers.add(r.managerEmail);
         }
       }
-
-      const alumniStatus = this.normalizeSheetString(row[COL_ALUMNI]);
-      if (alumniStatus !== undefined) {
-        updatePayload.alumniStatus = alumniStatus;
-      }
-
-      const gender = this.normalizeSheetString(row[COL_GENDER]);
-      if (gender !== undefined) {
-        updatePayload.gender = gender;
-      }
-
-      const discordId = this.normalizeSheetString(row[COL_DISCORD]);
-      if (discordId !== undefined) {
-        updatePayload.discordId = discordId;
-      }
-
-      if (Object.keys(updatePayload).length === 0) {
-        continue;
-      }
-
-      await db
-        .update(usersTable)
-        .set(updatePayload)
-        .where(eq(usersTable.id, userRecord.id));
-      updated += 1;
-
-      if (
-        Object.prototype.hasOwnProperty.call(updatePayload, 'dateOfJoining') ||
-        Object.prototype.hasOwnProperty.call(updatePayload, 'dateOfExit')
-      ) {
-        usersForPayableRecalc.set(userRecord.id, Number(userRecord.orgId));
-      }
     }
-
-    for (const [userId, orgId] of usersForPayableRecalc.entries()) {
-      await this.timesheetsService.recalculatePayableDaysForUserByExistingCycles(
-        orgId,
-        userId,
-      );
+ 
+    maybeSet('alumniStatus', r.alumniStatus);
+    maybeSet('gender', r.gender);
+    maybeSet('discordId', r.discordId);
+ 
+    if (Object.keys(payload).length === 0) continue;
+ 
+    pendingUpdates.push({ userId: Number(userRecord.id), payload });
+ 
+    if ('dateOfJoining' in payload || 'dateOfExit' in payload) {
+  usersForPayableRecalc.set(Number(userRecord.id), Number(userRecord.orgId));
+  for (const d of [r.dateOfJoining, r.dateOfExit]) {
+    if (d instanceof Date && !isNaN(d.getTime())) {
+      historicalRecalcs.push({ userId: Number(userRecord.id), date: d });
     }
+  }
+}
+  }
+ 
+  // ---------- Execute updates in parallel (bounded concurrency) ----------
+  await runWithConcurrency(pendingUpdates, 20, async ({ userId, payload }) => {
+    await db.update(usersTable).set(payload).where(eq(usersTable.id, userId));
+    updated += 1;
+  });
+ 
+  await this.timesheetsService.recalculatePayableDaysForUsersCurrentCycle(
+  1,
+  Array.from(usersForPayableRecalc.keys()),
+);
 
-    // Also ensure all users without joining dates get payable_days calculated
-    // so they properly compute expected_attendance and week_off from cycle start/end
-    const usersWithoutJoiningDate = await db
-      .select({
-        id: usersTable.id,
-        orgId: usersTable.orgId,
-      })
-      .from(usersTable)
-      .where(
-        and(
-          eq(usersTable.orgId, 1),
-          isNull(usersTable.dateOfJoining),
-        ),
-      );
-
-    for (const user of usersWithoutJoiningDate) {
-      if (!usersForPayableRecalc.has(user.id)) {
-        await this.timesheetsService.recalculatePayableDaysForUserByExistingCycles(
-          user.orgId,
-          user.id,
-        );
-      }
-    }
-
-    await this.ensureReportingManagersHaveManagerRole();
-
-    return {
-      created,
-      updated,
-      missingManagers: Array.from(missingManagers),
-    };
+await this.timesheetsService.recalculatePayableDaysForSpecificCycles(
+  1,
+  historicalRecalcs,
+);
+ 
+  await this.ensureReportingManagersHaveManagerRole();
+ 
+  return {
+    created,
+    updated,
+    missingManagers: Array.from(missingManagers),
+  };
   }
 
-@Cron(`0 1 * * *`, {
-  name: 'users-google-sheet-sync',
-})
-async syncUsersFromSheetCron() {
-  await this.syncUsersFromSheet();
-}
+  @Cron(`0 1 * * *`, {
+    name: 'users-google-sheet-sync',
+  })
+  async syncUsersFromSheetCron() {
+    await this.syncUsersFromSheet();
+  }
 
-@Cron('30 1 * * *', {
-  name: 'users-manager-roles-sync',
-})
-async syncManagerRolesCron() {
-  await this.ensureReportingManagersHaveManagerRole();
-}
+  @Cron('30 1 * * *', {
+    name: 'users-manager-roles-sync',
+  })
+  async syncManagerRolesCron() {
+    await this.ensureReportingManagersHaveManagerRole();
+  }
 
   async ensureReportingManagersHaveManagerRole(): Promise<ManagerRoleSyncResult> {
     const db = this.database.connection;
