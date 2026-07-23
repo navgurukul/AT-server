@@ -55,6 +55,24 @@ export interface PayableDaysSummaryRow {
   lwp: number;
 }
 
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let index = 0;
+  const runners = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      while (index < items.length) {
+        const i = index++;
+        await worker(items[i]);
+      }
+    },
+  );
+  await Promise.all(runners);
+}
+
 const DEFAULT_BACKFILL_PER_MONTH = 3;
 const BACKFILL_CUTOFF_DAY = 25;
 const MAX_HOURS_PER_DAY = 12;
@@ -1287,6 +1305,86 @@ export class TimesheetsService {
 
     return uniqueCycleKeys.length;
   }
+
+  // NEW METHOD 1: recalc CURRENT cycle only, for many users at once
+async recalculatePayableDaysForUsersCurrentCycle(
+  orgId: number,
+  userIds: number[],
+): Promise<void> {
+  if (userIds.length === 0) return;
+  const db = this.database.connection;
+  const now = new Date();
+
+  // current cycle is the same for every user → compute ONCE
+  const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(now);
+  const currentCycleEnd = this.normalizeDateUTC(
+    new Date(
+      Date.UTC(
+        currentCycle.end.getUTCFullYear(),
+        currentCycle.end.getUTCMonth(),
+        25,
+      ),
+    ),
+  );
+  const cycleKey = this.formatDateKey(currentCycleEnd);
+  const cycleDate = new Date(`${cycleKey}T00:00:00.000Z`);
+  const cycleRange = this.getCycleRangeForWorkDate(cycleDate);
+
+  await runWithConcurrency(userIds, 10, async (userId) => {
+    await this.recalculateAndPersistPayableDaysForCycle(
+      db,
+      orgId,
+      userId,
+      cycleRange.cycleStart,
+      cycleRange.cycleEnd,
+      cycleRange.cycleKey,
+      now,
+    );
+  });
+}
+
+// NEW METHOD 2: recalc a specific PAST cycle when a joining/exit date changed
+async recalculatePayableDaysForSpecificCycles(
+  orgId: number,
+  entries: { userId: number; date: Date }[],
+): Promise<void> {
+  if (entries.length === 0) return;
+  const db = this.database.connection;
+  const now = new Date();
+
+  const seen = new Set<string>();
+  const tasks: {
+    userId: number;
+    cycleStart: Date;
+    cycleEnd: Date;
+    cycleKey: string;
+  }[] = [];
+
+  for (const { userId, date } of entries) {
+    const range = this.getCycleRangeForWorkDate(date);
+    const key = `${userId}:${range.cycleKey}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tasks.push({
+      userId,
+      cycleStart: range.cycleStart,
+      cycleEnd: range.cycleEnd,
+      cycleKey: range.cycleKey,
+    });
+  }
+
+  await runWithConcurrency(tasks, 10, async (task) => {
+    await this.recalculateAndPersistPayableDaysForCycle(
+      db,
+      orgId,
+      task.userId,
+      task.cycleStart,
+      task.cycleEnd,
+      task.cycleKey,
+      now,
+    );
+  });
+}
 
   async updateBackfillLimit(payload: {
     orgId: number;
