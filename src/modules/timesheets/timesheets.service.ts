@@ -949,6 +949,7 @@ export class TimesheetsService {
     };
   }
 
+  
   private getPayableDaysForHours(hours: number): number {
     if (hours < 3) {
       return 0;
