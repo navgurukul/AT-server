@@ -837,7 +837,7 @@ export class TimesheetsService {
         ? backfillAllowance.remaining
         : Math.max(backfillAllowance.remaining - (existing ? 0 : 1), 0)
       : backfillAllowance.remaining;
-// Try to automatically process comp off for this timesheet
+    // Try to automatically process comp off for this timesheet
     // This happens after the transaction to avoid any conflicts
     try {
       const totalHoursNum = Number(result.timesheet.totalHours ?? 0);
@@ -934,11 +934,11 @@ export class TimesheetsService {
       now,
     );
 
-    try {
-      await this.timesheetSyncService.syncTimesheetToGoogleSheet(userId, workDate);
-    } catch (error: any) {
-      this.logger.warn(`Google sync failed for user ${userId} on date ${workDate}: ${error.message}`);
-    }
+    // try {
+    //   await this.timesheetSyncService.syncTimesheetToGoogleSheet(userId, workDate);
+    // } catch (error: any) {
+    //   this.logger.warn(`Google sync failed for user ${userId} on date ${workDate}: ${error.message}`);
+    // }
 
     return {
       ...result.timesheet,
