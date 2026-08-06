@@ -934,6 +934,7 @@ export class TimesheetsService {
       now,
     );
 
+    // Google sheets sync
     // try {
     //   await this.timesheetSyncService.syncTimesheetToGoogleSheet(userId, workDate);
     // } catch (error: any) {
