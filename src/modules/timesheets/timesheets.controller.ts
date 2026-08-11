@@ -188,6 +188,36 @@ export class TimesheetsController {
     });
   }
 
+  @Patch('entries/:entryId')
+  @Permissions('timesheet:edit:self')
+  updateOwnTimesheetEntry(
+    @Param('entryId') entryId: string,
+    @Body() payload: UpdateTimesheetEntryDto,
+    @CurrentUser() user: AuthenticatedUser | undefined,
+  ) {
+    if (!user) {
+      return null;
+    }
+
+    const parsedEntryId = Number.parseInt(entryId, 10);
+    if (Number.isNaN(parsedEntryId)) {
+      throw new ForbiddenException('Invalid entry ID');
+    }
+
+    return this.timesheetsService.updateTimesheetEntry(
+      parsedEntryId,
+      user.id,
+      {
+        projectId: payload.projectId,
+        date: payload.date,
+        hours: payload.hours,
+        activities: payload.activities,
+      },
+      user.orgId,
+      user,
+    );
+  }
+
   @Patch('actor/:actorId/user/:targetUserId/entries/:entryId')
   @UseGuards(RolesGuard)
   @Roles('super_admin', 'admin')
