@@ -2108,6 +2108,177 @@ export class LeavesService {
     });
   }
 
+  async userDeleteLeaveRequest(
+    actor: AuthenticatedUser,
+    requestId: number
+  ) {
+    const db = this.database.connection;
+    const now = new Date();
+
+    return db.transaction(async (tx) => {
+      const [existingRequest] = await tx
+        .select({
+          id: leaveRequestsTable.id,
+          userId: leaveRequestsTable.userId,
+          state: leaveRequestsTable.state,
+          createdAt: leaveRequestsTable.createdAt,
+          hours: leaveRequestsTable.hours,
+          leaveTypeId: leaveRequestsTable.leaveTypeId,
+          leaveTypePaid: leaveTypesTable.paid,
+          leaveTypeCode: leaveTypesTable.code,
+          leaveTypeName: leaveTypesTable.name,
+          startDate: leaveRequestsTable.startDate,
+          endDate: leaveRequestsTable.endDate,
+          durationType: leaveRequestsTable.durationType,
+          halfDaySegment: leaveRequestsTable.halfDaySegment,
+          reason: leaveRequestsTable.reason,
+        })
+        .from(leaveRequestsTable)
+        .innerJoin(
+          leaveTypesTable,
+          eq(leaveTypesTable.id, leaveRequestsTable.leaveTypeId)
+        )
+        .where(eq(leaveRequestsTable.id, requestId))
+        .limit(1);
+
+      if (!existingRequest) {
+        throw new NotFoundException("Leave request not found");
+      }
+
+      if (existingRequest.userId !== actor.id) {
+        throw new ForbiddenException("You can only delete your own leave requests");
+      }
+
+      const isCasualLeave =
+        existingRequest.leaveTypeCode === "casual" ||
+        existingRequest.leaveTypeCode === "casual_leave" ||
+        (existingRequest.leaveTypeName?.toLowerCase().includes("casual") ?? false);
+
+      if (!isCasualLeave) {
+        throw new BadRequestException("Only casual leave requests can be deleted");
+      }
+
+      if (existingRequest.state !== "pending") {
+        throw new BadRequestException(
+          `Only pending leave requests can be deleted (current state: ${existingRequest.state})`
+        );
+      }
+
+      // 7 AM IST deadline logic based on createdAt for casual leave
+      const createdAt = existingRequest.createdAt ? new Date(existingRequest.createdAt) : new Date();
+      const today = this.normalizeDateUTC(now);
+      const normalizedCreatedAt = this.normalizeDateUTC(createdAt);
+
+      // Check if createdAt is older than yesterday
+      const daysDifference = (today.getTime() - normalizedCreatedAt.getTime()) / (24 * 60 * 60 * 1000);
+      
+      if (daysDifference > 1) {
+         throw new BadRequestException("You can only delete casual leave requests until 7 AM next day");
+      }
+
+      if (daysDifference === 1) {
+        // If it was created yesterday, it is editable only before 7:00 AM IST today
+        const nowInIST = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+        if (nowInIST.getHours() >= 7) {
+          throw new BadRequestException("You can only delete casual leave requests until 7 AM next day");
+        }
+      }
+
+      const pendingHours = Number(existingRequest.hours ?? 0);
+      let updatedBalance: LeaveBalanceSnapshot | null = null;
+
+      const isPaidLeave = existingRequest.leaveTypePaid ?? true;
+      const isLWP = existingRequest.leaveTypeCode === LWP_LEAVE_CODE ||
+        (existingRequest.leaveTypeName?.toLowerCase().includes('without pay') ?? false);
+      const shouldRestoreBalance = isPaidLeave || isLWP;
+
+      if (shouldRestoreBalance) {
+        await this.ensureLeaveBalanceRow(
+          tx,
+          existingRequest.userId,
+          existingRequest.leaveTypeId
+        );
+
+        updatedBalance = await this.adjustLeaveBalance(
+          tx,
+          existingRequest.userId,
+          existingRequest.leaveTypeId,
+          {
+            pendingHours: -pendingHours,
+            balanceHours: pendingHours,
+          }
+        );
+      }
+
+      await tx
+        .delete(notificationsTable)
+        .where(
+          and(
+            eq(notificationsTable.template, 'leave_request'),
+            eq(notificationsTable.state, 'pending'),
+            sql`${notificationsTable.payload}->>'leaveId' = ${String(requestId)}`
+          )
+        );
+
+      await tx
+        .delete(approvalsTable)
+        .where(
+          and(
+            eq(approvalsTable.subjectType, "leave_request"),
+            eq(approvalsTable.subjectId, requestId)
+          )
+        );
+
+      await tx
+        .delete(bereavementLeaveRequestTable)
+        .where(
+          eq(bereavementLeaveRequestTable.leaveRequestId, requestId)
+        );
+
+      await tx
+        .delete(leaveRequestsTable)
+        .where(eq(leaveRequestsTable.id, requestId));
+
+      await this.auditService.createLog({
+        tx,
+        orgId: actor.orgId,
+        actorUserId: actor.id,
+        actorRole: this.getPrivilegedActorRole(actor.roles ?? []) || "employee",
+        action: "leave_deleted_by_user",
+        subjectType: "leave_modified",
+        targetUserId: existingRequest.userId,
+        prev: {
+          id: existingRequest.id,
+          leaveTypeId: existingRequest.leaveTypeId,
+          state: existingRequest.state,
+          startDate: existingRequest.startDate,
+          endDate: existingRequest.endDate,
+          durationType: existingRequest.durationType,
+          halfDaySegment: existingRequest.halfDaySegment,
+          hours: Number(existingRequest.hours ?? 0),
+          reason: existingRequest.reason ?? null,
+        },
+        next: {
+          deleted: true,
+        },
+      });
+
+      return {
+        deletedRequestId: existingRequest.id,
+        userId: existingRequest.userId,
+        leaveTypeId: existingRequest.leaveTypeId,
+        restoredPendingHours: pendingHours,
+        recalculatedBalance: updatedBalance
+          ? {
+            balanceHours: this.normalizeHours(updatedBalance.balanceHours),
+            pendingHours: this.normalizeHours(updatedBalance.pendingHours),
+            bookedHours: this.normalizeHours(updatedBalance.bookedHours),
+          }
+          : null,
+      };
+    });
+  }
+
   async adminDeleteApprovedLeaveRequest(
     actor: AuthenticatedUser,
     requestId: number

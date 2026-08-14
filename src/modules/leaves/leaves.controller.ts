@@ -258,6 +258,18 @@ export class LeavesController {
     });
   }
 
+  @Delete("requests/:id")
+  @Permissions("leave:create:self")
+  deleteMyLeaveRequest(
+    @Param("id", ParseIntPipe) requestId: number,
+    @CurrentUser() actor: AuthenticatedUser | undefined
+  ) {
+    if (!actor) {
+      return null;
+    }
+    return this.leavesService.userDeleteLeaveRequest(actor, requestId);
+  }
+
   @Post("comp-offs")
   @Permissions("leave:approve:team")
   grantCompOff(

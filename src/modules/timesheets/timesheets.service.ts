@@ -55,6 +55,24 @@ export interface PayableDaysSummaryRow {
   lwp: number;
 }
 
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let index = 0;
+  const runners = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      while (index < items.length) {
+        const i = index++;
+        await worker(items[i]);
+      }
+    },
+  );
+  await Promise.all(runners);
+}
+
 const DEFAULT_BACKFILL_PER_MONTH = 3;
 const BACKFILL_CUTOFF_DAY = 25;
 const MAX_HOURS_PER_DAY = 12;
@@ -78,7 +96,55 @@ export class TimesheetsService {
     private readonly leavesService: LeavesService,
     private readonly auditService: AuditService,
     private readonly timesheetSyncService: TimesheetSyncService,
-  ) {}
+  ) { }
+
+  /**
+   * Check if a timesheet for the given workDate can be edited by a regular user.
+   * Rules:
+   * - Today's timesheet is always editable.
+   * - Yesterday's timesheet is editable until 07:00 AM IST of today.
+   * - Older dates or yesterday past 07:00 AM IST cannot be edited by regular users.
+   */
+  isTimesheetEditable(workDate: Date, createdAt: Date | null = null, now: Date = new Date()): boolean {
+    const today = normalizeDate(now);
+
+    // If a createdAt date is provided, the edit window is also based on when it was created.
+    // If it was created within the current logical day (or the previous logical day before its 7AM cutoff), it's editable.
+    if (createdAt) {
+      const normalizedCreatedAt = normalizeDate(createdAt);
+      if (normalizedCreatedAt.getTime() === today.getTime()) {
+        return true;
+      }
+      const isCreatedYesterday = today.getTime() - normalizedCreatedAt.getTime() === 24 * 60 * 60 * 1000;
+      if (isCreatedYesterday) {
+        const nowInIST = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+        if (nowInIST.getHours() < 7) {
+          return true;
+        }
+      }
+    }
+
+    const normalizedWorkDate = normalizeDate(workDate);
+
+    // Future dates cannot be edited
+    if (normalizedWorkDate > today) {
+      return false;
+    }
+
+    // Today's timesheet is always editable
+    if (normalizedWorkDate.getTime() === today.getTime()) {
+      return true;
+    }
+
+    // Yesterday's timesheet is editable only before 7:00 AM IST
+    const isYesterday = today.getTime() - normalizedWorkDate.getTime() === 24 * 60 * 60 * 1000;
+    if (isYesterday) {
+      const nowInIST = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+      return nowInIST.getHours() < 7;
+    }
+
+    return false;
+  }
 
   private async enforceLeaveBasedDailyHoursLimit(
     userId: number,
@@ -221,25 +287,25 @@ export class TimesheetsService {
       timesheetIds.length === 0
         ? []
         : await db
-            .select({
-              id: timesheetEntriesTable.id,
-              timesheetId: timesheetEntriesTable.timesheetId,
-              projectId: timesheetEntriesTable.projectId,
-              taskTitle: timesheetEntriesTable.taskTitle,
-              taskDescription: timesheetEntriesTable.taskDescription,
-              hoursDecimal: timesheetEntriesTable.hoursDecimal,
-              tags: timesheetEntriesTable.tags,
-              createdAt: timesheetEntriesTable.createdAt,
-              updatedAt: timesheetEntriesTable.updatedAt,
-            })
-            .from(timesheetEntriesTable)
-            .where(
-              and(
-                inArray(timesheetEntriesTable.timesheetId, timesheetIds),
-                eq(timesheetEntriesTable.status, 'approved'),
-              ),
-            )
-            .orderBy(asc(timesheetEntriesTable.id));
+          .select({
+            id: timesheetEntriesTable.id,
+            timesheetId: timesheetEntriesTable.timesheetId,
+            projectId: timesheetEntriesTable.projectId,
+            taskTitle: timesheetEntriesTable.taskTitle,
+            taskDescription: timesheetEntriesTable.taskDescription,
+            hoursDecimal: timesheetEntriesTable.hoursDecimal,
+            tags: timesheetEntriesTable.tags,
+            createdAt: timesheetEntriesTable.createdAt,
+            updatedAt: timesheetEntriesTable.updatedAt,
+          })
+          .from(timesheetEntriesTable)
+          .where(
+            and(
+              inArray(timesheetEntriesTable.timesheetId, timesheetIds),
+              eq(timesheetEntriesTable.status, 'approved'),
+            ),
+          )
+          .orderBy(asc(timesheetEntriesTable.id));
 
     const entriesByTimesheet = entries.reduce<Record<number, typeof entries>>(
       (acc, entry) => {
@@ -398,12 +464,12 @@ export class TimesheetsService {
 
     let projectRecords:
       | Array<{
-          id: number;
-          orgId: number;
-          slackChannelId: string | null;
-          discordChannelId: string | null;
-          name: string | null;
-        }>
+        id: number;
+        orgId: number;
+        slackChannelId: string | null;
+        discordChannelId: string | null;
+        name: string | null;
+      }>
       | null = null;
 
     if (projectIds.length > 0) {
@@ -463,7 +529,7 @@ export class TimesheetsService {
     const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(now);
     const normalizedCycleStart = normalizeDate(currentCycle.start);
     const normalizedCycleEnd = normalizeDate(currentCycle.end);
-    
+
     if (
       enforceCurrentSalaryCycle &&
       (workDate < normalizedCycleStart || workDate >= normalizedCycleEnd)
@@ -491,7 +557,7 @@ export class TimesheetsService {
         );
       }
     }
-    
+
     const shouldApplyBackfillRules = enforceCurrentSalaryCycle;
     const backfillAllowance = shouldApplyBackfillRules && isBackfill
       ? await this.getBackfillAllowanceForCycle(orgId, userId, currentCycle, now)
@@ -502,6 +568,7 @@ export class TimesheetsService {
         id: timesheetsTable.id,
         state: timesheetsTable.state,
         notes: timesheetsTable.notes,
+        createdAt: timesheetsTable.createdAt,
       })
       .from(timesheetsTable)
       .where(
@@ -535,6 +602,20 @@ export class TimesheetsService {
       throw new BadRequestException(
         `Cannot modify timesheet when it is ${existing.state}`
       );
+    }
+
+    const isPrivileged =
+      userInfo?.role === 'super_admin' ||
+      userInfo?.role === 'admin' ||
+      skipBackfillDeduction;
+
+    if (existing && !isPrivileged) {
+      const canEdit = this.isTimesheetEditable(workDate, existing.createdAt, now);
+      if (!canEdit) {
+        throw new BadRequestException(
+          'Timesheet entries can only be edited until 7:00 AM of the next day'
+        );
+      }
     }
 
     // Fetch existing entries for this timesheet to merge/accumulate with new entries
@@ -572,7 +653,7 @@ export class TimesheetsService {
         if (existing) {
           // Accumulate hours
           const mergedHours = newEntry.hours + (Number(existing.hoursDecimal) || 0);
-          
+
           // Merge descriptions: append new descriptions to existing ones
           let mergedDescription = existing.taskDescription || '';
           if (newEntry.taskDescription && mergedDescription) {
@@ -819,7 +900,7 @@ export class TimesheetsService {
         ? backfillAllowance.remaining
         : Math.max(backfillAllowance.remaining - (existing ? 0 : 1), 0)
       : backfillAllowance.remaining;
-// Try to automatically process comp off for this timesheet
+    // Try to automatically process comp off for this timesheet
     // This happens after the transaction to avoid any conflicts
     try {
       const totalHoursNum = Number(result.timesheet.totalHours ?? 0);
@@ -874,9 +955,9 @@ export class TimesheetsService {
       const projectMeta = result.projectChannelMap?.[pid];
       const channel = projectMeta?.channel ?? null;
       const discordWebhook = projectMeta?.discordWebhook ?? null;
-      
+
       this.logger.log(`Project ${pid} (${projectMeta?.name}): Slack=${!!channel}, Discord=${!!discordWebhook}`);
-      
+
       const notificationPayload = {
         userId,
         userName: userInfo?.name ?? `User ${userId}`,
@@ -916,11 +997,12 @@ export class TimesheetsService {
       now,
     );
 
-    try {
-      await this.timesheetSyncService.syncTimesheetToGoogleSheet(userId, workDate);
-    } catch (error: any) {
-      this.logger.warn(`Google sync failed for user ${userId} on date ${workDate}: ${error.message}`);
-    }
+    // Google sheets sync
+    // try {
+    //   await this.timesheetSyncService.syncTimesheetToGoogleSheet(userId, workDate);
+    // } catch (error: any) {
+    //   this.logger.warn(`Google sync failed for user ${userId} on date ${workDate}: ${error.message}`);
+    // }
 
     return {
       ...result.timesheet,
@@ -929,6 +1011,7 @@ export class TimesheetsService {
       backfillRemaining,
     };
   }
+
 
   private getPayableDaysForHours(hours: number): number {
     if (hours < 3) {
@@ -1056,9 +1139,9 @@ export class TimesheetsService {
     const expectedAttendance =
       effectiveEndDate >= effectiveStartDate
         ? Math.floor(
-            (effectiveEndDate.getTime() - effectiveStartDate.getTime()) /
-              (24 * 60 * 60 * 1000),
-          ) + 1
+          (effectiveEndDate.getTime() - effectiveStartDate.getTime()) /
+          (24 * 60 * 60 * 1000),
+        ) + 1
         : 0;
 
     let weekOffDays = 0;
@@ -1288,6 +1371,86 @@ export class TimesheetsService {
     return uniqueCycleKeys.length;
   }
 
+  // NEW METHOD 1: recalc CURRENT cycle only, for many users at once
+  async recalculatePayableDaysForUsersCurrentCycle(
+    orgId: number,
+    userIds: number[],
+  ): Promise<void> {
+    if (userIds.length === 0) return;
+    const db = this.database.connection;
+    const now = new Date();
+
+    // current cycle is the same for every user → compute ONCE
+    const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(now);
+    const currentCycleEnd = this.normalizeDateUTC(
+      new Date(
+        Date.UTC(
+          currentCycle.end.getUTCFullYear(),
+          currentCycle.end.getUTCMonth(),
+          25,
+        ),
+      ),
+    );
+    const cycleKey = this.formatDateKey(currentCycleEnd);
+    const cycleDate = new Date(`${cycleKey}T00:00:00.000Z`);
+    const cycleRange = this.getCycleRangeForWorkDate(cycleDate);
+
+    await runWithConcurrency(userIds, 10, async (userId) => {
+      await this.recalculateAndPersistPayableDaysForCycle(
+        db,
+        orgId,
+        userId,
+        cycleRange.cycleStart,
+        cycleRange.cycleEnd,
+        cycleRange.cycleKey,
+        now,
+      );
+    });
+  }
+
+  // NEW METHOD 2: recalc a specific PAST cycle when a joining/exit date changed
+  async recalculatePayableDaysForSpecificCycles(
+    orgId: number,
+    entries: { userId: number; date: Date }[],
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    const db = this.database.connection;
+    const now = new Date();
+
+    const seen = new Set<string>();
+    const tasks: {
+      userId: number;
+      cycleStart: Date;
+      cycleEnd: Date;
+      cycleKey: string;
+    }[] = [];
+
+    for (const { userId, date } of entries) {
+      const range = this.getCycleRangeForWorkDate(date);
+      const key = `${userId}:${range.cycleKey}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      tasks.push({
+        userId,
+        cycleStart: range.cycleStart,
+        cycleEnd: range.cycleEnd,
+        cycleKey: range.cycleKey,
+      });
+    }
+
+    await runWithConcurrency(tasks, 10, async (task) => {
+      await this.recalculateAndPersistPayableDaysForCycle(
+        db,
+        orgId,
+        task.userId,
+        task.cycleStart,
+        task.cycleEnd,
+        task.cycleKey,
+        now,
+      );
+    });
+  }
+
   async updateBackfillLimit(payload: {
     orgId: number;
     userId: number;
@@ -1433,11 +1596,11 @@ export class TimesheetsService {
       counter && counter.used !== null && counter.used !== undefined
         ? Number(counter.used)
         : await this.countBackfilledDaysForCycle(
-            orgId,
-            userId,
-            cycle,
-            now,
-          );
+          orgId,
+          userId,
+          cycle,
+          now,
+        );
 
     const limit =
       counter && counter.limit !== null && counter.limit !== undefined
@@ -1539,40 +1702,40 @@ export class TimesheetsService {
       timesheetIds.length === 0
         ? []
         : await db
-            .select({
-              id: timesheetEntriesTable.id,
-              timesheetId: timesheetEntriesTable.timesheetId,
-              projectId: timesheetEntriesTable.projectId,
-              status: timesheetEntriesTable.status,
-              projectName: projectsTable.name,
-              departmentId: departmentsTable.id,
-              departmentName: departmentsTable.name,
-              taskTitle: timesheetEntriesTable.taskTitle,
-              taskDescription: timesheetEntriesTable.taskDescription,
-              hoursDecimal: timesheetEntriesTable.hoursDecimal,
-              tags: timesheetEntriesTable.tags,
-              createdAt: timesheetEntriesTable.createdAt,
-              updatedAt: timesheetEntriesTable.updatedAt,
-            })
-            .from(timesheetEntriesTable)
-            .leftJoin(
-              projectsTable,
-              eq(projectsTable.id, timesheetEntriesTable.projectId),
-            )
-            .leftJoin(
-              departmentsTable,
-              eq(departmentsTable.id, projectsTable.departmentId),
-            )
-            .where(
-              and(
-                inArray(timesheetEntriesTable.timesheetId, timesheetIds),
-                or(
-                  eq(timesheetEntriesTable.status, 'approved'),
-                  isNull(timesheetEntriesTable.status),
-                ),
+          .select({
+            id: timesheetEntriesTable.id,
+            timesheetId: timesheetEntriesTable.timesheetId,
+            projectId: timesheetEntriesTable.projectId,
+            status: timesheetEntriesTable.status,
+            projectName: projectsTable.name,
+            departmentId: departmentsTable.id,
+            departmentName: departmentsTable.name,
+            taskTitle: timesheetEntriesTable.taskTitle,
+            taskDescription: timesheetEntriesTable.taskDescription,
+            hoursDecimal: timesheetEntriesTable.hoursDecimal,
+            tags: timesheetEntriesTable.tags,
+            createdAt: timesheetEntriesTable.createdAt,
+            updatedAt: timesheetEntriesTable.updatedAt,
+          })
+          .from(timesheetEntriesTable)
+          .leftJoin(
+            projectsTable,
+            eq(projectsTable.id, timesheetEntriesTable.projectId),
+          )
+          .leftJoin(
+            departmentsTable,
+            eq(departmentsTable.id, projectsTable.departmentId),
+          )
+          .where(
+            and(
+              inArray(timesheetEntriesTable.timesheetId, timesheetIds),
+              or(
+                eq(timesheetEntriesTable.status, 'approved'),
+                isNull(timesheetEntriesTable.status),
               ),
-            )
-            .orderBy(asc(timesheetEntriesTable.id));
+            ),
+          )
+          .orderBy(asc(timesheetEntriesTable.id));
 
     const entriesByTimesheet = new Map<
       number,
@@ -1775,10 +1938,10 @@ export class TimesheetsService {
       });
 
       // Determine leave type for day counting
-      const isLWP = request.leaveTypeCode === 'lwp' || 
-                    request.leaveTypeName?.toLowerCase().includes('without pay');
-      const isCompOff = request.leaveTypeCode === 'comp_off' || 
-                       request.leaveTypeName?.toLowerCase().includes('comp off');
+      const isLWP = request.leaveTypeCode === 'lwp' ||
+        request.leaveTypeName?.toLowerCase().includes('without pay');
+      const isCompOff = request.leaveTypeCode === 'comp_off' ||
+        request.leaveTypeName?.toLowerCase().includes('comp off');
       const isPaidLeave = !isLWP && !isCompOff;
 
       // Count leave days from the actual working days in this cycle.
@@ -1838,7 +2001,7 @@ export class TimesheetsService {
         if (isApproved) {
           bucket.totalHours += hoursForDay;
         }
-        
+
         // Always add the entry to show in response (including pending/rejected)
         bucket.entries.push({
           requestId: request.id,
@@ -1868,7 +2031,7 @@ export class TimesheetsService {
       const workDate = this.normalizeDateUTC(new Date(timesheet.workDate));
       const key = this.formatDateKey(workDate);
       const hours = timesheet.totalHours ? Number(timesheet.totalHours) : 0;
-      
+
       timesheetDates.add(key);
 
       // Calculate payable days based on hours worked
@@ -1903,12 +2066,12 @@ export class TimesheetsService {
     while (cursorForWeekOff <= monthEnd) {
       const key = this.formatDateKey(cursorForWeekOff);
       const info = workingDayInfo.get(key);
-      
+
       // Count non-working days (weekends/holidays) that don't have timesheet entries
       if (!info?.isWorkingDay && !timesheetDates.has(key)) {
         weekOffDays += 1;
       }
-      
+
       cursorForWeekOff.setUTCDate(cursorForWeekOff.getUTCDate() + 1);
     }
 
@@ -1936,33 +2099,33 @@ export class TimesheetsService {
       isHoliday: boolean;
       holidayName: string | null;
       timesheet:
-        | ({
-            id: number;
-            state: string;
-            totalHours: number;
-            notes: string | null;
-            submittedAt: Date | null;
-            approvedAt: Date | null;
-            rejectedAt: Date | null;
-            lockedAt: Date | null;
-            createdAt: Date | null;
-            updatedAt: Date | null;
-          } & {
-            entries: Array<{
-              id: number;
-              projectId: number | null;
-              projectName: string | null;
-              departmentId: number | null;
-              departmentName: string | null;
-              taskTitle: string | null;
-              taskDescription: string | null;
-              hours: number;
-              tags: string[];
-              createdAt: Date | null;
-              updatedAt: Date | null;
-            }>;
-          })
-        | null;
+      | ({
+        id: number;
+        state: string;
+        totalHours: number;
+        notes: string | null;
+        submittedAt: Date | null;
+        approvedAt: Date | null;
+        rejectedAt: Date | null;
+        lockedAt: Date | null;
+        createdAt: Date | null;
+        updatedAt: Date | null;
+      } & {
+        entries: Array<{
+          id: number;
+          projectId: number | null;
+          projectName: string | null;
+          departmentId: number | null;
+          departmentName: string | null;
+          taskTitle: string | null;
+          taskDescription: string | null;
+          hours: number;
+          tags: string[];
+          createdAt: Date | null;
+          updatedAt: Date | null;
+        }>;
+      })
+      | null;
       leaves: {
         totalHours: number;
         entries: Array<{
@@ -1996,9 +2159,9 @@ export class TimesheetsService {
         timesheet,
         leaves: leaveInfo
           ? {
-              totalHours: Number(leaveInfo.totalHours.toFixed(2)),
-              entries: leaveInfo.entries,
-            }
+            totalHours: Number(leaveInfo.totalHours.toFixed(2)),
+            entries: leaveInfo.entries,
+          }
           : null,
       });
 
@@ -2241,7 +2404,7 @@ export class TimesheetsService {
       const workDate = this.normalizeDateUTC(new Date(timesheet.workDate));
       const key = this.formatDateKey(workDate);
       const hours = timesheet.totalHours ? Number(timesheet.totalHours) : 0;
-      
+
       timesheetDates.add(key);
       totalHours += hours;
 
@@ -2274,7 +2437,7 @@ export class TimesheetsService {
 
     // Process leave requests
     const leaveDates = new Map<string, { isLWP: boolean; isCompOff: boolean; isPaid: boolean }>();
-    
+
     for (const request of leaveRequests) {
       const requestStart = this.normalizeDateUTC(new Date(request.startDate));
       const requestEnd = this.normalizeDateUTC(new Date(request.endDate));
@@ -2304,10 +2467,10 @@ export class TimesheetsService {
       }
 
       // Determine leave type
-      const isLWP = request.leaveTypeCode === 'lwp' || 
-                    request.leaveTypeName?.toLowerCase().includes('without pay');
-      const isCompOff = request.leaveTypeCode === 'comp_off' || 
-                       request.leaveTypeName?.toLowerCase().includes('comp off');
+      const isLWP = request.leaveTypeCode === 'lwp' ||
+        request.leaveTypeName?.toLowerCase().includes('without pay');
+      const isCompOff = request.leaveTypeCode === 'comp_off' ||
+        request.leaveTypeName?.toLowerCase().includes('comp off');
       const isPaidLeave = !isLWP && !isCompOff;
 
       // Count leave days from the actual working days in this cycle.
@@ -2350,12 +2513,12 @@ export class TimesheetsService {
     while (cursor <= monthEnd) {
       const key = this.formatDateKey(cursor);
       const info = workingDayInfo.get(key);
-      
+
       // Count non-working days (weekends/holidays) that don't have timesheet entries
       if (!info?.isWorkingDay && !timesheetDates.has(key)) {
         weekOffDays += 1;
       }
-      
+
       cursor.setUTCDate(cursor.getUTCDate() + 1);
     }
 
@@ -2387,7 +2550,7 @@ export class TimesheetsService {
 
       totalPayableDays,
       LWP,
-      
+
       totals: {
         timesheetHours: Number(totalHours.toFixed(2)),
         leaveHours: Number(totalLeaveHours.toFixed(2)),
@@ -2409,14 +2572,14 @@ export class TimesheetsService {
     if (!startDate || !endDate) {
       const now = new Date();
       const currentCycle = SalaryCycleUtil.getCurrentSalaryCycle(now);
-      
+
       // Calculate display dates: 26th to 25th
       const displayStart = new Date(currentCycle.start);
       displayStart.setUTCDate(26);
-      
+
       const displayEnd = new Date(currentCycle.end);
       displayEnd.setUTCDate(25);
-      
+
       finalStartDate = displayStart.toISOString().split('T')[0];
       finalEndDate = displayEnd.toISOString().split('T')[0];
     } else {
@@ -2568,20 +2731,20 @@ export class TimesheetsService {
       userIds.length === 0
         ? []
         : await db
-            .select({
-              userId: payableDaysTable.userId,
-              expectedAttendance: payableDaysTable.expectedAttendance,
-              totalWorkingDays: payableDaysTable.totalWorkingDays,
-              weekOff: payableDaysTable.weekOff,
-              totalPayableDays: payableDaysTable.totalPayableDays,
-            })
-            .from(payableDaysTable)
-            .where(
-              and(
-                eq(payableDaysTable.cycle, cycleKey),
-                inArray(payableDaysTable.userId, userIds),
-              ),
-            );
+          .select({
+            userId: payableDaysTable.userId,
+            expectedAttendance: payableDaysTable.expectedAttendance,
+            totalWorkingDays: payableDaysTable.totalWorkingDays,
+            weekOff: payableDaysTable.weekOff,
+            totalPayableDays: payableDaysTable.totalPayableDays,
+          })
+          .from(payableDaysTable)
+          .where(
+            and(
+              eq(payableDaysTable.cycle, cycleKey),
+              inArray(payableDaysTable.userId, userIds),
+            ),
+          );
 
     const cycleEndExclusive = new Date(cycleEnd);
     cycleEndExclusive.setUTCDate(cycleEndExclusive.getUTCDate() + 1);
@@ -2590,19 +2753,19 @@ export class TimesheetsService {
       userIds.length === 0
         ? []
         : await db
-            .select({
-              userId: timesheetsTable.userId,
-              totalHours: timesheetsTable.totalHours,
-            })
-            .from(timesheetsTable)
-            .where(
-              and(
-                eq(timesheetsTable.orgId, orgId),
-                inArray(timesheetsTable.userId, userIds),
-                gte(timesheetsTable.workDate, cycleStart),
-                lt(timesheetsTable.workDate, cycleEndExclusive),
-              ),
-            );
+          .select({
+            userId: timesheetsTable.userId,
+            totalHours: timesheetsTable.totalHours,
+          })
+          .from(timesheetsTable)
+          .where(
+            and(
+              eq(timesheetsTable.orgId, orgId),
+              inArray(timesheetsTable.userId, userIds),
+              gte(timesheetsTable.workDate, cycleStart),
+              lt(timesheetsTable.workDate, cycleEndExclusive),
+            ),
+          );
 
     const totalTimesheetHoursByUserId = new Map<number, number>();
     for (const row of cycleTimesheets) {
@@ -2751,20 +2914,20 @@ export class TimesheetsService {
       userIds.length === 0
         ? []
         : await db
-            .select({
-              userId: payableDaysTable.userId,
-              expectedAttendance: payableDaysTable.expectedAttendance,
-              totalWorkingDays: payableDaysTable.totalWorkingDays,
-              weekOff: payableDaysTable.weekOff,
-              totalPayableDays: payableDaysTable.totalPayableDays,
-            })
-            .from(payableDaysTable)
-            .where(
-              and(
-                eq(payableDaysTable.cycle, cycleKey),
-                inArray(payableDaysTable.userId, userIds),
-              ),
-            );
+          .select({
+            userId: payableDaysTable.userId,
+            expectedAttendance: payableDaysTable.expectedAttendance,
+            totalWorkingDays: payableDaysTable.totalWorkingDays,
+            weekOff: payableDaysTable.weekOff,
+            totalPayableDays: payableDaysTable.totalPayableDays,
+          })
+          .from(payableDaysTable)
+          .where(
+            and(
+              eq(payableDaysTable.cycle, cycleKey),
+              inArray(payableDaysTable.userId, userIds),
+            ),
+          );
 
     const cycleEndExclusive = new Date(cycleEnd);
     cycleEndExclusive.setUTCDate(cycleEndExclusive.getUTCDate() + 1);
@@ -2773,19 +2936,19 @@ export class TimesheetsService {
       userIds.length === 0
         ? []
         : await db
-            .select({
-              userId: timesheetsTable.userId,
-              totalHours: timesheetsTable.totalHours,
-            })
-            .from(timesheetsTable)
-            .where(
-              and(
-                eq(timesheetsTable.orgId, orgId),
-                inArray(timesheetsTable.userId, userIds),
-                gte(timesheetsTable.workDate, cycleStart),
-                lt(timesheetsTable.workDate, cycleEndExclusive),
-              ),
-            );
+          .select({
+            userId: timesheetsTable.userId,
+            totalHours: timesheetsTable.totalHours,
+          })
+          .from(timesheetsTable)
+          .where(
+            and(
+              eq(timesheetsTable.orgId, orgId),
+              inArray(timesheetsTable.userId, userIds),
+              gte(timesheetsTable.workDate, cycleStart),
+              lt(timesheetsTable.workDate, cycleEndExclusive),
+            ),
+          );
 
     const totalTimesheetHoursByUserId = new Map<number, number>();
     for (const row of cycleTimesheets) {
@@ -2822,39 +2985,39 @@ export class TimesheetsService {
     });
 
     const payableRows = users.map((user) => {
-        const leaveBreakdown = leaveBreakdownByUserId.get(user.id) ?? {
-          earnLeave: 0,
-          specialLeave: 0,
-          compOffLeaves: 0,
-          lwp: 0,
-        };
-        const payableRow = payableDaysByUserId.get(user.id);
+      const leaveBreakdown = leaveBreakdownByUserId.get(user.id) ?? {
+        earnLeave: 0,
+        specialLeave: 0,
+        compOffLeaves: 0,
+        lwp: 0,
+      };
+      const payableRow = payableDaysByUserId.get(user.id);
 
-        return {
-          userId: user.id,
-          email: user.email,
-          employmentType: user.employmentType,
-          joiningDate: user.joiningDate,
-          exitDate: user.exitDate,
-          status: user.status,
-          expectedAttendance: parseNumericValue(payableRow?.expectedAttendance),
-          cycle: cycleKey,
-          totalHours: Number(
-            (totalTimesheetHoursByUserId.get(user.id) ?? 0).toFixed(1),
-          ),
-          totalWorkingDays: Number(
-            parseNumericValue(payableRow?.totalWorkingDays).toFixed(1),
-          ),
-          earnLeave: Number(leaveBreakdown.earnLeave.toFixed(1)),
-          specialLeave: Number(leaveBreakdown.specialLeave.toFixed(1)),
-          compOffLeaves: Number(leaveBreakdown.compOffLeaves.toFixed(1)),
-          weekOff: Number(parseNumericValue(payableRow?.weekOff).toFixed(1)),
-          totalPayableDays: Number(
-            parseNumericValue(payableRow?.totalPayableDays).toFixed(1),
-          ),
-          lwp: Number(leaveBreakdown.lwp.toFixed(1)),
-        };
-      });
+      return {
+        userId: user.id,
+        email: user.email,
+        employmentType: user.employmentType,
+        joiningDate: user.joiningDate,
+        exitDate: user.exitDate,
+        status: user.status,
+        expectedAttendance: parseNumericValue(payableRow?.expectedAttendance),
+        cycle: cycleKey,
+        totalHours: Number(
+          (totalTimesheetHoursByUserId.get(user.id) ?? 0).toFixed(1),
+        ),
+        totalWorkingDays: Number(
+          parseNumericValue(payableRow?.totalWorkingDays).toFixed(1),
+        ),
+        earnLeave: Number(leaveBreakdown.earnLeave.toFixed(1)),
+        specialLeave: Number(leaveBreakdown.specialLeave.toFixed(1)),
+        compOffLeaves: Number(leaveBreakdown.compOffLeaves.toFixed(1)),
+        weekOff: Number(parseNumericValue(payableRow?.weekOff).toFixed(1)),
+        totalPayableDays: Number(
+          parseNumericValue(payableRow?.totalPayableDays).toFixed(1),
+        ),
+        lwp: Number(leaveBreakdown.lwp.toFixed(1)),
+      };
+    });
 
     const csv = this.convertPayableDaysToCSV(payableRows);
 
@@ -3150,15 +3313,15 @@ export class TimesheetsService {
     if (value === null || value === undefined) {
       return '';
     }
-    
+
     const stringValue = String(value);
-    
+
     // If the value contains comma, newline, or double quote, wrap it in quotes
     if (stringValue.includes(',') || stringValue.includes('\n') || stringValue.includes('"')) {
       // Escape double quotes by doubling them
       return `"${stringValue.replace(/"/g, '""')}"`;
     }
-    
+
     return stringValue;
   }
 
@@ -3666,6 +3829,40 @@ export class TimesheetsService {
     return info;
   }
 
+  private async getRecentWorkingDays(
+    orgId: number,
+    baseDate: Date,
+    count: number,
+  ): Promise<Date[]> {
+    const today = this.normalizeDateUTC(baseDate);
+    // Fetch a wide enough range (e.g. 30 days back) to guarantee we find `count` working days
+    const maxLookbackDays = 30;
+    const startDate = new Date(today.getTime() - maxLookbackDays * 24 * 60 * 60 * 1000);
+    // endDate is yesterday, because we want the *previous* working days
+    const endDate = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+
+    if (endDate < startDate) {
+      return [];
+    }
+
+    const workingDayInfo = await this.getWorkingDayInfo(orgId, startDate, endDate);
+    
+    const workingDates: Date[] = [];
+    
+    // Iterate backwards from yesterday
+    const cursor = new Date(endDate);
+    while (cursor >= startDate && workingDates.length < count) {
+      const key = this.formatDateKey(cursor);
+      const info = workingDayInfo.get(key);
+      if (info && info.isWorkingDay) {
+        workingDates.push(new Date(cursor));
+      }
+      cursor.setUTCDate(cursor.getUTCDate() - 1);
+    }
+    
+    return workingDates;
+  }
+
   private isSecondOrFourthSaturday(date: Date): boolean {
     const occurrence = Math.ceil(date.getUTCDate() / 7);
     return occurrence === 2 || occurrence === 4;
@@ -3685,7 +3882,13 @@ export class TimesheetsService {
   ) {
     const db = this.database.connection;
     const now = new Date();
-    if (actor) {
+    const isSelfAction = actor && actor.id === targetUserId;
+    const isPrivilegedAdmin =
+      actor &&
+      (actor.roles.includes('super_admin') || actor.roles.includes('admin')) &&
+      !isSelfAction;
+
+    if (actor && !isSelfAction) {
       checkAdminSelfAction(actor, targetUserId.toString());
     }
 
@@ -3699,6 +3902,7 @@ export class TimesheetsService {
         hoursDecimal: timesheetEntriesTable.hoursDecimal,
         taskDescription: timesheetEntriesTable.taskDescription,
         dateOfExit: usersTable.dateOfExit,
+        createdAt: timesheetsTable.createdAt,
       })
       .from(timesheetEntriesTable)
       .innerJoin(
@@ -3721,6 +3925,50 @@ export class TimesheetsService {
       throw new NotFoundException(
         `Timesheet entry with ID ${entryId} for user ${targetUserId} not found`,
       );
+    }
+
+    if (!isPrivilegedAdmin) {
+      const canEditOldDate = this.isTimesheetEditable(
+        new Date(existingEntry.workDate),
+        existingEntry.createdAt,
+        now,
+      );
+      if (!canEditOldDate) {
+        throw new BadRequestException(
+          'Timesheet entries can only be edited until 7:00 AM of the next day',
+        );
+      }
+
+      if (updateData.date) {
+        const newDate = normalizeDate(new Date(updateData.date));
+        const oldDate = normalizeDate(new Date(existingEntry.workDate));
+        const today = normalizeDate(now);
+
+        if (oldDate.getTime() === today.getTime()) {
+          if (newDate.getTime() !== today.getTime()) {
+            throw new BadRequestException('Cannot change the date of an entry created for today');
+          }
+        } else {
+          // If original entry is a past date, new date must be one of the last 3 working days before today
+          const recentWorkingDays = await this.getRecentWorkingDays(orgId, now, 3);
+          
+          const isAllowed = recentWorkingDays.some(
+            (d) => d.getTime() === newDate.getTime()
+          );
+
+          if (!isAllowed) {
+            // format the allowed dates beautifully for the error message
+            const allowedDatesStr = recentWorkingDays
+              .map(d => d.toISOString().slice(0, 10))
+              // sort chronologically
+              .sort()
+              .join(', ');
+            throw new BadRequestException(
+              `Date can only be changed to one of the previous 3 working days: ${allowedDatesStr}`
+            );
+          }
+        }
+      }
     }
 
     if (existingEntry.dateOfExit) {
@@ -3800,6 +4048,10 @@ export class TimesheetsService {
           ),
         );
 
+      if (targetTimesheet && !isPrivilegedAdmin && ["submitted", "approved", "locked"].includes(targetTimesheet.state)) {
+        throw new BadRequestException(`Cannot move entry to a timesheet that is ${targetTimesheet.state}`);
+      }
+
       if (!targetTimesheet) {
         // the entry remains on the same timesheet row (avoid creating duplicates).
         await db
@@ -3855,27 +4107,28 @@ export class TimesheetsService {
       .where(eq(timesheetEntriesTable.id, entryId))
       .returning();
 
-    const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []);
-    if (actorRole) {
-      await this.auditService.createLog({
-        orgId,
-        actorUserId: actor?.id,
-        actorRole,
-        action: 'timesheet_edited',
-        subjectType: 'timesheet_edited',
-        targetUserId,
-        prev: {
-          projectId: existingEntry.projectId,
-          hours: Number(existingEntry.hoursDecimal ?? 0),
-          activities: existingEntry.taskDescription ?? null,
-        },
-        next: {
-          projectId: updatedEntry.projectId,
-          hours: Number(updatedEntry.hoursDecimal ?? 0),
-          activities: updatedEntry.taskDescription ?? null,
-        },
-      });
-    }
+    const actorRole = this.getPrivilegedActorRole(actor?.roles ?? []) || 'user';
+    
+    await this.auditService.createLog({
+      orgId,
+      actorUserId: actor?.id,
+      actorRole,
+      action: 'timesheet_edited',
+      subjectType: 'timesheet_edited',
+      targetUserId,
+      prev: {
+        workDate: getYYYYMMDD(existingEntry.workDate),
+        projectId: existingEntry.projectId,
+        hours: Number(existingEntry.hoursDecimal ?? 0),
+        activities: existingEntry.taskDescription ?? null,
+      },
+      next: {
+        workDate: getYYYYMMDD(targetWorkDate),
+        projectId: updatedEntry.projectId,
+        hours: Number(updatedEntry.hoursDecimal ?? 0),
+        activities: updatedEntry.taskDescription ?? null,
+      },
+    });
 
     // Recalculate total hours for affected timesheets (only approved entries)
     const timesheetIds = new Set<number>([existingEntry.timesheetId]);
@@ -3908,7 +4161,7 @@ export class TimesheetsService {
     const dateChanged =
       updateData.date &&
       normalizeDate(new Date(updateData.date as string)).getTime() !==
-        new Date(oldWorkDate).getTime();
+      new Date(oldWorkDate).getTime();
 
     if (dateChanged) {
       const newWorkDate = normalizeDate(new Date(updateData.date as string));
@@ -4094,7 +4347,7 @@ export class TimesheetsService {
         // Perform pending notification cleanup/updates if projectId is valid
         if (existingEntry.projectId !== null && existingEntry.projectId !== undefined) {
           const formattedWorkDateISO = workDate.toISOString();
-          
+
           // Query all pending timesheet_entry notifications for this user, project, and date
           const pendingNotifications = await tx
             .select()
