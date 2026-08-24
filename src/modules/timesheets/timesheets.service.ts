@@ -559,7 +559,7 @@ export class TimesheetsService {
     }
 
     const shouldApplyBackfillRules = enforceCurrentSalaryCycle;
-    const backfillAllowance = shouldApplyBackfillRules && isBackfill
+    const backfillAllowance = shouldApplyBackfillRules
       ? await this.getBackfillAllowanceForCycle(orgId, userId, currentCycle, now)
       : { limit: DEFAULT_BACKFILL_PER_MONTH, used: 0, remaining: DEFAULT_BACKFILL_PER_MONTH };
 
@@ -1870,6 +1870,22 @@ export class TimesheetsService {
 
     const workingDayInfo = await this.getWorkingDayInfo(orgId, monthStart, monthEnd);
 
+    const backfillDatesQuery = await db
+      .select({ workDate: backfillDatesTable.workDate })
+      .from(backfillDatesTable)
+      .where(
+        and(
+          eq(backfillDatesTable.userId, userId),
+          eq(backfillDatesTable.orgId, orgId),
+          eq(backfillDatesTable.year, year),
+          eq(backfillDatesTable.month, month),
+        ),
+      );
+
+    const backfillDateSet = new Set(
+      backfillDatesQuery.map((row) => this.formatDateKey(new Date(row.workDate))),
+    );
+
     const leaveDaily = new Map<
       string,
       {
@@ -2098,6 +2114,7 @@ export class TimesheetsService {
       isWeekend: boolean;
       isHoliday: boolean;
       holidayName: string | null;
+      isLifeline: boolean;
       timesheet:
       | ({
         id: number;
@@ -2156,6 +2173,7 @@ export class TimesheetsService {
         isWeekend: info?.isWeekend ?? false,
         isHoliday: info?.isHoliday ?? false,
         holidayName: info?.holidayName ?? null,
+        isLifeline: backfillDateSet.has(key),
         timesheet,
         leaves: leaveInfo
           ? {
@@ -2242,7 +2260,43 @@ export class TimesheetsService {
     // Get salary cycle label for display
     const cycleInfo = SalaryCycleUtil.getSalaryCycleForMonth(year, month);
 
+    const [backfillCounter] = await db
+      .select({ used: backfillCountersTable.used })
+      .from(backfillCountersTable)
+      .where(
+        and(
+          eq(backfillCountersTable.orgId, orgId),
+          eq(backfillCountersTable.userId, userId),
+          eq(backfillCountersTable.year, year),
+          eq(backfillCountersTable.month, month),
+        ),
+      )
+      .limit(1);
+
+    let usedLifelineCount =
+      backfillCounter && backfillCounter.used !== null && backfillCounter.used !== undefined
+        ? Number(backfillCounter.used)
+        : 0;
+
+    if (!backfillCounter || backfillCounter.used === null || backfillCounter.used === undefined) {
+      const [{ value: backfillCount }] = await db
+        .select({ value: count(backfillDatesTable.id) })
+        .from(backfillDatesTable)
+        .where(
+          and(
+            eq(backfillDatesTable.orgId, orgId),
+            eq(backfillDatesTable.userId, userId),
+            eq(backfillDatesTable.year, year),
+            eq(backfillDatesTable.month, month),
+          ),
+        );
+      usedLifelineCount = Number(backfillCount ?? 0);
+    }
+
+    const lifeline = usedLifelineCount > 0;
+
     return {
+      lifeline,
       user: {
         id: user.id,
         name: user.name,
