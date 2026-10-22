@@ -9,12 +9,14 @@ import { authBlacklistedTokensTable, usersTable, orgsTable } from '../../../db/s
 import { JwtPayload } from '../types/jwt-payload.interface';
 import { eq } from 'drizzle-orm';
 import { validateUserAccess } from '../../../common/utils/access-control.util';
+import { AuthService } from '../auth.service';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(
     private readonly configService: ConfigService,
     private readonly databaseService: DatabaseService,
+    private readonly authService: AuthService,
   ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
@@ -52,6 +54,9 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
           managerId: usersTable.managerId,
           employeeDepartmentId: usersTable.employeeDepartmentId,
           dateOfExit: usersTable.dateOfExit,
+          dateOfJoining: usersTable.dateOfJoining,
+          employmentType: usersTable.employmentType,
+          lastLoginAt: usersTable.lastLoginAt,
         },
         timezone: orgsTable.timezone,
       })
@@ -73,6 +78,18 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       dateOfExit: user.dateOfExit,
       timezone,
     });
+
+    // Validate new user leave allocation flow (24h grace period for missing required fields)
+    await this.authService.validateNewUserGracePeriod(
+      {
+        id: Number(user.id),
+        dateOfJoining: user.dateOfJoining,
+        employmentType: user.employmentType,
+        lastLoginAt: user.lastLoginAt ? new Date(user.lastLoginAt) : null,
+      },
+      token,
+      'access',
+    );
 
     return {
       id: Number(user.id),

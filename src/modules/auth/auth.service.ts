@@ -87,33 +87,77 @@ export class AuthService {
       ? Number(user.employeeDepartmentId)
       : null;
 
-    const isFirstLogin = !user.lastLoginAt;
-    if (isFirstLogin) {
-      try {
-        await this.leaveAllocationService.initialize(Number(user.id));
-      } catch (error) {
-        this.logger.error(`Leave allocation failed for user ${user.id}: ${error instanceof Error ? error.message : error}`);
+    let targetLastLoginAt: Date | null = now;
+
+    const isNewUser = this.leaveAllocationService.hasJoinedLessThanOneMonthAgo(user.dateOfJoining, now);
+
+    if (isNewUser) {
+      const leaveAllocated = await this.leaveAllocationService.hasLeaveBeenAllocated(Number(user.id));
+      if (!leaveAllocated) {
+        const hasRequiredFields = this.leaveAllocationService.hasRequiredFieldsForAllocation(user);
+        if (hasRequiredFields) {
+          try {
+            await this.leaveAllocationService.initialize(Number(user.id));
+          } catch (error) {
+            this.logger.error(`Leave allocation failed for user ${user.id}: ${error instanceof Error ? error.message : error}`);
+          }
+          targetLastLoginAt = now;
+        } else {
+          // Required fields are missing
+          if (!user.lastLoginAt) {
+            // First time missing fields encountered (or first login after forced logout)
+            // Record start of 24-hour period
+            targetLastLoginAt = now;
+          } else {
+            const elapsedMs = now.getTime() - new Date(user.lastLoginAt).getTime();
+            const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+            if (elapsedMs >= TWENTY_FOUR_HOURS_MS) {
+              // 24 hours have elapsed: reset first-login flow for this specific validation flow
+              targetLastLoginAt = now;
+            } else {
+              // Preserve original timestamp during the 24-hour period; do not repeatedly reset
+              targetLastLoginAt = new Date(user.lastLoginAt);
+            }
+          }
+        }
+      } else {
+        targetLastLoginAt = now;
       }
+    } else {
+      const isFirstLogin = !user.lastLoginAt;
+      if (isFirstLogin) {
+        try {
+          await this.leaveAllocationService.initialize(Number(user.id));
+        } catch (error) {
+          this.logger.error(`Leave allocation failed for user ${user.id}: ${error instanceof Error ? error.message : error}`);
+        }
+      }
+      targetLastLoginAt = now;
     }
 
+    const userUpdatePayload: Partial<typeof usersTable.$inferInsert> = {
+      updatedAt: now,
+    };
+
     if (!user.googleUserId) {
-      await db
-        .update(usersTable)
-        .set({
-          googleUserId: googleProfile.sub,
-          avatarUrl: googleProfile.picture ?? user.avatarUrl,
-          lastLoginAt: now,
-          updatedAt: now,
-        })
-        .where(eq(usersTable.id, user.id));
+      userUpdatePayload.googleUserId = googleProfile.sub;
+      userUpdatePayload.avatarUrl = googleProfile.picture ?? user.avatarUrl;
     } else if (user.googleUserId !== googleProfile.sub) {
       throw new UnauthorizedException('Google user identifier mismatch');
-    } else {
-      await db
-        .update(usersTable)
-        .set({ lastLoginAt: now, updatedAt: now })
-        .where(eq(usersTable.id, user.id));
     }
+
+    const shouldUpdateLastLogin =
+      !user.lastLoginAt ||
+      (targetLastLoginAt && targetLastLoginAt.getTime() !== new Date(user.lastLoginAt).getTime());
+
+    if (shouldUpdateLastLogin) {
+      userUpdatePayload.lastLoginAt = targetLastLoginAt;
+    }
+
+    await db
+      .update(usersTable)
+      .set(userUpdatePayload)
+      .where(eq(usersTable.id, user.id));
 
     // Assign employee role if user doesn't have any roles
     await this.assignEmployeeRoleIfNeeded(Number(user.id));
@@ -208,6 +252,9 @@ export class AuthService {
           employeeDepartmentId: usersTable.employeeDepartmentId,
           status: usersTable.status,
           dateOfExit: usersTable.dateOfExit,
+          dateOfJoining: usersTable.dateOfJoining,
+          employmentType: usersTable.employmentType,
+          lastLoginAt: usersTable.lastLoginAt,
         },
         timezone: orgsTable.timezone,
       })
@@ -229,6 +276,18 @@ export class AuthService {
       dateOfExit: userRecord.dateOfExit,
       timezone,
     });
+
+    // Validate new user leave allocation flow (24h grace period for missing required fields)
+    await this.validateNewUserGracePeriod(
+      {
+        id: Number(userRecord.id),
+        dateOfJoining: userRecord.dateOfJoining,
+        employmentType: userRecord.employmentType,
+        lastLoginAt: userRecord.lastLoginAt ? new Date(userRecord.lastLoginAt) : null,
+      },
+      refreshToken,
+      'refresh',
+    );
 
     const roles = await this.getUserRoles(payload.sub);
     const permissions = await this.getUserPermissions(payload.sub);
@@ -384,18 +443,100 @@ export class AuthService {
     return Array.from(new Set(permissionsResult.map((row) => row.key)));
   }
 
-  private async blacklistToken(
+  async forceLogoutUser(
+    userId: number,
+    token?: string,
+    tokenType: 'access' | 'refresh' = 'access',
+  ): Promise<void> {
+    const db = this.databaseService.connection;
+    await db
+      .update(usersTable)
+      .set({
+        lastLoginAt: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(usersTable.id, userId));
+
+    if (token) {
+      await this.blacklistToken(token, tokenType, userId);
+    }
+  }
+
+  async validateNewUserGracePeriod(
+    user: {
+      id: number;
+      dateOfJoining?: string | Date | null;
+      employmentType?: string | null;
+      lastLoginAt?: Date | string | null;
+    },
+    token?: string,
+    tokenType: 'access' | 'refresh' = 'access',
+  ): Promise<void> {
+    const now = new Date();
+
+    // 1. Check Date of Joining: apply only if user joined less than 1 month ago
+    if (!this.leaveAllocationService.hasJoinedLessThanOneMonthAgo(user.dateOfJoining, now)) {
+      return;
+    }
+
+    // 2. Check Leave Allocation: if already allocated, allow normal access
+    const leaveAllocated = await this.leaveAllocationService.hasLeaveBeenAllocated(Number(user.id));
+    if (leaveAllocated) {
+      return;
+    }
+
+    // 3. Check Required Fields
+    const hasRequiredFields = this.leaveAllocationService.hasRequiredFieldsForAllocation(user);
+    if (hasRequiredFields) {
+      // If required fields are updated, let existing leave allocation flow handle it
+      try {
+        await this.leaveAllocationService.initialize(Number(user.id));
+      } catch (error) {
+        this.logger.error(
+          `Leave allocation failed for user ${user.id}: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+      return;
+    }
+
+    // Required fields are missing
+    if (!user.lastLoginAt) {
+      // If lastLoginAt is null during an authenticated action, the user was either forcibly logged out
+      // or their session has reset. Require re-login.
+      if (token) {
+        await this.blacklistToken(token, tokenType, Number(user.id));
+      }
+      throw new UnauthorizedException(
+        'Required profile information is incomplete. Session expired. Please log in again.',
+      );
+    }
+
+    const elapsedMs = now.getTime() - new Date(user.lastLoginAt).getTime();
+    const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+
+    if (elapsedMs < TWENTY_FOUR_HOURS_MS) {
+      // Within 24-hour window: allow user to continue using the website, do not reset timestamp
+      return;
+    }
+
+    // 4. Recheck after 24 hours: 24 hours have elapsed and required fields are still missing
+    // Set last_login_at to NULL, expire/invalidate token, automatically log user out
+    await this.forceLogoutUser(Number(user.id), token, tokenType);
+    throw new UnauthorizedException(
+      'Required profile information is incomplete. Your 24-hour grace period has expired. Please log in again.',
+    );
+  }
+
+  async blacklistToken(
     token: string,
     tokenType: 'access' | 'refresh',
     userId: number,
   ) {
     try {
       const decoded = this.jwtService.decode(token) as { exp?: number } | null;
-      if (!decoded?.exp) {
-        throw new UnauthorizedException('Unable to decode token');
-      }
-
-      const expiresAt = new Date(decoded.exp * 1000);
+      const expiresAt = decoded?.exp
+        ? new Date(decoded.exp * 1000)
+        : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
       const db = this.databaseService.connection;
 
       await db

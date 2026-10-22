@@ -8,6 +8,7 @@ import {
   leaveBalancesTable,
   leaveAllocationLogsTable,
 } from '../../db/schema';
+import { getYYYYMMDD } from '../../common/utils/access-control.util';
 
 @Injectable()
 export class LeaveAllocationService {
@@ -15,6 +16,85 @@ export class LeaveAllocationService {
   private readonly STANDARD_WORKDAY_HOURS = 8;
 
   constructor(private readonly databaseService: DatabaseService) {}
+
+  /**
+   * Check whether a user's Date of Joining (DOJ) is less than one month ago.
+   * Handles null, undefined, and invalid DOJ safely by returning false.
+   */
+  hasJoinedLessThanOneMonthAgo(
+    dateOfJoining: string | Date | null | undefined,
+    now: Date = new Date(),
+  ): boolean {
+    if (!dateOfJoining) {
+      return false;
+    }
+
+    const dojStr = getYYYYMMDD(dateOfJoining);
+    if (!dojStr || !/^\d{4}-\d{2}-\d{2}$/.test(dojStr)) {
+      return false;
+    }
+
+    const oneMonthAgo = new Date(now);
+    const targetMonth = oneMonthAgo.getMonth() - 1;
+    oneMonthAgo.setMonth(targetMonth);
+    // Snap to last day of previous month if month overflowed (e.g. March 31 -> March 3)
+    if (oneMonthAgo.getMonth() !== (targetMonth + 12) % 12) {
+      oneMonthAgo.setDate(0);
+    }
+
+    const oneMonthAgoStr = getYYYYMMDD(oneMonthAgo);
+    return dojStr >= oneMonthAgoStr;
+  }
+
+  /**
+   * Check whether Day-1 leave has already been allocated for a user.
+   * Checks both leave allocation logs (DAY_1) and leave balances.
+   */
+  async hasLeaveBeenAllocated(userId: number): Promise<boolean> {
+    const db = this.databaseService.connection;
+
+    const [existingLog] = await db
+      .select({ id: leaveAllocationLogsTable.id })
+      .from(leaveAllocationLogsTable)
+      .where(
+        and(
+          eq(leaveAllocationLogsTable.userId, userId),
+          eq(leaveAllocationLogsTable.allocationType, 'DAY_1'),
+        ),
+      )
+      .limit(1);
+
+    if (existingLog) {
+      return true;
+    }
+
+    const [existingBalance] = await db
+      .select({ id: leaveBalancesTable.id })
+      .from(leaveBalancesTable)
+      .where(eq(leaveBalancesTable.userId, userId))
+      .limit(1);
+
+    return Boolean(existingBalance);
+  }
+
+  /**
+   * Check whether all required fields for leave allocation are present in the user record.
+   * Required fields: valid dateOfJoining and non-empty employmentType.
+   */
+  hasRequiredFieldsForAllocation<T extends { dateOfJoining?: string | Date | null; employmentType?: string | null }>(
+    user?: T | null,
+  ): user is T & { dateOfJoining: string | Date; employmentType: string } {
+    if (!user) {
+      return false;
+    }
+    const validDoj = Boolean(user.dateOfJoining && getYYYYMMDD(user.dateOfJoining));
+    const validEmploymentType = Boolean(
+      user.employmentType &&
+      typeof user.employmentType === 'string' &&
+      user.employmentType.trim().length > 0,
+    );
+    return validDoj && validEmploymentType;
+  }
 
   async initialize(userId: number) {
     const db = this.databaseService.connection;
@@ -34,7 +114,7 @@ export class LeaveAllocationService {
       .limit(1);
 
     // Step 2: Validate Required Fields
-    if (!user || !user.dateOfJoining || !user.employmentType) {
+    if (!user || !this.hasRequiredFieldsForAllocation(user)) {
       this.logger.warn(`Skip leave allocation: Missing required fields for user ${userId}`);
       return { success: true, message: 'Skipped: Missing required user fields (dateOfJoining or employmentType)' };
     }
