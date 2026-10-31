@@ -139,7 +139,9 @@ const TIMESHEET_HALF_DAY_MIN_HOURS = 3;
 const TIMESHEET_FULL_DAY_MIN_HOURS = 6;
 const COMP_OFF_FULL_DAY_HOURS = HOURS_PER_WORKING_DAY;
 const COMP_OFF_HALF_DAY_HOURS = COMP_OFF_FULL_DAY_HOURS / 2;
+const COMP_OFF_LEGACY_EXPIRY_DAYS = 30;
 const COMP_OFF_EXPIRY_DAYS = 60;
+const COMP_OFF_60_DAYS_EFFECTIVE_DATE = "2026-11-01";
 const MAX_LEAVE_DOCUMENT_UPLOAD_BYTES = 10 * 1024 * 1024;
 const ALLOWED_LEAVE_DOCUMENT_MIME_TYPES = new Set([
   "application/pdf",
@@ -5374,10 +5376,18 @@ export class LeavesService {
     return normalizedCreditExpiryDate >= leaveDate;
   }
 
+  private getCompOffExpiryDays(workDate: Date | string): number {
+    const normalizedWorkDate = this.normalizeDateUTC(new Date(workDate));
+    const workDateKey = this.formatDateKey(normalizedWorkDate);
+    return workDateKey < COMP_OFF_60_DAYS_EFFECTIVE_DATE
+      ? COMP_OFF_LEGACY_EXPIRY_DAYS
+      : COMP_OFF_EXPIRY_DAYS;
+  }
+
   private calculateCompOffExpiryAt(workDate: Date | string): Date {
-    const expiry = new Date(workDate);
-    expiry.setUTCDate(expiry.getUTCDate() + COMP_OFF_EXPIRY_DAYS);
-    // Expire at the end of the expiry date, not at the start.
+    const expiry = this.normalizeDateUTC(new Date(workDate));
+    const expiryDays = this.getCompOffExpiryDays(workDate);
+    expiry.setUTCDate(expiry.getUTCDate() + expiryDays);
     expiry.setUTCHours(23, 59, 59, 999);
     return expiry;
   }
