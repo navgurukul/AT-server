@@ -130,11 +130,6 @@ const HALF_DAY_HOURS = HOURS_PER_WORKING_DAY / 2;
 const HOURS_NEGATIVE_TOLERANCE = 1e-6;
 const COMP_OFF_LEAVE_CODE = "COMP_OFF";
 const LWP_LEAVE_CODE = "LWP";
-const ONE_DAY_NOTICE_MS = 24 * 60 * 60 * 1000;
-const CASUAL_OR_COMP_OFF_SHORT_RANGE_DAYS = 2;
-const CASUAL_OR_COMP_OFF_MEDIUM_RANGE_DAYS = 5;
-const CASUAL_OR_COMP_OFF_SHORT_NOTICE_DAYS = 1;
-const CASUAL_OR_COMP_OFF_MEDIUM_NOTICE_DAYS = 7;
 const TIMESHEET_HALF_DAY_MIN_HOURS = 3;
 const TIMESHEET_FULL_DAY_MIN_HOURS = 6;
 const COMP_OFF_FULL_DAY_HOURS = HOURS_PER_WORKING_DAY;
@@ -1323,46 +1318,14 @@ export class LeavesService {
           : leaveType.requiresApproval;
       isPaidLeave = leaveType.paid ?? true;
 
-      const isWellnessLeave =
-        leaveType.code === "wellness" ||
-        leaveType.code === "wellness_leave" ||
-        (leaveType.name?.toLowerCase().includes("wellness") ?? false);
-      const isCasualLeave =
-        leaveType.code === "casual" ||
-        leaveType.code === "casual_leave" ||
-        (leaveType.name?.toLowerCase().includes("casual") ?? false);
-      const isCompOffLeave =
-        leaveType.code === COMP_OFF_LEAVE_CODE ||
-        (leaveType.name?.toLowerCase().includes("comp off") ?? false);
-      const isAutoApproveEligibleCustomLeave = isCasualLeave || isCompOffLeave;
-      // Duration is the count of working days spanned (not hours-based)
-      const leaveDurationDays = workingDays;
       const requestedAt = new Date();
-      const requestedAtUTC = this.normalizeDateUTC(requestedAt);
-      const startDateUTC = this.normalizeDateUTC(startDate);
-      const noticeDays = Math.floor(
-        (startDateUTC.getTime() - requestedAtUTC.getTime()) / ONE_DAY_NOTICE_MS
-      );
-      const isWithinShortAutoApprovalWindow =
-        leaveDurationDays >= 1 &&
-        leaveDurationDays <= CASUAL_OR_COMP_OFF_SHORT_RANGE_DAYS &&
-        noticeDays >= CASUAL_OR_COMP_OFF_SHORT_NOTICE_DAYS;
-      const isWithinMediumAutoApprovalWindow =
-        leaveDurationDays >= 3 &&
-        leaveDurationDays <= CASUAL_OR_COMP_OFF_MEDIUM_RANGE_DAYS &&
-        noticeDays >= CASUAL_OR_COMP_OFF_MEDIUM_NOTICE_DAYS;
-      const shouldAutoApproveCustomLeave =
-        isAutoApproveEligibleCustomLeave &&
-        (isWithinShortAutoApprovalWindow || isWithinMediumAutoApprovalWindow);
       const isLWP =
         leaveType.code === LWP_LEAVE_CODE ||
         (leaveType.name?.toLowerCase().includes("without pay") ?? false);
 
       const shouldAutoApprove =
-        isWellnessLeave ||
         isLWP ||
-        shouldAutoApproveCustomLeave ||
-        (!isAutoApproveEligibleCustomLeave && isPaidLeave && !requiresApproval);
+        (isPaidLeave && !requiresApproval);
 
       // Check if this is an LWP (Leave Without Pay) leave type
 
