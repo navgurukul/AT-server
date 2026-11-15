@@ -86,6 +86,28 @@ function normalizeDate(date: Date) {
   );
 }
 
+export const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+
+export function getTodayInIST(now: Date = new Date()): Date {
+  const istDate = new Date(now.getTime() + IST_OFFSET_MS);
+  return new Date(
+    Date.UTC(istDate.getUTCFullYear(), istDate.getUTCMonth(), istDate.getUTCDate())
+  );
+}
+
+export function getHourInIST(now: Date = new Date()): number {
+  const istDate = new Date(now.getTime() + IST_OFFSET_MS);
+  return istDate.getUTCHours();
+}
+
+export function isBackfillWorkDate(workDate: Date, now: Date = new Date()): boolean {
+  const normalizedWorkDate = normalizeDate(workDate);
+  const today = getTodayInIST(now);
+  const isYesterday = today.getTime() - normalizedWorkDate.getTime() === 24 * 60 * 60 * 1000;
+  const isBefore7AMIST = getHourInIST(now) < 7;
+  return normalizedWorkDate < today && !(isYesterday && isBefore7AMIST);
+}
+
 @Injectable()
 export class TimesheetsService {
   private readonly logger = new Logger(TimesheetsService.name);
@@ -106,21 +128,19 @@ export class TimesheetsService {
    * - Older dates or yesterday past 07:00 AM IST cannot be edited by regular users.
    */
   isTimesheetEditable(workDate: Date, createdAt: Date | null = null, now: Date = new Date()): boolean {
-    const today = normalizeDate(now);
+    const today = getTodayInIST(now);
+    const hourInIST = getHourInIST(now);
 
     // If a createdAt date is provided, the edit window is also based on when it was created.
     // If it was created within the current logical day (or the previous logical day before its 7AM cutoff), it's editable.
     if (createdAt) {
-      const normalizedCreatedAt = normalizeDate(createdAt);
+      const normalizedCreatedAt = getTodayInIST(createdAt);
       if (normalizedCreatedAt.getTime() === today.getTime()) {
         return true;
       }
       const isCreatedYesterday = today.getTime() - normalizedCreatedAt.getTime() === 24 * 60 * 60 * 1000;
-      if (isCreatedYesterday) {
-        const nowInIST = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-        if (nowInIST.getHours() < 7) {
-          return true;
-        }
+      if (isCreatedYesterday && hourInIST < 7) {
+        return true;
       }
     }
 
@@ -139,8 +159,7 @@ export class TimesheetsService {
     // Yesterday's timesheet is editable only before 7:00 AM IST
     const isYesterday = today.getTime() - normalizedWorkDate.getTime() === 24 * 60 * 60 * 1000;
     if (isYesterday) {
-      const nowInIST = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-      return nowInIST.getHours() < 7;
+      return hourInIST < 7;
     }
 
     return false;
@@ -334,11 +353,12 @@ export class TimesheetsService {
     options?: {
       skipBackfillDeduction?: boolean;
       enforceCurrentSalaryCycle?: boolean;
+      now?: Date;
     }
   ) {
     const db = this.database.connection;
     const workDate = normalizeDate(new Date(payload.workDate));
-    const now = new Date();
+    const now = options?.now ?? new Date();
     const skipBackfillDeduction = options?.skipBackfillDeduction ?? false;
     const enforceCurrentSalaryCycle = options?.enforceCurrentSalaryCycle ?? true;
 
@@ -509,7 +529,7 @@ export class TimesheetsService {
       );
     }
 
-    const today = normalizeDate(now);
+    const today = getTodayInIST(now);
     if (workDate > today) {
       throw new BadRequestException("Cannot create timesheet for future date");
     }
@@ -543,8 +563,7 @@ export class TimesheetsService {
     // Removed validation that blocked timesheets on non-working days
 
     const isYesterday = today.getTime() - workDate.getTime() === 24 * 60 * 60 * 1000;
-    const nowInIST = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-    const isBefore7AMIST = nowInIST.getHours() < 7;
+    const isBefore7AMIST = getHourInIST(now) < 7;
 
     const isBackfill = workDate < today && !(isYesterday && isBefore7AMIST);
 
@@ -3888,7 +3907,7 @@ export class TimesheetsService {
     baseDate: Date,
     count: number,
   ): Promise<Date[]> {
-    const today = this.normalizeDateUTC(baseDate);
+    const today = getTodayInIST(baseDate);
     // Fetch a wide enough range (e.g. 30 days back) to guarantee we find `count` working days
     const maxLookbackDays = 30;
     const startDate = new Date(today.getTime() - maxLookbackDays * 24 * 60 * 60 * 1000);
@@ -3996,7 +4015,7 @@ export class TimesheetsService {
       if (updateData.date) {
         const newDate = normalizeDate(new Date(updateData.date));
         const oldDate = normalizeDate(new Date(existingEntry.workDate));
-        const today = normalizeDate(now);
+        const today = getTodayInIST(now);
 
         if (oldDate.getTime() === today.getTime()) {
           if (newDate.getTime() !== today.getTime()) {
@@ -4085,7 +4104,7 @@ export class TimesheetsService {
     if (updateData.date) {
       const workDate = normalizeDate(new Date(updateData.date));
 
-      const today = normalizeDate(now);
+      const today = getTodayInIST(now);
       if (workDate > today) {
         throw new BadRequestException('Cannot move timesheet entry to a future date');
       }
