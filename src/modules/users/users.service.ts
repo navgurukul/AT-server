@@ -2,7 +2,7 @@ import { BadRequestException, ForbiddenException, Injectable, NotFoundException 
 import { Cron } from '@nestjs/schedule';
 import { JWT } from 'google-auth-library';
 import { createHash } from 'crypto';
-import { and, asc, count, desc, eq, ilike, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, ilike, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 
 import { AuthenticatedUser } from '../../common/types/authenticated-user.interface';
 import { DatabaseService } from '../../database/database.service';
@@ -1624,6 +1624,9 @@ await this.timesheetsService.recalculatePayableDaysForSpecificCycles(
 
   async getManagersWithReportees(params: { email?: string }) {
     const db = this.database.connection;
+    const todayStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+    }).format(new Date());
 
     const allUsersQuery = db
       .select({
@@ -1637,6 +1640,12 @@ await this.timesheetsService.recalculatePayableDaysForSpecificCycles(
       .leftJoin(
         employeeDepartmentsTable,
         eq(usersTable.employeeDepartmentId, employeeDepartmentsTable.id),
+      )
+      .where(
+        or(
+          isNull(usersTable.dateOfExit),
+          gte(usersTable.dateOfExit, todayStr),
+        ),
       );
 
     const allUsers = await allUsersQuery;
@@ -1688,7 +1697,6 @@ await this.timesheetsService.recalculatePayableDaysForSpecificCycles(
         });
       }
     }
-
     return Array.from(managersMap.values());
   }
 
