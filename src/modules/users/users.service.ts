@@ -1697,7 +1697,6 @@ await this.timesheetsService.recalculatePayableDaysForSpecificCycles(
         });
       }
     }
-
     return Array.from(managersMap.values());
   }
 
